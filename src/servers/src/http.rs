@@ -165,6 +165,10 @@ pub struct HttpOptions {
     pub cors_allowed_origins: Vec<String>,
 
     pub enable_cors: bool,
+
+    /// Custom HTTP header name for specifying the target database.
+    /// Defaults to "x-greptime-db-name".
+    pub db_name_header: String,
 }
 
 impl Default for HttpOptions {
@@ -177,6 +181,7 @@ impl Default for HttpOptions {
             cors_allowed_origins: Vec::new(),
             enable_cors: true,
             prom_validation_mode: PromValidationMode::Strict,
+            db_name_header: header::constants::GREPTIME_DB_HEADER_NAME.to_string(),
         }
     }
 }
@@ -882,7 +887,11 @@ impl HttpServer {
                     ))
                     // auth layer
                     .layer(middleware::from_fn_with_state(
-                        AuthState::new(self.user_provider.clone()),
+                        AuthState::new(
+                            self.user_provider.clone(),
+                            http::HeaderName::from_bytes(self.options.db_name_header.as_bytes())
+                                .unwrap_or_else(|_| header::GREPTIME_DB_HEADER_NAME.clone()),
+                        ),
                         authorize::check_http_auth,
                     ))
                     .layer(middleware::from_fn(hints::extract_hints))

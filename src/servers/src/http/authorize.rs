@@ -27,7 +27,7 @@ use common_error::ext::ErrorExt;
 use common_telemetry::warn;
 use common_time::Timezone;
 use common_time::timezone::parse_timezone;
-use headers::Header;
+use headers::{Header, HeaderName};
 use session::context::QueryContextBuilder;
 use snafu::{OptionExt, ResultExt, ensure};
 
@@ -45,20 +45,25 @@ use crate::influxdb::{is_influxdb_request, is_influxdb_v2_request};
 #[derive(Clone)]
 pub struct AuthState {
     user_provider: Option<UserProviderRef>,
+    db_name_header: HeaderName,
 }
 
 impl AuthState {
-    pub fn new(user_provider: Option<UserProviderRef>) -> Self {
-        Self { user_provider }
+    pub fn new(user_provider: Option<UserProviderRef>, db_name_header: HeaderName) -> Self {
+        Self {
+            user_provider,
+            db_name_header,
+        }
     }
 }
 
 pub async fn inner_auth<B>(
     user_provider: Option<UserProviderRef>,
+    db_name_header: &HeaderName,
     mut req: Request<B>,
 ) -> std::result::Result<Request<B>, Response> {
     // 1. prepare
-    let (catalog, schema) = extract_catalog_and_schema(&req);
+    let (catalog, schema) = extract_catalog_and_schema(&req, db_name_header);
     // TODO(ruihang): move this out of auth module
     let timezone = extract_timezone(&req);
     let query_ctx_builder = QueryContextBuilder::default()
@@ -120,7 +125,7 @@ pub async fn check_http_auth(
     req: Request,
     next: Next,
 ) -> Response {
-    match inner_auth(auth_state.user_provider, req).await {
+    match inner_auth(auth_state.user_provider, &auth_state.db_name_header, req).await {
         Ok(req) => next.run(req).await,
         Err(resp) => resp,
     }
@@ -130,11 +135,14 @@ fn err_response(err: impl ErrorExt) -> Response {
     (StatusCode::UNAUTHORIZED, ErrorResponse::from_error(err)).into_response()
 }
 
-pub fn extract_catalog_and_schema<B>(request: &Request<B>) -> (String, String) {
+pub fn extract_catalog_and_schema<B>(
+    request: &Request<B>,
+    db_name_header: &HeaderName,
+) -> (String, String) {
     // parse database from header
     let dbname = request
         .headers()
-        .get(GreptimeDbName::name())
+        .get(db_name_header)
         // eat this invalid ascii error and give user the final IllegalParam error
         .and_then(|header| header.to_str().ok())
         .or_else(|| {
@@ -425,7 +433,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let db = extract_catalog_and_schema(&req);
+        let db = extract_catalog_and_schema(&req, GreptimeDbName::name());
         assert_eq!(db, ("greptime".to_string(), "tomcat".to_string()));
     }
 
