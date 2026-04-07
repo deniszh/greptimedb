@@ -41,6 +41,9 @@ timeout = "0s"
 ## The following units are supported: `B`, `KB`, `KiB`, `MB`, `MiB`, `GB`, `GiB`, `TB`, `TiB`, `PB`, `PiB`.
 ## Set to 0 to disable limit.
 body_limit = "64MB"
+## Header name used to select database from HTTP requests.
+## @toml2docs:none-default
+#+ db_name_header_name = "x-greptime-db-name"
 ## HTTP CORS support, it's turned on by default
 ## This allows browser to access http APIs without CORS restrictions
 enable_cors = true

@@ -37,7 +37,7 @@ use datatypes::data_type::DataType;
 use datatypes::schema::SchemaRef;
 use event::{LogState, LogValidatorRef};
 use futures::FutureExt;
-use http::{HeaderValue, Method};
+use http::{HeaderName, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::{ResultExt, ensure};
@@ -56,8 +56,9 @@ use crate::configurator::HttpConfiguratorRef;
 use crate::elasticsearch;
 use crate::error::{
     AddressBindSnafu, AlreadyStartedSnafu, Error, InternalIoSnafu, InvalidHeaderValueSnafu,
-    OtherSnafu, Result,
+    InvalidParameterSnafu, OtherSnafu, Result,
 };
+use crate::http::header::constants::GREPTIME_DB_HEADER_NAME;
 use crate::http::influxdb::{influxdb_health, influxdb_ping, influxdb_write_v1, influxdb_write_v2};
 use crate::http::otlp::OtlpState;
 use crate::http::prom_store::PromStoreState;
@@ -159,6 +160,9 @@ pub struct HttpOptions {
 
     pub body_limit: ReadableSize,
 
+    /// Header name used to select database from HTTP requests.
+    pub db_name_header_name: String,
+
     /// Validation mode while decoding Prometheus remote write requests.
     pub prom_validation_mode: PromValidationMode,
 
@@ -174,6 +178,7 @@ impl Default for HttpOptions {
             timeout: Duration::from_secs(0),
             disable_dashboard: false,
             body_limit: DEFAULT_BODY_LIMIT,
+            db_name_header_name: GREPTIME_DB_HEADER_NAME.to_string(),
             cors_allowed_origins: Vec::new(),
             enable_cors: true,
             prom_validation_mode: PromValidationMode::Strict,
@@ -756,6 +761,18 @@ impl HttpServerBuilder {
 }
 
 impl HttpServer {
+    fn db_name_header(&self) -> Result<HeaderName> {
+        HeaderName::from_bytes(self.options.db_name_header_name.as_bytes()).map_err(|error| {
+            InvalidParameterSnafu {
+                reason: format!(
+                    "invalid http.db_name_header_name `{}`: {}",
+                    self.options.db_name_header_name, error
+                ),
+            }
+            .build()
+        })
+    }
+
     /// Gets the router and adds necessary root routes (health, status, dashboard).
     pub fn make_app(&self) -> Router {
         let mut router = {
@@ -819,6 +836,7 @@ impl HttpServer {
     /// Attaches middlewares and debug routes to the router.
     /// Callers should call this method after [HttpServer::make_app()].
     pub fn build(&self, router: Router) -> Result<Router> {
+        let db_name_header = self.db_name_header()?;
         let timeout_layer = if self.options.timeout != Duration::default() {
             Some(ServiceBuilder::new().layer(DynamicTimeoutLayer::new(self.options.timeout)))
         } else {
@@ -882,7 +900,7 @@ impl HttpServer {
                     ))
                     // auth layer
                     .layer(middleware::from_fn_with_state(
-                        AuthState::new(self.user_provider.clone()),
+                        AuthState::new(self.user_provider.clone(), db_name_header),
                         authorize::check_http_auth,
                     ))
                     .layer(middleware::from_fn(hints::extract_hints))
@@ -1513,7 +1531,23 @@ mod test {
     fn test_http_options_default() {
         let default = HttpOptions::default();
         assert_eq!("127.0.0.1:4000".to_string(), default.addr);
-        assert_eq!(Duration::from_secs(0), default.timeout)
+        assert_eq!(Duration::from_secs(0), default.timeout);
+        assert_eq!(GREPTIME_DB_HEADER_NAME, default.db_name_header_name);
+    }
+
+    #[test]
+    fn test_invalid_db_name_header_name() {
+        let (tx, _rx) = mpsc::channel(100);
+        let instance = Arc::new(DummyInstance { _tx: tx });
+        let server = HttpServerBuilder::new(HttpOptions {
+            db_name_header_name: "bad header".to_string(),
+            ..Default::default()
+        })
+        .with_sql_handler(instance)
+        .build();
+
+        let err = server.build(server.make_app()).unwrap_err();
+        assert!(matches!(err, Error::InvalidParameter { .. }));
     }
 
     #[tokio::test]

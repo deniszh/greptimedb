@@ -37,10 +37,11 @@ use servers::query_handler::sql::SqlQueryHandler;
 use servers::query_handler::{PromStoreProtocolHandler, PromStoreResponse};
 use session::context::QueryContextRef;
 use sql::statements::statement::Statement;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 struct DummyInstance {
     tx: mpsc::Sender<(String, Vec<u8>)>,
+    write_schemas: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -48,9 +49,10 @@ impl PromStoreProtocolHandler for DummyInstance {
     async fn write(
         &self,
         _request: RowInsertRequests,
-        _ctx: QueryContextRef,
+        ctx: QueryContextRef,
         _with_metric_engine: bool,
     ) -> Result<Output> {
+        self.write_schemas.lock().await.push(ctx.current_schema());
         Ok(Output::new_with_affected_rows(0))
     }
 
@@ -117,12 +119,31 @@ fn make_test_app(tx: mpsc::Sender<(String, Vec<u8>)>) -> Router {
         ..Default::default()
     };
 
-    let instance = Arc::new(DummyInstance { tx });
+    let instance = Arc::new(DummyInstance {
+        tx,
+        write_schemas: Arc::new(Mutex::new(Vec::new())),
+    });
     let server = HttpServerBuilder::new(http_opts)
         .with_sql_handler(instance.clone())
         .with_prom_handler(instance, None, true, PromValidationMode::Unchecked, None)
         .build();
     server.build(server.make_app()).unwrap()
+}
+
+fn make_test_app_with_options(
+    tx: mpsc::Sender<(String, Vec<u8>)>,
+    http_opts: HttpOptions,
+) -> (Router, Arc<Mutex<Vec<String>>>) {
+    let write_schemas = Arc::new(Mutex::new(Vec::new()));
+    let instance = Arc::new(DummyInstance {
+        tx,
+        write_schemas: write_schemas.clone(),
+    });
+    let server = HttpServerBuilder::new(http_opts)
+        .with_sql_handler(instance.clone())
+        .with_prom_handler(instance, None, true, PromValidationMode::Unchecked, None)
+        .build();
+    (server.build(server.make_app()).unwrap(), write_schemas)
 }
 
 #[tokio::test]
@@ -219,4 +240,35 @@ async fn test_prometheus_remote_write_read() {
         read_request,
         ReadRequest::decode(&(requests[1].1)[..]).unwrap()
     );
+}
+
+#[tokio::test]
+async fn test_prometheus_remote_write_with_custom_db_name_header() {
+    common_telemetry::init_default_ut_logging();
+    let (tx, _rx) = mpsc::channel(100);
+    let (app, write_schemas) = make_test_app_with_options(
+        tx,
+        HttpOptions {
+            addr: format!("127.0.0.1:{}", ports::get_port()),
+            db_name_header_name: "x-custom-db-name".to_string(),
+            ..Default::default()
+        },
+    );
+    let client = TestClient::new(app).await;
+
+    let write_request = WriteRequest {
+        timeseries: prom_store::mock_timeseries(),
+        ..Default::default()
+    };
+
+    let result = client
+        .post("/v1/prometheus/write?db=public")
+        .header("x-custom-db-name", "greptime-prometheus")
+        .body(snappy_compress(&write_request.encode_to_vec()[..]).unwrap())
+        .send()
+        .await;
+
+    assert_eq!(result.status(), 204);
+    let write_schemas = write_schemas.lock().await;
+    assert_eq!(write_schemas.as_slice(), &["prometheus".to_string()]);
 }

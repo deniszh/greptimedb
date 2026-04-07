@@ -27,7 +27,6 @@ use common_error::ext::ErrorExt;
 use common_telemetry::warn;
 use common_time::Timezone;
 use common_time::timezone::parse_timezone;
-use headers::Header;
 use session::context::QueryContextBuilder;
 use snafu::{OptionExt, ResultExt, ensure};
 
@@ -35,7 +34,8 @@ use crate::error::{
     self, InvalidAuthHeaderInvisibleASCIISnafu, InvalidAuthHeaderSnafu, InvalidParameterSnafu,
     NotFoundInfluxAuthSnafu, Result, UnsupportedAuthSchemeSnafu, UrlDecodeSnafu,
 };
-use crate::http::header::{GREPTIME_TIMEZONE_HEADER_NAME, GreptimeDbName};
+use crate::http::header::GREPTIME_TIMEZONE_HEADER_NAME;
+use crate::http::header::constants::GREPTIME_DB_HEADER_NAME;
 use crate::http::result::error_result::ErrorResponse;
 use crate::http::{AUTHORIZATION_HEADER, HTTP_API_PREFIX, PUBLIC_APIS};
 use crate::influxdb::{is_influxdb_request, is_influxdb_v2_request};
@@ -45,20 +45,45 @@ use crate::influxdb::{is_influxdb_request, is_influxdb_v2_request};
 #[derive(Clone)]
 pub struct AuthState {
     user_provider: Option<UserProviderRef>,
+    db_name_header: http::HeaderName,
 }
 
 impl AuthState {
-    pub fn new(user_provider: Option<UserProviderRef>) -> Self {
-        Self { user_provider }
+    pub fn new(user_provider: Option<UserProviderRef>, db_name_header: http::HeaderName) -> Self {
+        Self {
+            user_provider,
+            db_name_header,
+        }
     }
 }
 
 pub async fn inner_auth<B>(
     user_provider: Option<UserProviderRef>,
+    req: Request<B>,
+) -> std::result::Result<Request<B>, Response> {
+    inner_auth_with_db_header(
+        user_provider,
+        http::HeaderName::from_static(GREPTIME_DB_HEADER_NAME),
+        req,
+    )
+    .await
+}
+
+pub async fn inner_auth_with_db_header<B>(
+    user_provider: Option<UserProviderRef>,
+    db_name_header: http::HeaderName,
+    req: Request<B>,
+) -> std::result::Result<Request<B>, Response> {
+    inner_auth_with_state(&AuthState::new(user_provider, db_name_header), req).await
+}
+
+async fn inner_auth_with_state<B>(
+    auth_state: &AuthState,
     mut req: Request<B>,
 ) -> std::result::Result<Request<B>, Response> {
     // 1. prepare
-    let (catalog, schema) = extract_catalog_and_schema(&req);
+    let (catalog, schema) =
+        extract_catalog_and_schema_with_header(&req, &auth_state.db_name_header);
     // TODO(ruihang): move this out of auth module
     let timezone = extract_timezone(&req);
     let query_ctx_builder = QueryContextBuilder::default()
@@ -70,13 +95,14 @@ pub async fn inner_auth<B>(
     let need_auth = need_auth(&req);
 
     // 2. check if auth is needed
-    let user_provider = if let Some(user_provider) = user_provider.filter(|_| need_auth) {
-        user_provider
-    } else {
-        query_ctx.set_current_user(auth::userinfo_by_name(None));
-        let _ = req.extensions_mut().insert(query_ctx);
-        return Ok(req);
-    };
+    let user_provider =
+        if let Some(user_provider) = auth_state.user_provider.clone().filter(|_| need_auth) {
+            user_provider
+        } else {
+            query_ctx.set_current_user(auth::userinfo_by_name(None));
+            let _ = req.extensions_mut().insert(query_ctx);
+            return Ok(req);
+        };
 
     // 3. get username and pwd
     let (username, password) = match extract_username_and_password(&req) {
@@ -120,7 +146,7 @@ pub async fn check_http_auth(
     req: Request,
     next: Next,
 ) -> Response {
-    match inner_auth(auth_state.user_provider, req).await {
+    match inner_auth_with_state(&auth_state, req).await {
         Ok(req) => next.run(req).await,
         Err(resp) => resp,
     }
@@ -131,10 +157,20 @@ fn err_response(err: impl ErrorExt) -> Response {
 }
 
 pub fn extract_catalog_and_schema<B>(request: &Request<B>) -> (String, String) {
+    extract_catalog_and_schema_with_header(
+        request,
+        &http::HeaderName::from_static(GREPTIME_DB_HEADER_NAME),
+    )
+}
+
+pub fn extract_catalog_and_schema_with_header<B>(
+    request: &Request<B>,
+    db_name_header: &http::HeaderName,
+) -> (String, String) {
     // parse database from header
     let dbname = request
         .headers()
-        .get(GreptimeDbName::name())
+        .get(db_name_header)
         // eat this invalid ascii error and give user the final IllegalParam error
         .and_then(|header| header.to_str().ok())
         .or_else(|| {
@@ -421,11 +457,42 @@ mod tests {
         let http_api_version = crate::http::HTTP_API_VERSION;
         let req = Request::builder()
             .uri(format!("http://localhost/{http_api_version}/sql").as_str())
-            .header(GreptimeDbName::name(), "greptime-tomcat")
+            .header(
+                http::HeaderName::from_static(GREPTIME_DB_HEADER_NAME),
+                "greptime-tomcat",
+            )
             .body(())
             .unwrap();
 
         let db = extract_catalog_and_schema(&req);
+        assert_eq!(db, ("greptime".to_string(), "tomcat".to_string()));
+    }
+
+    #[test]
+    fn test_custom_db_name_header() {
+        let http_api_version = crate::http::HTTP_API_VERSION;
+        let custom_header = http::HeaderName::from_static("x-custom-db-name");
+        let req = Request::builder()
+            .uri(format!("http://localhost/{http_api_version}/sql").as_str())
+            .header(custom_header.as_str(), "greptime-frontend")
+            .body(())
+            .unwrap();
+
+        let db = extract_catalog_and_schema_with_header(&req, &custom_header);
+        assert_eq!(db, ("greptime".to_string(), "frontend".to_string()));
+    }
+
+    #[test]
+    fn test_custom_db_name_header_precedence() {
+        let http_api_version = crate::http::HTTP_API_VERSION;
+        let custom_header = http::HeaderName::from_static("x-custom-db-name");
+        let req = Request::builder()
+            .uri(format!("http://localhost/{http_api_version}/sql?db=public").as_str())
+            .header(custom_header.as_str(), "greptime-tomcat")
+            .body(())
+            .unwrap();
+
+        let db = extract_catalog_and_schema_with_header(&req, &custom_header);
         assert_eq!(db, ("greptime".to_string(), "tomcat".to_string()));
     }
 
