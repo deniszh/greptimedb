@@ -66,6 +66,7 @@ greptimedb_data
 !/.github
 
 # AI related
+.omc
 .codex
 .gemini
 .opencode
