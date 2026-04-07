@@ -19,7 +19,7 @@ use auth::tests::MockUserProvider;
 use axum::http;
 use hyper::{Request, StatusCode};
 use servers::http::AUTHORIZATION_HEADER;
-use servers::http::authorize::inner_auth;
+use servers::http::authorize::{inner_auth, inner_auth_with_db_header};
 use session::context::QueryContext;
 
 async fn check_http_auth(header_key: &str) {
@@ -114,6 +114,23 @@ async fn check_schema_validating(header: &str) {
 async fn test_schema_validating() {
     check_schema_validating(http::header::AUTHORIZATION.as_str()).await;
     check_schema_validating(AUTHORIZATION_HEADER).await;
+}
+
+#[tokio::test]
+async fn test_custom_db_name_header_populates_query_context() {
+    let req = Request::builder()
+        .uri("http://localhost/v1/sql?db=public")
+        .header("x-custom-db-name", "greptime-prometheus")
+        .body(())
+        .unwrap();
+    let req =
+        inner_auth_with_db_header(None, http::HeaderName::from_static("x-custom-db-name"), req)
+            .await
+            .unwrap();
+
+    let ctx: &QueryContext = req.extensions().get().unwrap();
+    assert_eq!("greptime", ctx.current_catalog());
+    assert_eq!("prometheus", ctx.current_schema());
 }
 
 async fn check_auth_header(header_key: &str) {
