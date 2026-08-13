@@ -131,6 +131,7 @@ async fn test_append_mode_compaction_with_format(flat_format: bool) {
 
     let request = CreateRequestBuilder::new()
         .insert_option("compaction.type", "twcs")
+        .insert_option("compaction.twcs.trigger_file_num", "2")
         .insert_option("append_mode", "true")
         .build();
     let table_dir = request.table_dir.clone();
@@ -199,6 +200,8 @@ async fn test_append_mode_compaction_with_format(flat_format: bool) {
         .scanner(region_id, ScanRequest::default())
         .await
         .unwrap();
+    // The manual compaction waits for the in-flight automatic compaction, then runs its own
+    // cycle and compacts the remaining SSTs into one file.
     assert_eq!(1, scanner.num_files());
     assert_eq!(1, scanner.num_memtables());
     scanner.set_target_partitions(2);
@@ -347,6 +350,7 @@ async fn test_alter_append_mode_clears_merge_mode_with_format(flat_format: bool)
                 options,
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await

@@ -17,6 +17,8 @@ mod validate;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use api::v1::SemanticType;
+use common_query::native_histogram::is_native_histogram_value_type;
 use extract_new_columns::extract_new_columns;
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::metadata::ColumnMetadata;
@@ -27,8 +29,8 @@ use validate::validate_alter_region_requests;
 
 use crate::engine::MetricEngineInner;
 use crate::error::{
-    LogicalRegionNotFoundSnafu, PhysicalRegionNotFoundSnafu, Result, SerializeColumnMetadataSnafu,
-    UnexpectedRequestSnafu,
+    AddingFieldColumnSnafu, LogicalRegionNotFoundSnafu, PhysicalRegionNotFoundSnafu, Result,
+    SerializeColumnMetadataSnafu, UnexpectedRequestSnafu,
 };
 use crate::utils::{append_manifest_info, encode_manifest_info_to_extensions, to_data_region_id};
 
@@ -117,6 +119,8 @@ impl MetricEngineInner {
     ) -> Result<AffectedRows> {
         // Checks all alter requests are add columns.
         validate_alter_region_requests(&requests)?;
+        self.validate_logical_field_alters(physical_region_id, &requests)
+            .await?;
 
         // Finds new columns to add
         let mut new_column_names = HashSet::new();
@@ -189,7 +193,7 @@ impl MetricEngineInner {
         let new_add_columns = new_column_names.iter().map(|name| {
             // Safety: previous steps ensure the physical region exist
             let column_metadata = *physical_schema_map.get(name).unwrap();
-            (name.to_string(), column_metadata.column_id)
+            (name.to_string(), column_metadata.clone())
         });
 
         // Writes logical regions metadata to metadata region
@@ -209,6 +213,49 @@ impl MetricEngineInner {
         Ok(0)
     }
 
+    async fn validate_logical_field_alters(
+        &self,
+        physical_region_id: RegionId,
+        requests: &[(RegionId, RegionAlterRequest)],
+    ) -> Result<()> {
+        // Logical metric tables have one field column. Native histograms are a
+        // special struct field, so field alters must leave exactly that field.
+        for (region_id, request) in requests {
+            let AlterKind::AddColumns { columns } = &request.kind else {
+                unreachable!()
+            };
+            let added_fields = columns
+                .iter()
+                .filter(|col| col.column_metadata.semantic_type == SemanticType::Field)
+                .collect::<Vec<_>>();
+            let Some(&first_added_field) = added_fields.first() else {
+                continue;
+            };
+
+            let mut fields = self
+                .load_logical_columns(physical_region_id, *region_id)
+                .await?
+                .into_iter()
+                .filter(|col| col.semantic_type == SemanticType::Field)
+                .collect::<Vec<_>>();
+            fields.extend(
+                added_fields
+                    .into_iter()
+                    .map(|col| col.column_metadata.clone()),
+            );
+
+            ensure!(
+                fields.len() == 1
+                    && is_native_histogram_value_type(&fields[0].column_schema.data_type),
+                AddingFieldColumnSnafu {
+                    name: first_added_field.column_metadata.column_schema.name.clone(),
+                }
+            );
+        }
+
+        Ok(())
+    }
+
     async fn alter_physical_region(
         &self,
         region_id: RegionId,
@@ -223,8 +270,6 @@ impl MetricEngineInner {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
-
     use api::v1::SemanticType;
     use common_meta::ddl::test_util::assert_column_name_and_id;
     use common_meta::ddl::utils::{parse_column_metadatas, parse_manifest_infos_from_extensions};
@@ -259,16 +304,16 @@ mod test {
             "Alter request to physical region is forbidden".to_string()
         );
 
-        // alter physical region's option should work
+        // skip WAL on the physical region should be forwarded to the data region
         let alter_region_option_request = RegionAlterRequest {
             kind: AlterKind::SetRegionOptions {
-                options: vec![SetRegionOption::Ttl(Some(Duration::from_secs(500).into()))],
+                options: vec![SetRegionOption::SkipWal],
             },
         };
-        let result = engine_inner
-            .alter_physical_region(physical_region_id, alter_region_option_request.clone())
-            .await;
-        assert!(result.is_ok());
+        engine_inner
+            .alter_physical_region(physical_region_id, alter_region_option_request)
+            .await
+            .unwrap();
 
         // alter logical region
         let metadata_region = env.metadata_region();

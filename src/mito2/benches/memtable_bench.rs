@@ -22,13 +22,19 @@
 
 use std::sync::Arc;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use common_recordbatch::DfRecordBatch;
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use datatypes::arrow::array::{
+    ArrayRef, BinaryDictionaryBuilder, Int64Array, TimestampMillisecondArray, UInt8Array,
+    UInt64Array,
+};
+use datatypes::arrow::compute::{SortColumn, SortOptions};
+use datatypes::arrow::datatypes::{DataType, Field, Schema, TimeUnit, UInt32Type};
 use mito_codec::row_converter::DensePrimaryKeyCodec;
 use mito2::memtable::bulk::context::BulkIterContext;
-use mito2::memtable::bulk::part::BulkPartConverter;
+use mito2::memtable::bulk::part::{BulkPartConverter, sort_primary_key_record_batch};
 use mito2::memtable::bulk::part_reader::BulkPartBatchIter;
 use mito2::memtable::bulk::{BulkMemtable, BulkMemtableConfig};
-use mito2::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtable};
 use mito2::memtable::time_series::TimeSeriesMemtable;
 use mito2::memtable::{IterBuilder, Memtable, RangesOptions};
 use mito2::read::flat_merge::FlatMergeIterator;
@@ -38,6 +44,113 @@ use mito2::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 use mito2::test_util::bench_util::{CpuDataGenerator, cpu_metadata};
 use mito2::test_util::memtable_util;
 
+const DEFAULT_BATCH_SIZE: usize = 8 * 1024;
+
+fn primary_key_sort_batch(
+    series_count: usize,
+    samples_per_series: usize,
+    sorted_within_series: bool,
+) -> DfRecordBatch {
+    let num_rows = series_count * samples_per_series;
+    let primary_keys = (0..series_count)
+        .map(|series| format!("series_{series:08}").into_bytes())
+        .collect::<Vec<_>>();
+    let mut primary_key_builder = BinaryDictionaryBuilder::<UInt32Type>::new();
+    let mut timestamps = Vec::with_capacity(num_rows);
+    let mut sequences = Vec::with_capacity(num_rows);
+
+    for series_order in 0..series_count {
+        // 17 is coprime to the power-of-two cardinalities used below and gives a deterministic
+        // non-lexical series order.
+        let series = series_order * 17 % series_count;
+        for sample_order in 0..samples_per_series {
+            let sample = if sorted_within_series {
+                sample_order
+            } else {
+                sample_order * 37 % samples_per_series
+            };
+            primary_key_builder
+                .append(primary_keys[series].as_slice())
+                .unwrap();
+            timestamps.push(sample as i64);
+            sequences.push((series * samples_per_series + sample_order) as u64);
+        }
+    }
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from_iter_values(0..num_rows as i64)),
+        Arc::new(TimestampMillisecondArray::from(timestamps)),
+        Arc::new(primary_key_builder.finish()),
+        Arc::new(UInt64Array::from(sequences)),
+        Arc::new(UInt8Array::from_value(1, num_rows)),
+    ];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new(
+            "__primary_key",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Binary)),
+            false,
+        ),
+        Field::new("__sequence", DataType::UInt64, false),
+        Field::new("__op_type", DataType::UInt8, false),
+    ]));
+    DfRecordBatch::try_new(schema, columns).unwrap()
+}
+
+fn lexsort_primary_key_record_batch(batch: &DfRecordBatch) -> DfRecordBatch {
+    let total_columns = batch.num_columns();
+    let sort_columns = vec![
+        SortColumn {
+            values: batch.column(total_columns - 3).clone(),
+            options: Some(SortOptions {
+                descending: false,
+                nulls_first: true,
+            }),
+        },
+        SortColumn {
+            values: batch.column(total_columns - 4).clone(),
+            options: Some(SortOptions {
+                descending: false,
+                nulls_first: true,
+            }),
+        },
+        SortColumn {
+            values: batch.column(total_columns - 2).clone(),
+            options: Some(SortOptions {
+                descending: true,
+                nulls_first: true,
+            }),
+        },
+    ];
+    let indices = datatypes::arrow::compute::lexsort_to_indices(&sort_columns, None).unwrap();
+    datatypes::arrow::compute::take_record_batch(batch, &indices).unwrap()
+}
+
+fn primary_key_sort(c: &mut Criterion) {
+    let mut group = c.benchmark_group("primary_key_sort");
+    group.sample_size(20);
+
+    for (name, series_count, samples_per_series, sorted_within_series) in [
+        ("sorted_runs", 512, 16, true),
+        ("shuffled_runs", 512, 16, false),
+        ("high_cardinality", 8192, 1, true),
+    ] {
+        let batch = primary_key_sort_batch(series_count, samples_per_series, sorted_within_series);
+        group.throughput(Throughput::Elements(batch.num_rows() as u64));
+        group.bench_function(format!("{name}/arrow_lexsort"), |b| {
+            b.iter(|| lexsort_primary_key_record_batch(&batch));
+        });
+        group.bench_function(format!("{name}/rank_scatter"), |b| {
+            b.iter(|| sort_primary_key_record_batch(&batch).unwrap());
+        });
+    }
+}
+
 /// Writes rows.
 fn write_rows(c: &mut Criterion) {
     let metadata = Arc::new(memtable_util::metadata_with_primary_key(vec![1, 0], true));
@@ -45,21 +158,6 @@ fn write_rows(c: &mut Criterion) {
 
     // Note that this test only generate one time series.
     let mut group = c.benchmark_group("write");
-    group.bench_function("partition_tree", |b| {
-        let codec = Arc::new(DensePrimaryKeyCodec::new(&metadata));
-        let memtable = PartitionTreeMemtable::new(
-            1,
-            codec,
-            metadata.clone(),
-            None,
-            &PartitionTreeConfig::default(),
-        );
-        let kvs =
-            memtable_util::build_key_values(&metadata, "hello".to_string(), 42, &timestamps, 1);
-        b.iter(|| {
-            memtable.write(&kvs).unwrap();
-        });
-    });
     group.bench_function("time_series", |b| {
         let memtable = TimeSeriesMemtable::new(metadata.clone(), 1, None, true, MergeMode::LastRow);
         let kvs =
@@ -73,26 +171,11 @@ fn write_rows(c: &mut Criterion) {
 /// Scans all rows.
 fn full_scan(c: &mut Criterion) {
     let metadata = Arc::new(cpu_metadata());
-    let config = PartitionTreeConfig::default();
     let start_sec = 1710043200;
     let generator = CpuDataGenerator::new(metadata.clone(), 4000, start_sec, start_sec + 3600 * 2);
 
     let mut group = c.benchmark_group("full_scan");
     group.sample_size(10);
-    group.bench_function("partition_tree", |b| {
-        let codec = Arc::new(DensePrimaryKeyCodec::new(&metadata));
-        let memtable = PartitionTreeMemtable::new(1, codec, metadata.clone(), None, &config);
-        for kvs in generator.iter() {
-            memtable.write(&kvs).unwrap();
-        }
-
-        b.iter(|| {
-            let iter = memtable.iter(None, None, None).unwrap();
-            for batch in iter {
-                let _batch = batch.unwrap();
-            }
-        });
-    });
     group.bench_function("time_series", |b| {
         let memtable = TimeSeriesMemtable::new(metadata.clone(), 1, None, true, MergeMode::LastRow);
         for kvs in generator.iter() {
@@ -115,27 +198,11 @@ fn full_scan(c: &mut Criterion) {
 /// Filters 1 host.
 fn filter_1_host(c: &mut Criterion) {
     let metadata = Arc::new(cpu_metadata());
-    let config = PartitionTreeConfig::default();
     let start_sec = 1710043200;
     let generator = CpuDataGenerator::new(metadata.clone(), 4000, start_sec, start_sec + 3600 * 2);
 
     let mut group = c.benchmark_group("filter_1_host");
     group.sample_size(10);
-    group.bench_function("partition_tree", |b| {
-        let codec = Arc::new(DensePrimaryKeyCodec::new(&metadata));
-        let memtable = PartitionTreeMemtable::new(1, codec, metadata.clone(), None, &config);
-        for kvs in generator.iter() {
-            memtable.write(&kvs).unwrap();
-        }
-        let predicate = generator.random_host_filter();
-
-        b.iter(|| {
-            let iter = memtable.iter(None, Some(predicate.clone()), None).unwrap();
-            for batch in iter {
-                let _batch = batch.unwrap();
-            }
-        });
-    });
     group.bench_function("time_series", |b| {
         let memtable = TimeSeriesMemtable::new(metadata.clone(), 1, None, true, MergeMode::LastRow);
         for kvs in generator.iter() {
@@ -229,6 +296,7 @@ fn bulk_part_converter(c: &mut Criterion) {
                     &FlatSchemaOptions {
                         raw_pk_columns: false,
                         string_pk_use_dict: false,
+                        ..Default::default()
                     },
                 );
                 let mut converter = BulkPartConverter::new(&metadata, schema, rows, codec, false);
@@ -255,6 +323,7 @@ fn bulk_part_converter(c: &mut Criterion) {
                         &FlatSchemaOptions {
                             raw_pk_columns: true,
                             string_pk_use_dict: true,
+                            ..Default::default()
                         },
                     );
                     let mut converter =
@@ -308,6 +377,7 @@ fn flat_merge_iterator_bench(c: &mut Criterion) {
                 None, // No projection
                 None, // No predicate
                 false,
+                DEFAULT_BATCH_SIZE,
             )
             .unwrap(),
         );
@@ -378,6 +448,7 @@ fn bulk_part_record_batch_iter_filter(c: &mut Criterion) {
                     None,                    // No projection
                     Some(predicate.clone()), // With hostname filter
                     false,
+                    DEFAULT_BATCH_SIZE,
                 )
                 .unwrap(),
             );
@@ -408,6 +479,7 @@ fn bulk_part_record_batch_iter_filter(c: &mut Criterion) {
                     None, // No projection
                     None, // No predicate
                     false,
+                    DEFAULT_BATCH_SIZE,
                 )
                 .unwrap(),
             );
@@ -431,6 +503,7 @@ fn bulk_part_record_batch_iter_filter(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    primary_key_sort,
     write_rows,
     full_scan,
     filter_1_host,

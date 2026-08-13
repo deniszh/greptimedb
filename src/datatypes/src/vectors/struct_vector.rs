@@ -15,7 +15,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::array::NullBufferBuilder;
+use arrow::array::{MutableArrayData, NullBufferBuilder};
 use arrow::compute::TakeOptions;
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow_array::{Array, ArrayRef, StructArray};
@@ -122,7 +122,7 @@ impl Vector for StructVector {
             .map(|i| {
                 let field_array = &self.array.column(i);
 
-                if field_array.is_null(i) {
+                if field_array.is_null(index) {
                     Value::Null
                 } else {
                     let scalar_value = ScalarValue::try_from_array(field_array, index).unwrap();
@@ -144,22 +144,28 @@ impl Vector for StructVector {
 
 impl VectorOp for StructVector {
     fn replicate(&self, offsets: &[usize]) -> VectorRef {
-        let column_arrays = self
-            .array
-            .columns()
-            .iter()
-            .map(|col| {
-                let vector = Helper::try_into_vector(col)
-                    .expect("Failed to replicate struct vector columns");
-                vector.replicate(offsets).to_arrow_array()
-            })
-            .collect::<Vec<_>>();
-        let replicated_array = StructArray::new(
-            self.array.fields().clone(),
-            column_arrays,
-            self.array.nulls().cloned(),
-        );
-        Arc::new(StructVector::try_new(self.fields.clone(), replicated_array).unwrap())
+        assert_eq!(offsets.len(), self.len());
+        assert!(offsets.is_sorted(), "offsets must be non-decreasing");
+
+        let Some(&output_len) = offsets.last() else {
+            return self.slice(0, 0);
+        };
+
+        let source = self.array.to_data();
+        let mut output = MutableArrayData::new(vec![&source], false, output_len);
+        let mut previous_offset = 0;
+
+        for (index, &offset) in offsets.iter().enumerate() {
+            for _ in previous_offset..offset {
+                output.extend(0, index, index + 1);
+            }
+            previous_offset = offset;
+        }
+
+        Arc::new(StructVector {
+            array: StructArray::from(output.freeze()),
+            fields: self.fields.clone(),
+        })
     }
 
     fn cast(&self, _to_type: &ConcreteDataType) -> Result<VectorRef> {
@@ -220,7 +226,7 @@ impl TryFrom<StructArray> for StructVector {
 
     fn try_from(array: StructArray) -> Result<Self> {
         let fields = match array.data_type() {
-            ArrowDataType::Struct(fields) => StructType::try_from(fields)?,
+            ArrowDataType::Struct(fields) => StructType::from(fields),
             other => ConversionSnafu {
                 from: other.to_string(),
             }
@@ -317,31 +323,42 @@ impl StructVectorBuilder {
         Ok(())
     }
 
+    pub(crate) fn push_struct_value_ref(&mut self, struct_value: StructValueRef<'_>) -> Result<()> {
+        match struct_value {
+            StructValueRef::Indexed { vector, idx } => match vector.get(idx).as_struct()? {
+                Some(struct_value) => self.push_struct_value(struct_value)?,
+                None => self.push_null_struct_value(),
+            },
+            StructValueRef::Ref(value) => self.push_struct_value(value)?,
+            StructValueRef::RefList { val, fields } => {
+                ensure!(
+                    val.len() == self.value_builders.len(),
+                    InconsistentStructFieldsAndItemsSnafu {
+                        field_len: self.value_builders.len(),
+                        item_len: val.len(),
+                    }
+                );
+                ensure!(
+                    fields.fields().len() == self.value_builders.len(),
+                    InconsistentStructFieldsAndItemsSnafu {
+                        field_len: self.value_builders.len(),
+                        item_len: fields.fields().len(),
+                    }
+                );
+                for (builder, value) in self.value_builders.iter_mut().zip(val) {
+                    builder.try_push_value_ref(&value)?;
+                }
+                self.null_buffer.append_non_null();
+            }
+        }
+        Ok(())
+    }
+
     fn push_null_struct_value(&mut self) {
         for builder in &mut self.value_builders {
             builder.push_null();
         }
         self.null_buffer.append_null();
-    }
-
-    pub(crate) fn struct_type(&self) -> &StructType {
-        &self.fields
-    }
-
-    pub(crate) fn value_builders(&self) -> &[Box<dyn MutableVector>] {
-        &self.value_builders
-    }
-
-    pub(crate) fn mut_value_builders(&mut self) -> &mut [Box<dyn MutableVector>] {
-        &mut self.value_builders
-    }
-
-    pub(crate) fn null_buffer(&self) -> &NullBufferBuilder {
-        &self.null_buffer
-    }
-
-    pub(crate) fn mut_null_buffer(&mut self) -> &mut NullBufferBuilder {
-        &mut self.null_buffer
     }
 }
 
@@ -372,18 +389,7 @@ impl MutableVector for StructVectorBuilder {
 
     fn try_push_value_ref(&mut self, value: &ValueRef) -> Result<()> {
         if let Some(struct_ref) = value.try_into_struct()? {
-            match struct_ref {
-                StructValueRef::Indexed { vector, idx } => match vector.get(idx).as_struct()? {
-                    Some(struct_value) => self.push_struct_value(struct_value)?,
-                    None => self.push_null(),
-                },
-                StructValueRef::Ref(val) => self.push_struct_value(val)?,
-                StructValueRef::RefList { val, fields } => {
-                    let struct_value =
-                        StructValue::try_new(val.into_iter().map(Value::from).collect(), fields)?;
-                    self.push_struct_value(&struct_value)?;
-                }
-            }
+            self.push_struct_value_ref(struct_ref)?;
         } else {
             self.push_null();
         }
@@ -460,7 +466,13 @@ impl ScalarVectorBuilder for StructVectorBuilder {
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{DictionaryArray, Int8Array, StringArray};
+    use arrow::buffer::NullBuffer;
+    use arrow::datatypes::Int8Type;
+
     use super::*;
+    use crate::json::JsonSettings;
+    use crate::schema::{ColumnDefaultConstraint, ColumnSchema};
     use crate::types::StructField;
     use crate::value::ListValue;
     use crate::value::tests::*;
@@ -508,6 +520,93 @@ mod tests {
         } else {
             panic!("Expected a struct value");
         }
+    }
+
+    #[test]
+    fn test_struct_vector_builder_push_ref_list() {
+        let struct_type = StructType::new(Arc::new(vec![
+            StructField::new("id".to_string(), ConcreteDataType::int64_datatype(), true),
+            StructField::new(
+                "name".to_string(),
+                ConcreteDataType::string_datatype(),
+                true,
+            ),
+        ]));
+        let mut builder = StructVectorBuilder::with_type_and_capacity(struct_type.clone(), 2);
+        builder
+            .push_struct_value_ref(StructValueRef::RefList {
+                val: vec![ValueRef::Int64(1), ValueRef::String("foo")],
+                fields: struct_type.clone(),
+            })
+            .unwrap();
+        builder.push_null();
+
+        let vector = builder.finish();
+        assert_eq!(vector.len(), 2);
+        assert_eq!(vector.null_count(), 1);
+        assert_eq!(
+            vector.get(0),
+            Value::Struct(StructValue::new(
+                vec![Value::Int64(1), Value::String("foo".into())],
+                struct_type,
+            ))
+        );
+        assert_eq!(vector.get(1), Value::Null);
+    }
+
+    #[test]
+    fn test_replicate_preserves_json2_identity() {
+        let json = JsonSettings::default()
+            .encode(serde_json::json!({"answer": 42}))
+            .unwrap();
+        let fields = StructType::new(Arc::new(vec![StructField::new(
+            "payload",
+            json.data_type(),
+            true,
+        )]));
+        let data_type = ConcreteDataType::struct_datatype(fields.clone());
+        let value = Value::Struct(StructValue::new(vec![json], fields));
+        let schema = ColumnSchema::new("nested", data_type.clone(), true)
+            .with_default_constraint(Some(ColumnDefaultConstraint::Value(value)))
+            .unwrap();
+
+        let replicated = schema.create_default_vector(2).unwrap().unwrap();
+
+        assert_eq!(replicated.data_type(), data_type);
+        assert_eq!(replicated.len(), 2);
+    }
+
+    #[test]
+    fn test_replicate_preserves_dictionary_and_nulls() {
+        let fields = StructType::new(Arc::new(vec![StructField::new(
+            "label",
+            ConcreteDataType::dictionary_datatype(
+                ConcreteDataType::int8_datatype(),
+                ConcreteDataType::string_datatype(),
+            ),
+            true,
+        )]));
+        let dictionary = DictionaryArray::<Int8Type>::new(
+            Int8Array::from(vec![Some(0), Some(1)]),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+        );
+        let array = StructArray::new(
+            fields.as_arrow_fields(),
+            vec![Arc::new(dictionary)],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        let vector = StructVector::try_new(fields.clone(), array).unwrap();
+
+        let replicated = vector.replicate(&[2, 3]);
+
+        assert_eq!(
+            replicated.data_type(),
+            ConcreteDataType::struct_datatype(fields)
+        );
+        assert_eq!(replicated.len(), 3);
+        assert_eq!(replicated.null_count(), 1);
+        assert_eq!(replicated.get(0), replicated.get(1));
+        assert!(replicated.is_null(2));
     }
 
     #[test]

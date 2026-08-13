@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod const_normalization;
 pub mod constant_term;
 pub mod count_nest_aggr;
 pub mod count_wildcard;
+pub mod global_limit;
+pub(crate) mod json_type_concretize;
 pub mod parallelize_scan;
 pub mod pass_distribution;
+pub mod promql_tsid_narrow_join;
 pub mod remove_duplicate;
 pub mod scan_hint;
 pub mod string_normalization;

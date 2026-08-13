@@ -23,6 +23,7 @@ use api::greptime_proto::v1::meta::{GrantedRegion as PbGrantedRegion, RegionRole
 use api::region::RegionResponse;
 use async_trait::async_trait;
 use common_error::ext::BoxedError;
+use common_recordbatch::adapter::RegionQueryStatCounters;
 use common_recordbatch::{EmptyRecordBatchStream, QueryMemoryTracker, SendableRecordBatchStream};
 use common_time::Timestamp;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -67,7 +68,7 @@ impl From<SettableRegionRoleState> for RegionRole {
             SettableRegionRoleState::Follower => RegionRole::Follower,
             SettableRegionRoleState::DowngradingLeader => RegionRole::DowngradingLeader,
             SettableRegionRoleState::Leader => RegionRole::Leader,
-            SettableRegionRoleState::StagingLeader => RegionRole::Leader, // Still a leader role
+            SettableRegionRoleState::StagingLeader => RegionRole::StagingLeader,
         }
     }
 }
@@ -210,6 +211,11 @@ pub enum RegionRole {
     Follower,
     // Writable region(mito2), Readonly region(file).
     Leader,
+    // Leader is in staging mode.
+    //
+    // This is leader-like and writable, but it follows the staging workflow
+    // semantics instead of a normal leader's steady state.
+    StagingLeader,
     // Leader is downgrading to follower.
     //
     // This state is used to prevent new write requests.
@@ -221,6 +227,7 @@ impl Display for RegionRole {
         match self {
             RegionRole::Follower => write!(f, "Follower"),
             RegionRole::Leader => write!(f, "Leader"),
+            RegionRole::StagingLeader => write!(f, "Leader(Staging)"),
             RegionRole::DowngradingLeader => write!(f, "Leader(Downgrading)"),
         }
     }
@@ -228,7 +235,7 @@ impl Display for RegionRole {
 
 impl RegionRole {
     pub fn writable(&self) -> bool {
-        matches!(self, RegionRole::Leader)
+        matches!(self, RegionRole::Leader | RegionRole::StagingLeader)
     }
 }
 
@@ -237,6 +244,7 @@ impl From<RegionRole> for PbRegionRole {
         match value {
             RegionRole::Follower => PbRegionRole::Follower,
             RegionRole::Leader => PbRegionRole::Leader,
+            RegionRole::StagingLeader => PbRegionRole::StagingLeader,
             RegionRole::DowngradingLeader => PbRegionRole::DowngradingLeader,
         }
     }
@@ -246,6 +254,7 @@ impl From<PbRegionRole> for RegionRole {
     fn from(value: PbRegionRole) -> Self {
         match value {
             PbRegionRole::Leader => RegionRole::Leader,
+            PbRegionRole::StagingLeader => RegionRole::StagingLeader,
             PbRegionRole::Follower => RegionRole::Follower,
             PbRegionRole::DowngradingLeader => RegionRole::DowngradingLeader,
         }
@@ -305,6 +314,11 @@ pub struct ScannerProperties {
 
     /// Whether the scanner is scanning a logical region.
     logical_region: bool,
+
+    /// Region id that should receive query-load metrics for this scanner.
+    query_load_region_id: Option<RegionId>,
+    /// Counters that should receive query-load metrics for this scanner.
+    query_stat_counters: Option<RegionQueryStatCounters>,
 }
 
 impl ScannerProperties {
@@ -329,6 +343,8 @@ impl ScannerProperties {
             distinguish_partition_range: false,
             target_partitions: 0,
             logical_region: false,
+            query_load_region_id: None,
+            query_stat_counters: None,
         }
     }
 
@@ -375,6 +391,26 @@ impl ScannerProperties {
     /// Sets whether the scanner is reading a logical region.
     pub fn set_logical_region(&mut self, logical_region: bool) {
         self.logical_region = logical_region;
+    }
+
+    /// Returns the region id that should receive query-load metrics.
+    pub fn query_load_region_id(&self) -> Option<RegionId> {
+        self.query_load_region_id
+    }
+
+    /// Returns the counters that should receive query-load metrics.
+    pub fn query_stat_counters(&self) -> Option<RegionQueryStatCounters> {
+        self.query_stat_counters.clone()
+    }
+
+    /// Sets the region id that should receive query-load metrics.
+    pub fn set_query_load_region_id(&mut self, region_id: RegionId) {
+        self.query_load_region_id = Some(region_id);
+    }
+
+    /// Sets the counters that should receive query-load metrics.
+    pub fn set_query_stat_counters(&mut self, counters: RegionQueryStatCounters) {
+        self.query_stat_counters = Some(counters);
     }
 }
 
@@ -463,6 +499,9 @@ pub trait RegionScanner: Debug + DisplayAs + Send {
     /// Sets whether the scanner is reading a logical region.
     fn set_logical_region(&mut self, logical_region: bool);
 
+    /// Sets the region id that should receive query-load metrics.
+    fn set_query_load_region_id(&mut self, region_id: RegionId);
+
     fn snapshot_sequence(&self) -> Option<SequenceNumber> {
         None
     }
@@ -475,7 +514,10 @@ pub type BatchResponses = Vec<(RegionId, Result<RegionResponse, BoxedError>)>;
 /// Represents the statistics of a region.
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct RegionStatistic {
-    /// The number of rows
+    /// The number of rows stored in SST files owned by this region plus rows in memtables.
+    ///
+    /// Rows from SST files referenced from other regions, for example after repartition,
+    /// are not counted to avoid table-level double counting when summing region statistics.
     #[serde(default)]
     pub num_rows: u64,
     /// The size of memtable in bytes.
@@ -484,11 +526,17 @@ pub struct RegionStatistic {
     pub wal_size: u64,
     /// The size of manifest in bytes.
     pub manifest_size: u64,
-    /// The size of SST data files in bytes.
+    /// The size of SST data files owned by this region in bytes.
+    ///
+    /// SST files referenced from other regions, for example after repartition, are not counted.
     pub sst_size: u64,
-    /// The num of SST files.
+    /// The number of SST files owned by this region.
+    ///
+    /// SST files referenced from other regions, for example after repartition, are not counted.
     pub sst_num: u64,
-    /// The size of SST index files in bytes.
+    /// The size of SST index files owned by this region in bytes.
+    ///
+    /// SST index files referenced from other regions, for example after repartition, are not counted.
     #[serde(default)]
     pub index_size: u64,
     /// The details of the region.
@@ -497,6 +545,14 @@ pub struct RegionStatistic {
     #[serde(default)]
     /// The total bytes written of the region since region opened.
     pub written_bytes: u64,
+    /// The total query CPU time of the region since region opened.
+    ///
+    /// Unit: nanoseconds.
+    #[serde(default)]
+    pub query_cpu_time: u64,
+    /// The total scanned bytes of the region since region opened.
+    #[serde(default)]
+    pub query_scanned_bytes: u64,
     /// The latest entry id of the region's remote WAL since last flush.
     /// For metric engine, there're two latest entry ids, one for data and one for metadata.
     /// TODO(weny): remove this two fields and use single instead.
@@ -647,6 +703,38 @@ impl RegionStatistic {
     /// Returns the estimated disk size of the region.
     pub fn estimated_disk_size(&self) -> u64 {
         self.wal_size + self.sst_size + self.manifest_size + self.index_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn region_statistic_deserializes_without_query_stats() {
+        let statistic: RegionStatistic = serde_json::from_value(json!({
+            "num_rows": 1,
+            "memtable_size": 2,
+            "wal_size": 3,
+            "manifest_size": 4,
+            "sst_size": 5,
+            "sst_num": 6,
+            "index_size": 7,
+            "manifest": {
+                "Mito": {
+                    "manifest_version": 8,
+                    "flushed_entry_id": 9,
+                    "file_removed_cnt": 10
+                }
+            },
+            "written_bytes": 11
+        }))
+        .unwrap();
+
+        assert_eq!(statistic.query_cpu_time, 0);
+        assert_eq!(statistic.query_scanned_bytes, 0);
     }
 }
 
@@ -1025,6 +1113,10 @@ impl RegionScanner for SinglePartitionScanner {
 
     fn set_logical_region(&mut self, logical_region: bool) {
         self.properties.set_logical_region(logical_region);
+    }
+
+    fn set_query_load_region_id(&mut self, region_id: RegionId) {
+        self.properties.set_query_load_region_id(region_id);
     }
 
     fn snapshot_sequence(&self) -> Option<SequenceNumber> {

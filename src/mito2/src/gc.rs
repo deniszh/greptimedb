@@ -30,7 +30,7 @@ use common_telemetry::tracing::Instrument as _;
 use common_telemetry::{debug, error, info, warn};
 use common_time::Timestamp;
 use itertools::Itertools;
-use object_store::{Entry, Lister};
+use object_store::{Entry, ErrorKind, Lister};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt as _, ensure};
 use store_api::storage::{FileId, FileRef, FileRefsManifest, GcReport, IndexVersion, RegionId};
@@ -41,6 +41,7 @@ use crate::access_layer::AccessLayerRef;
 use crate::cache::CacheManagerRef;
 use crate::cache::file_cache::FileType;
 use crate::config::MitoConfig;
+use crate::engine::region_hook::{RegionGcInfo, RegionHookRef};
 use crate::error::{
     DurationOutOfRangeSnafu, InvalidRequestSnafu, JoinSnafu, OpenDalSnafu, Result,
     TooManyGcJobsSnafu, UnexpectedSnafu,
@@ -53,6 +54,7 @@ use crate::metrics::{
 use crate::region::{MitoRegionRef, RegionRoleState};
 use crate::sst::file::{RegionFileId, RegionIndexId, delete_files, delete_indexes};
 use crate::sst::location::{self};
+use crate::worker::DROPPING_MARKER_FILE;
 
 #[cfg(test)]
 mod worker_test;
@@ -65,18 +67,36 @@ fn should_delete_file(
     is_linger: bool,
     is_eligible_for_delete: bool,
     is_region_dropped: bool,
-    _entry: &Entry,
-    _unknown_file_may_linger_until: chrono::DateTime<chrono::Utc>,
+    entry: &Entry,
+    unknown_file_may_linger_until: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    let is_known = is_linger || is_eligible_for_delete;
+    if is_in_manifest || is_in_tmp_ref {
+        return false;
+    }
 
-    !is_in_manifest
-        && !is_in_tmp_ref
-        && if is_known {
-            is_eligible_for_delete
-        } else {
-            !is_in_tmp_ref && is_region_dropped
-        }
+    let is_known = is_linger || is_eligible_for_delete;
+    if is_known {
+        return is_eligible_for_delete;
+    }
+
+    // Unknown file: not in manifest, tmp_ref, or known removed records.
+    // For dropped regions, unknown files not protected by manifest/tmp refs/cross-region refs
+    // are deleted immediately. This relies on meta collecting FileRefsManifest from related
+    // active regions before issuing dropped-region GC; preserving young unknown files would
+    // also require keeping the table_repart tombstone for retry.
+    // For active/open regions, only delete if the object's last-modified time exceeds the
+    // unknown_file_lingering_time TTL.
+    if is_region_dropped {
+        return true;
+    }
+
+    entry
+        .metadata()
+        .last_modified()
+        .map(|ts| {
+            ts.into_inner().as_millisecond() < unknown_file_may_linger_until.timestamp_millis()
+        })
+        .unwrap_or(false)
 }
 
 /// Limit the amount of concurrent GC jobs on the datanode
@@ -155,9 +175,11 @@ impl Default for GcConfig {
         Self {
             enable: false,
             // expect long running queries to be finished(or at least be able to notify it's using a deleted file) within a reasonable time
-            lingering_time: Some(Duration::from_secs(60)),
-            // 1 hours, for unknown expel time, which is when this file get removed from manifest, it should rarely happen, can keep it longer
-            unknown_file_lingering_time: Duration::from_secs(60 * 60),
+            lingering_time: Some(Duration::from_secs(60 * 60)),
+            // 1 day, for unknown expel time, which is when this file get removed from manifest.
+            // Only applies to full-listing GC for active/open regions. A long default avoids
+            // accidentally deleting pre-manifest files (e.g. compaction/flush still in progress).
+            unknown_file_lingering_time: Duration::from_secs(24 * 60 * 60),
             max_concurrent_lister_per_gc_job: 32,
             max_concurrent_gc_job: 4,
         }
@@ -185,6 +207,9 @@ pub struct LocalGcWorker {
     /// Set to false for regular GC operations to optimize performance.
     /// Set to true periodically or when you need to clean up orphan files.
     pub full_file_listing: bool,
+    /// The region hook (if any), fired via `on_region_gc` after each GC pass so
+    /// extensions with sidecar files outside the mito2 region dir can clean up.
+    pub(crate) hook: Option<RegionHookRef>,
 }
 
 pub struct ManifestOpenConfig {
@@ -220,6 +245,7 @@ impl LocalGcWorker {
         file_ref_manifest: FileRefsManifest,
         limiter: &GcLimiterRef,
         full_file_listing: bool,
+        hook: Option<RegionHookRef>,
     ) -> Result<Self> {
         if let Some(first_region_id) = regions_to_gc.keys().next() {
             let table_id = first_region_id.table_id();
@@ -247,6 +273,7 @@ impl LocalGcWorker {
             file_ref_manifest,
             _permit: permit,
             full_file_listing,
+            hook,
         })
     }
 
@@ -283,6 +310,7 @@ impl LocalGcWorker {
         let mut deleted_files = HashMap::new();
         let mut deleted_indexes = HashMap::new();
         let mut processed_regions = HashSet::new();
+        let mut need_retry_regions = HashSet::new();
         let tmp_ref_files = self.read_tmp_ref_files().await?;
         for (region_id, region) in &self.regions {
             let per_region_time = std::time::Instant::now();
@@ -301,16 +329,33 @@ impl LocalGcWorker {
                 .get(region_id)
                 .cloned()
                 .unwrap_or_else(HashSet::new);
-            let files = self
+            let outcome = self
                 .do_region_gc(*region_id, region.clone(), &tmp_ref_files)
                 .await?;
-            let index_files = files
+            let RegionGcOutcome {
+                removed_files,
+                extension_cleanup_failed,
+            } = outcome;
+            let index_files = removed_files
                 .iter()
                 .filter_map(|f| f.index_version().map(|v| (f.file_id(), v)))
                 .collect_vec();
-            deleted_files.insert(*region_id, files.into_iter().map(|f| f.file_id()).collect());
-            deleted_indexes.insert(*region_id, index_files);
-            processed_regions.insert(*region_id);
+            let data_files = removed_files
+                .into_iter()
+                .filter_map(|f| match f {
+                    RemovedFile::File(file_id, _) => Some(file_id),
+                    RemovedFile::Index(_, _) => None,
+                })
+                .collect();
+            // Don't acknowledge the region as processed until extension cleanup
+            // succeeds; retry it next pass instead.
+            if extension_cleanup_failed {
+                need_retry_regions.insert(*region_id);
+            } else {
+                deleted_files.insert(*region_id, data_files);
+                deleted_indexes.insert(*region_id, index_files);
+                processed_regions.insert(*region_id);
+            }
             debug!(
                 "GC for region {} took {} secs.",
                 region_id,
@@ -324,11 +369,24 @@ impl LocalGcWorker {
         let report = GcReport {
             deleted_files,
             deleted_indexes,
-            need_retry_regions: HashSet::new(),
+            need_retry_regions,
             processed_regions,
         };
         Ok(report)
     }
+}
+
+/// Per-region outcome of [`LocalGcWorker::do_region_gc`].
+///
+/// `extension_cleanup_failed` records whether a registered extension's
+/// [`RegionHook::on_region_gc`] could not finish; the caller must then keep the
+/// region un-acknowledged (retry set) so the next GC pass replays the callback.
+pub(crate) struct RegionGcOutcome {
+    /// Files physically deleted this pass.
+    pub removed_files: Vec<RemovedFile>,
+    /// `true` if a registered extension's `on_region_gc` returned `Err`; the
+    /// caller retries the region next pass.
+    pub extension_cleanup_failed: bool,
 }
 
 impl LocalGcWorker {
@@ -352,12 +410,12 @@ impl LocalGcWorker {
             region_present = region.is_some()
         )
     )]
-    pub async fn do_region_gc(
+    pub(crate) async fn do_region_gc(
         &self,
         region_id: RegionId,
         region: Option<MitoRegionRef>,
         tmp_ref_files: &HashSet<FileRef>,
-    ) -> Result<Vec<RemovedFile>> {
+    ) -> Result<RegionGcOutcome> {
         let mode = if self.full_file_listing {
             "full_listing"
         } else {
@@ -401,7 +459,10 @@ impl LocalGcWorker {
                 GC_ERRORS_TOTAL
                     .with_label_values(&["manifest_mismatch"])
                     .inc();
-                return Ok(vec![]);
+                return Ok(RegionGcOutcome {
+                    removed_files: vec![],
+                    extension_cleanup_failed: false,
+                });
             }
             Some(manifest)
         } else {
@@ -504,7 +565,45 @@ impl LocalGcWorker {
             "Successfully deleted {} unused files for region {}",
             unused_file_cnt, region_id
         );
-        if let Some(region) = &region {
+
+        // Notify extensions so they can clean up sidecar files. Fire when there
+        // are removed files, or on a full-listing pass (lets extensions reconcile
+        // orphans even when mito deleted nothing). Cleanup is always scoped to
+        // `removed_files`; see `RegionGcInfo`.
+        let extension_cleanup_failed = if let Some(hook) = &self.hook
+            && (!deletable_files.is_empty() || self.full_file_listing)
+        {
+            let region_metadata = region.as_ref().map(|r| r.metadata());
+            let result = hook
+                .on_region_gc(
+                    region_id,
+                    region_metadata.as_ref(),
+                    &self.access_layer,
+                    &RegionGcInfo {
+                        removed_files: &deletable_files,
+                        is_region_dropped,
+                        full_file_listing: self.full_file_listing,
+                    },
+                )
+                .await;
+            if let Err(err) = result {
+                warn!(
+                    err;
+                    "Region hook on_region_gc failed for region {}, will retry on the next GC pass",
+                    region_id
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Defer clearing the manifest tracking until the extension succeeds, so
+        // a failed live-region cleanup is replayed next pass. (Dropped regions
+        // have no manifest.)
+        if !extension_cleanup_failed && let Some(region) = &region {
             let _update_timer = GC_DURATION_SECONDS
                 .with_label_values(&["update_manifest"])
                 .start_timer();
@@ -512,7 +611,10 @@ impl LocalGcWorker {
                 .await?;
         }
 
-        Ok(deletable_files)
+        Ok(RegionGcOutcome {
+            removed_files: deletable_files,
+            extension_cleanup_failed,
+        })
     }
 
     #[common_telemetry::tracing::instrument(
@@ -671,20 +773,70 @@ impl LocalGcWorker {
             })?;
         let lister_cnt = listers.len();
 
-        // Step 2: Concurrently list all files in the region directory
-        let all_entries = self
+        // Step 2: Concurrently list all parquet files in the region root directory
+        let mut all_entries = self
             .list_region_files_concurrent(listers)
             .await
             .inspect_err(|_| {
                 GC_ERRORS_TOTAL.with_label_values(&["list_failed"]).inc();
             })?;
-        let cnt = all_entries.len();
+        let root_cnt = all_entries.len();
+
+        // Step 2b: Flat-list region_dir/index/ for puffin files.
+        // This is NOT a recursive listing — we only list the index/
+        // subdirectory to avoid scanning nested dirs/staging/blob/cache.
+        let index_entries = self
+            .list_region_index_files(region_id)
+            .await
+            .inspect_err(|_| {
+                GC_ERRORS_TOTAL.with_label_values(&["list_failed"]).inc();
+            })?;
+        let index_cnt = index_entries.len();
+        all_entries.extend(index_entries);
         info!(
-            "gc: full listing mode cost {} secs using {lister_cnt} lister for {cnt} files in region {}.",
+            "gc: full listing mode cost {} secs using {lister_cnt} lister for root={root_cnt} index={index_cnt} files in region {}.",
             start.elapsed().as_secs_f64(),
             region_id
         );
         Ok(all_entries)
+    }
+
+    /// Flat-list puffin files from `region_dir/index/`.
+    /// If the index directory does not exist, returns an empty vec without error.
+    /// Only `.puffin` files (not subdirectories) are included.
+    async fn list_region_index_files(&self, region_id: RegionId) -> Result<Vec<Entry>> {
+        let region_dir = self.access_layer.build_region_dir(region_id);
+        let index_dir = object_store::util::join_dir(&region_dir, "index");
+
+        let mut lister = match self
+            .access_layer
+            .object_store()
+            .lister_with(&index_dir)
+            .await
+        {
+            Ok(l) => l,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // Index dir may not exist — that's fine, just log and return empty.
+                // object-store backends (especially filesystem) may error on
+                // non-existent directories.
+                debug!(
+                    "Index directory not found for region {}: {}. Treating as empty.",
+                    region_id, e
+                );
+                return Ok(vec![]);
+            }
+            Err(e) => return Err(e).context(OpenDalSnafu),
+        };
+
+        let mut entries = Vec::new();
+        while let Some(entry) = lister.next().await {
+            let entry = entry.context(OpenDalSnafu)?;
+            if entry.metadata().is_file() && entry.name().ends_with(".puffin") {
+                entries.push(entry);
+            }
+        }
+
+        Ok(entries)
     }
 
     /// Concurrently list all files in the region directory using the provided listers.
@@ -710,7 +862,8 @@ impl LocalGcWorker {
                                 true
                             }
                         }
-                        // entry went wrong, log and skip it
+                        // Entry went wrong. Keep listing so the error can be propagated below
+                        // instead of returning a partial listing as success.
                         Err(err) => {
                             warn!("Failed to list entry: {}", err);
                             true
@@ -747,7 +900,9 @@ impl LocalGcWorker {
         // Collect all entries from the channel
         let mut all_entries = vec![];
         while let Some(stream) = rx.recv().await {
-            all_entries.extend(stream.into_iter().filter_map(Result::ok));
+            for entry in stream {
+                all_entries.push(entry.context(OpenDalSnafu)?);
+            }
         }
 
         Ok(all_entries)
@@ -794,6 +949,10 @@ impl LocalGcWorker {
             });
 
         for entry in entries {
+            if entry.name() == DROPPING_MARKER_FILE {
+                continue;
+            }
+
             let (file_id, file_type) = match location::parse_file_id_type_from_path(entry.name()) {
                 Ok((file_id, file_type)) => (file_id, file_type),
                 Err(err) => {
@@ -1053,6 +1212,14 @@ mod tests {
                 "78", "80", "88", "90", "98", "a0", "a8", "b0", "b8", "c0", "c8", "d0", "d8", "e0",
                 "e8", "f0", "f8",
             ]
+        );
+    }
+
+    #[test]
+    fn test_gc_config_default_lingering_time() {
+        assert_eq!(
+            GcConfig::default().lingering_time,
+            Some(Duration::from_secs(60 * 60))
         );
     }
 }

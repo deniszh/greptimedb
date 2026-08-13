@@ -39,6 +39,8 @@ mod drop_test;
 #[cfg(test)]
 mod edit_region_test;
 #[cfg(test)]
+mod file_ref_test;
+#[cfg(test)]
 mod filter_deleted_test;
 #[cfg(test)]
 mod flush_test;
@@ -56,6 +58,7 @@ mod parallel_test;
 mod projection_test;
 #[cfg(test)]
 mod prune_test;
+pub mod region_hook;
 #[cfg(test)]
 mod row_selector_test;
 #[cfg(test)]
@@ -102,6 +105,7 @@ use common_wal::options::WalOptions;
 use futures::future::{join_all, try_join_all};
 use futures::stream::{self, Stream, StreamExt};
 use object_store::manager::ObjectStoreManagerRef;
+use region_hook::RegionHookRef;
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::ManifestVersion;
 use store_api::codec::PrimaryKeyEncoding;
@@ -117,6 +121,7 @@ use store_api::region_engine::{
     RemapManifestsResponse, SetRegionRoleStateResponse, SettableRegionRoleState,
     SyncRegionFromRequest, SyncRegionFromResponse,
 };
+use store_api::region_info::RegionInfoEntry;
 use store_api::region_request::{
     AffectedRows, RegionCatchupRequest, RegionOpenRequest, RegionRequest,
 };
@@ -129,8 +134,9 @@ use crate::cache::{CacheManagerRef, CacheStrategy};
 use crate::config::MitoConfig;
 use crate::engine::puffin_index::{IndexEntryContext, collect_index_entries_from_puffin};
 use crate::error::{
-    InvalidRequestSnafu, JoinSnafu, MitoManifestInfoSnafu, RecvSnafu, RegionNotFoundSnafu, Result,
-    SerdeJsonSnafu, SerializeColumnMetadataSnafu,
+    IncrementalQueryStaleSnafu, InvalidRequestSnafu, JoinSnafu, MitoManifestInfoSnafu, RecvSnafu,
+    RegionNotFoundSnafu, Result, SerdeJsonSnafu, SerializeColumnMetadataSnafu,
+    SnapshotFenceStaleSnafu,
 };
 #[cfg(feature = "enterprise")]
 use crate::extension::BoxedExtensionRangeProviderFactory;
@@ -214,6 +220,9 @@ impl<'a, S: LogStore> MitoEngineBuilder<'a, S> {
         self.config.sanitize(self.data_home)?;
 
         let config = Arc::new(self.config);
+        // Extract the region hook before `plugins` is moved into the WorkerGroup,
+        // so the engine (and thus the GC worker) can fire `on_region_gc`.
+        let region_hook = self.plugins.get::<RegionHookRef>();
         let workers = WorkerGroup::start(
             config.clone(),
             self.log_store.clone(),
@@ -245,6 +254,7 @@ impl<'a, S: LogStore> MitoEngineBuilder<'a, S> {
             config,
             wal_raw_entry_reader,
             scan_memory_tracker,
+            region_hook,
             #[cfg(feature = "enterprise")]
             extension_range_provider_factory: None,
         };
@@ -323,6 +333,12 @@ impl MitoEngine {
         self.inner.workers.schema_metadata_manager()
     }
 
+    /// Returns the registered region hook (if any), for the GC worker to fire
+    /// [`RegionHook::on_region_gc`].
+    pub fn region_hook(&self) -> Option<RegionHookRef> {
+        self.inner.region_hook.clone()
+    }
+
     /// Get all tmp ref files for given region ids, excluding files that's already in manifest.
     pub async fn get_snapshot_of_file_refs(
         &self,
@@ -353,10 +369,13 @@ impl MitoEngine {
                 );
             let mut dst_region_to_src_regions = Vec::with_capacity(dst2src.len());
             for (dst_region, srcs) in dst2src {
-                let Some(dst_region) = self.find_region(dst_region) else {
-                    continue;
+                let Some(region) = self.find_region(dst_region) else {
+                    return RegionNotFoundSnafu {
+                        region_id: dst_region,
+                    }
+                    .fail();
                 };
-                dst_region_to_src_regions.push((dst_region, srcs));
+                dst_region_to_src_regions.push((region, srcs));
             }
             dst_region_to_src_regions
         };
@@ -455,11 +474,7 @@ impl MitoEngine {
         );
 
         let (tx, rx) = oneshot::channel();
-        let request = WorkerRequest::EditRegion(RegionEditRequest {
-            region_id,
-            edit,
-            tx,
-        });
+        let request = WorkerRequest::EditRegion(RegionEditRequest::new(region_id, edit, true, tx));
         self.inner
             .workers
             .submit_to_worker(region_id, request)
@@ -616,8 +631,10 @@ impl MitoEngine {
                             return Vec::new();
                         }
                     };
+                    // The index file path is derived from the physical file owner. After
+                    // repartition, `entry.region_id` is only the referring region.
                     let region_index_id = RegionIndexId::new(
-                        RegionFileId::new(entry.region_id, file_id),
+                        RegionFileId::new(entry.origin_region_id, file_id),
                         index_version,
                     );
                     let context = IndexEntryContext {
@@ -655,6 +672,16 @@ impl MitoEngine {
         }
 
         results
+    }
+
+    /// Lists region info entries of all regions in the engine.
+    pub async fn all_region_infos(&self) -> Vec<RegionInfoEntry> {
+        let node_id = self.inner.workers.file_ref_manager().node_id();
+        self.inner
+            .workers
+            .all_regions()
+            .map(|region| region.region_info_entry(node_id))
+            .collect()
     }
 
     /// Lists all SSTs from the storage layer of all regions in the engine.
@@ -712,6 +739,9 @@ struct EngineInner {
     wal_raw_entry_reader: Arc<dyn RawEntryReader>,
     /// Memory tracker for table scans.
     scan_memory_tracker: QueryMemoryTracker,
+    /// The region hook (if any) registered via plugins; exposed for the GC worker
+    /// to fire [`RegionHook::on_region_gc`].
+    region_hook: Option<RegionHookRef>,
     #[cfg(feature = "enterprise")]
     extension_range_provider_factory: Option<BoxedExtensionRangeProviderFactory>,
 }
@@ -1013,11 +1043,49 @@ impl EngineInner {
 
     /// Handles the scan `request` and returns a [ScanRegion].
     #[tracing::instrument(skip_all, fields(region_id = %region_id))]
-    fn scan_region(&self, region_id: RegionId, request: ScanRequest) -> Result<ScanRegion> {
+    fn scan_region(&self, region_id: RegionId, mut request: ScanRequest) -> Result<ScanRegion> {
         let query_start = Instant::now();
         // Reading a region doesn't need to go through the region worker thread.
         let region = self.find_region(region_id)?;
-        let version = region.version();
+        let version_data = region.version_control.current();
+        let version = version_data.version;
+
+        if request.snapshot_on_scan && request.memtable_max_sequence.is_none() {
+            request.memtable_max_sequence = Some(version_data.committed_sequence);
+        }
+
+        if let Some(given_seq) = request.memtable_min_sequence {
+            let min_readable_seq = version.flushed_sequence;
+            ensure!(
+                given_seq >= min_readable_seq,
+                IncrementalQueryStaleSnafu {
+                    region_id,
+                    given_seq,
+                    min_readable_seq,
+                }
+            );
+        }
+
+        if let Some(given_seq) = request.memtable_max_sequence
+            && !request.skip_sst_files
+        {
+            // Explicit snapshot fences that include SST reads are enforceable
+            // only while the requested upper bound is not older than the
+            // region's flushed frontier. If H has already been flushed into SST,
+            // mito cannot apply a memtable-only sequence upper bound to that
+            // SST scan, so fail and let Flow rebind the fenced repair instead
+            // of reading rows beyond H.
+            let min_enforceable_seq = version.flushed_sequence;
+            ensure!(
+                given_seq >= min_enforceable_seq,
+                SnapshotFenceStaleSnafu {
+                    region_id,
+                    given_seq,
+                    min_enforceable_seq,
+                }
+            );
+        }
+
         // Get cache.
         let cache_manager = self.workers.cache_manager();
 
@@ -1027,6 +1095,7 @@ impl EngineInner {
             request,
             CacheStrategy::EnableAll(cache_manager),
         )
+        .with_query_stat_counters(region.region_stats.query_stat_counters())
         .with_max_concurrent_scan_files(self.config.max_concurrent_scan_files)
         .with_ignore_inverted_index(self.config.inverted_index.apply_on_query.disabled())
         .with_ignore_fulltext_index(self.config.fulltext_index.apply_on_query.disabled())
@@ -1114,13 +1183,9 @@ impl EngineInner {
     }
 
     fn role(&self, region_id: RegionId) -> Option<RegionRole> {
-        self.workers.get_region(region_id).map(|region| {
-            if region.is_follower() {
-                RegionRole::Follower
-            } else {
-                RegionRole::Leader
-            }
-        })
+        self.workers
+            .get_region(region_id)
+            .map(|region| region.region_role())
     }
 }
 
@@ -1407,6 +1472,7 @@ impl MitoEngine {
                 config,
                 wal_raw_entry_reader,
                 scan_memory_tracker,
+                region_hook: None,
                 #[cfg(feature = "enterprise")]
                 extension_range_provider_factory: None,
             }),
@@ -1452,7 +1518,19 @@ mod tests {
         };
         assert!(!is_valid_region_edit(&edit));
 
-        // Valid: "files_to_remove" is not empty
+        // Valid: has only "files_to_remove"
+        let edit = RegionEdit {
+            files_to_add: vec![],
+            files_to_remove: vec![FileMeta::default()],
+            timestamp_ms: None,
+            compaction_time_window: None,
+            flushed_entry_id: None,
+            flushed_sequence: None,
+            committed_sequence: None,
+        };
+        assert!(is_valid_region_edit(&edit));
+
+        // Valid: both "files_to_add" and "files_to_remove" are not empty
         let edit = RegionEdit {
             files_to_add: vec![FileMeta::default()],
             files_to_remove: vec![FileMeta::default()],

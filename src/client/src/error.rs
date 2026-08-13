@@ -15,7 +15,7 @@
 use std::any::Any;
 
 use common_error::define_from_tonic_status;
-use common_error::ext::{BoxedError, ErrorExt};
+use common_error::ext::{BoxedError, ErrorExt, RetryHint};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use snafu::{Location, Snafu};
@@ -130,6 +130,7 @@ pub enum Error {
         code: StatusCode,
         msg: String,
         tonic_code: Code,
+        retry_hint: RetryHint,
         #[snafu(implicit)]
         location: Location,
     },
@@ -168,25 +169,52 @@ impl ErrorExt for Error {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn retry_hint(&self) -> RetryHint {
+        match self {
+            Error::Tonic { retry_hint, .. } => *retry_hint,
+            Error::FlightGet { source, .. }
+            | Error::RegionServer { source, .. }
+            | Error::FlowServer { source, .. }
+            | Error::External { source, .. } => source.retry_hint(),
+            Error::ConvertFlightData { source, .. }
+            | Error::CreateChannel { source, .. }
+            | Error::CreateTlsChannel { source, .. } => source.retry_hint(),
+            Error::ConvertSchema { source, .. } => source.retry_hint(),
+            _ => RetryHint::NonRetryable,
+        }
+    }
 }
 
 define_from_tonic_status!(Error, Tonic);
 
 impl Error {
-    pub fn should_retry(&self) -> bool {
-        // TODO(weny): figure out each case of these codes.
-        matches!(
-            self,
-            Self::RegionServer {
-                code: Code::Cancelled,
-                ..
-            } | Self::RegionServer {
-                code: Code::DeadlineExceeded,
-                ..
-            } | Self::RegionServer {
-                code: Code::Unavailable,
-                ..
+    /// Returns the gRPC status code if this error is caused by a gRPC request failure.
+    pub fn tonic_code(&self) -> Option<Code> {
+        match self {
+            Self::FlightGet { tonic_code, .. }
+            | Self::RegionServer {
+                code: tonic_code, ..
             }
-        )
+            | Self::FlowServer {
+                code: tonic_code, ..
+            }
+            | Self::Tonic { tonic_code, .. } => Some(*tonic_code),
+            _ => None,
+        }
+    }
+
+    /// Returns true if the error is a connection error that may be resolved by retrying the request.
+    pub fn is_connection_error(&self) -> bool {
+        matches!(self.tonic_code(), Some(Code::Unavailable))
+    }
+
+    pub fn should_retry(&self) -> bool {
+        self.retry_hint().is_retryable()
+            || self.is_connection_error()
+            || matches!(
+                self.tonic_code(),
+                Some(Code::Cancelled) | Some(Code::DeadlineExceeded)
+            )
     }
 }

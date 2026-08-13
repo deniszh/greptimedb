@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use common_base::Plugins;
+use common_meta::cache::CacheRegistryBuilder;
 use common_meta::kv_backend::KvBackendRef;
 use standalone::error::Result;
 use standalone::options::StandaloneOptions;
@@ -30,8 +31,9 @@ pub async fn setup_standalone_plugins(
     Ok(())
 }
 
-pub async fn start_standalone_plugins(_plugins: Plugins) -> Result<()> {
-    Ok(())
+/// Allows standalone plugins to add cache invalidators to the layered registry.
+pub fn configure_cache_registry(_plugins: &Plugins) -> Option<CacheRegistryBuilder> {
+    None
 }
 
 pub mod context {

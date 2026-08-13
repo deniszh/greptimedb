@@ -33,7 +33,7 @@ mod tests {
     use datafusion_expr::LogicalPlan;
     use frontend::error::{Error, Result};
     use frontend::instance::Instance;
-    use query::parser::QueryLanguageParser;
+    use query::parser::{QueryLanguageParser, QueryStatement};
     use query::query_engine::DefaultSerializer;
     use servers::interceptor::{SqlQueryInterceptor, SqlQueryInterceptorRef};
     use servers::query_handler::sql::SqlQueryHandler;
@@ -323,7 +323,7 @@ mod tests {
 
             fn pre_execute(
                 &self,
-                _statement: &Statement,
+                _statement: Option<&Statement>,
                 _plan: Option<&LogicalPlan>,
                 _query_ctx: QueryContextRef,
             ) -> Result<()> {
@@ -379,6 +379,82 @@ mod tests {
             OutputData::AffectedRows(rows) => assert_eq!(rows, 10),
             _ => unreachable!(),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_exec_plan_interceptor_plugin() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Default)]
+        struct ExecPlanHook {
+            pub(crate) pre_execute_called: AtomicBool,
+            pub(crate) post_execute_called: AtomicBool,
+        }
+
+        impl SqlQueryInterceptor for ExecPlanHook {
+            type Error = Error;
+
+            fn pre_execute(
+                &self,
+                _statement: Option<&Statement>,
+                _plan: Option<&LogicalPlan>,
+                _query_ctx: QueryContextRef,
+            ) -> Result<()> {
+                self.pre_execute_called.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+
+            fn post_execute(&self, output: Output, _query_ctx: QueryContextRef) -> Result<Output> {
+                self.post_execute_called.store(true, Ordering::Relaxed);
+                Ok(output)
+            }
+        }
+
+        let plugins = Plugins::new();
+        let hook = Arc::new(ExecPlanHook::default());
+        plugins.insert::<SqlQueryInterceptorRef<Error>>(hook.clone());
+
+        let standalone = GreptimeDbStandaloneBuilder::new("test_exec_plan_interceptor_plugin")
+            .with_plugin(plugins)
+            .build()
+            .await;
+        let instance = standalone.fe_instance().clone();
+
+        let sql = r#"CREATE TABLE demo(
+                            host STRING,
+                            ts TIMESTAMP,
+                            cpu DOUBLE NULL,
+                            TIME INDEX (ts),
+                            PRIMARY KEY(host)
+                        ) engine=mito;"#;
+        SqlQueryHandler::do_query(&*instance, sql, QueryContext::arc())
+            .await
+            .remove(0)
+            .unwrap();
+
+        let query_ctx = QueryContext::arc();
+        let stmt = QueryLanguageParser::parse_sql("SELECT * FROM demo", &query_ctx).unwrap();
+        let plan = instance
+            .statement_executor()
+            .plan(&stmt, query_ctx.clone())
+            .await
+            .unwrap();
+        let QueryStatement::Sql(sql_stmt) = stmt else {
+            unreachable!()
+        };
+
+        SqlQueryHandler::do_exec_plan(&*instance, plan, Some(sql_stmt), query_ctx.clone())
+            .await
+            .unwrap();
+
+        assert!(
+            hook.pre_execute_called.load(Ordering::Relaxed),
+            "pre_execute should be called for do_exec_plan"
+        );
+        assert!(
+            hook.post_execute_called.load(Ordering::Relaxed),
+            "post_execute should be called for do_exec_plan"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -459,5 +535,160 @@ mod tests {
         } else {
             unreachable!();
         }
+    }
+
+    /// The entity-graph derivation must run as the caller: a source table the
+    /// caller cannot read contributes neither entities nor edges.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_entity_graph_derivation_runs_as_caller() {
+        common_telemetry::init_default_ut_logging();
+
+        /// Denies the entity-graph derivation on `secret_traces` only.
+        struct DenySecretTraces;
+
+        impl auth::PermissionChecker for DenySecretTraces {
+            fn check_permission(
+                &self,
+                _user_info: auth::UserInfoRef,
+                _req: auth::PermissionReq,
+            ) -> auth::error::Result<auth::PermissionResp> {
+                Ok(auth::PermissionResp::Allow)
+            }
+
+            fn check_permission_with_table_targets(
+                &self,
+                _user_info: auth::UserInfoRef,
+                req: auth::PermissionReq,
+                targets: auth::PermissionTableTargets,
+            ) -> auth::error::Result<auth::PermissionResp> {
+                if matches!(req, auth::PermissionReq::Action(auth::SEMANTIC_GRAPH_QUERY))
+                    && let auth::PermissionTableTargets::Resolved(targets) = targets
+                    && targets
+                        .iter()
+                        .any(|target| target.table.starts_with("secret_"))
+                {
+                    return Ok(auth::PermissionResp::Reject);
+                }
+                Ok(auth::PermissionResp::Allow)
+            }
+        }
+
+        let plugins = Plugins::new();
+        plugins.insert::<auth::PermissionCheckerRef>(Arc::new(DenySecretTraces));
+
+        let standalone = GreptimeDbStandaloneBuilder::new("test_entity_graph_runs_as_caller")
+            .with_plugin(plugins)
+            .build()
+            .await;
+        let instance = standalone.fe_instance().clone();
+
+        for (table, trace_id) in [("open_traces", "t0"), ("secret_traces", "t1")] {
+            let create = format!(
+                r#"create table {table} (
+                    "timestamp" timestamp(9) time index,
+                    trace_id string,
+                    span_id string,
+                    parent_span_id string,
+                    span_kind string,
+                    span_status_code string,
+                    service_name string,
+                    duration_nano bigint unsigned,
+                    primary key (service_name)
+                ) with ('table_data_model' = 'greptime_trace_v1', 'append_mode' = 'true')"#
+            );
+            create_table(&instance, &create).await;
+            let insert = format!(
+                "insert into {table} values \
+                 (now(), '{trace_id}', 'c1', NULL, 'SPAN_KIND_CLIENT', 'STATUS_CODE_UNSET', 'client-{table}', 0), \
+                 (now(), '{trace_id}', 's1', 'c1', 'SPAN_KIND_SERVER', 'STATUS_CODE_UNSET', 'server-{table}', 100)"
+            );
+            let output = query(&instance, &insert).await;
+            let OutputData::AffectedRows(x) = output.data else {
+                unreachable!()
+            };
+            assert_eq!(x, 2);
+        }
+
+        // A pair split across tables (client here, server in a denied table):
+        // a join-derived edge needs read access to all of its input tables.
+        create_table(
+            &instance,
+            r#"create table cross_clients (
+                "timestamp" timestamp(9) time index,
+                trace_id string,
+                span_id string,
+                parent_span_id string,
+                span_kind string,
+                span_status_code string,
+                service_name string,
+                duration_nano bigint unsigned,
+                primary key (service_name)
+            ) with ('table_data_model' = 'greptime_trace_v1', 'append_mode' = 'true')"#,
+        )
+        .await;
+        create_table(
+            &instance,
+            r#"create table secret_cross_servers (
+                "timestamp" timestamp(9) time index,
+                trace_id string,
+                span_id string,
+                parent_span_id string,
+                span_kind string,
+                span_status_code string,
+                service_name string,
+                duration_nano bigint unsigned,
+                primary key (service_name)
+            ) with ('table_data_model' = 'greptime_trace_v1', 'append_mode' = 'true')"#,
+        )
+        .await;
+        for insert in [
+            "insert into cross_clients values \
+             (now(), 't9', 'c9', NULL, 'SPAN_KIND_CLIENT', 'STATUS_CODE_UNSET', 'client-cross', 0)",
+            "insert into secret_cross_servers values \
+             (now(), 't9', 's9', 'c9', 'SPAN_KIND_SERVER', 'STATUS_CODE_UNSET', 'server-cross', 100)",
+        ] {
+            let output = query(&instance, insert).await;
+            let OutputData::AffectedRows(x) = output.data else {
+                unreachable!()
+            };
+            assert_eq!(x, 1);
+        }
+
+        let sql = "select src_id, dst_id from greptime_private.semantic_relationships \
+                   order by src_id";
+        let output = query(&instance, sql).await;
+        let OutputData::Stream(s) = output.data else {
+            unreachable!()
+        };
+        let batches = common_recordbatch::util::collect_batches(s).await.unwrap();
+        let pretty_print = batches.pretty_print().unwrap();
+        assert!(
+            pretty_print.contains("client-open_traces"),
+            "allowed edge missing:\n{pretty_print}"
+        );
+        assert!(
+            !pretty_print.contains("secret_traces"),
+            "denied source leaked into edges:\n{pretty_print}"
+        );
+        assert!(
+            !pretty_print.contains("client-cross"),
+            "edge with a denied join side leaked:\n{pretty_print}"
+        );
+
+        let sql = "select entity_id from greptime_private.semantic_entities order by entity_id";
+        let output = query(&instance, sql).await;
+        let OutputData::Stream(s) = output.data else {
+            unreachable!()
+        };
+        let batches = common_recordbatch::util::collect_batches(s).await.unwrap();
+        let pretty_print = batches.pretty_print().unwrap();
+        assert!(
+            pretty_print.contains("client-open_traces"),
+            "allowed entity missing:\n{pretty_print}"
+        );
+        assert!(
+            !pretty_print.contains("secret_traces") && !pretty_print.contains("server-cross"),
+            "denied source leaked into entities:\n{pretty_print}"
+        );
     }
 }

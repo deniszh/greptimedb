@@ -19,18 +19,21 @@ use api::v1::query_request::Query;
 use async_trait::async_trait;
 use catalog::memory::MemoryCatalogManager;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_error::ext::BoxedError;
 use common_grpc::flight::do_put::DoPutResponse;
 use common_query::Output;
 use datafusion_expr::LogicalPlan;
+use futures_util::TryFutureExt;
 use query::options::QueryOptions;
-use query::parser::{PromQuery, QueryLanguageParser, QueryStatement};
+use query::parser::{PromQuery, QueryStatement};
 use query::query_engine::DescribeResult;
 use query::{QueryEngineFactory, QueryEngineRef};
-use servers::error::{NotSupportedSnafu, Result};
+use servers::error::{ExecuteQuerySnafu, NotSupportedSnafu, Result};
 use servers::query_handler::grpc::GrpcQueryHandler;
 use servers::query_handler::sql::{ServerSqlQueryHandlerRef, SqlQueryHandler};
 use session::context::QueryContextRef;
-use snafu::ensure;
+use snafu::{ResultExt, ensure};
+use sql::parser::{ParseOptions, ParserContext};
 use sql::statements::statement::Statement;
 use table::TableRef;
 
@@ -38,6 +41,7 @@ mod http;
 mod interceptor;
 mod mysql;
 mod postgres;
+mod prom_remote_write_v2_test;
 
 pub struct DummyInstance {
     query_engine: QueryEngineRef,
@@ -52,21 +56,90 @@ impl DummyInstance {
 #[async_trait]
 impl SqlQueryHandler for DummyInstance {
     async fn do_query(&self, query: &str, query_ctx: QueryContextRef) -> Vec<Result<Output>> {
-        let stmt = QueryLanguageParser::parse_sql(query, &query_ctx).unwrap();
-        let plan = self
-            .query_engine
+        let mut results = vec![];
+
+        let statements = ParserContext::create_with_dialect(
+            query,
+            query_ctx.sql_dialect(),
+            ParseOptions::default(),
+        )
+        .map(|x| x.into_iter().map(QueryStatement::Sql).collect::<Vec<_>>())
+        .unwrap();
+
+        for statement in &statements {
+            let result = self
+                .query_engine
+                .planner()
+                .plan(statement, query_ctx.clone())
+                .and_then(|plan| self.query_engine.execute(plan, query_ctx.clone()))
+                .await
+                .map_err(BoxedError::new)
+                .context(ExecuteQuerySnafu);
+            results.push(result);
+        }
+
+        results
+    }
+
+    async fn do_analyze_stream_query(
+        &self,
+        query: &str,
+        query_ctx: QueryContextRef,
+    ) -> Result<Output> {
+        let mut statements = ParserContext::create_with_dialect(
+            query,
+            query_ctx.sql_dialect(),
+            ParseOptions::default(),
+        )
+        .map_err(BoxedError::new)
+        .context(ExecuteQuerySnafu)?;
+        ensure!(
+            statements.len() == 1,
+            NotSupportedSnafu {
+                feat: "execute multiple statements in analyze stream query"
+            }
+        );
+
+        let mut statement = statements.remove(0);
+        let Statement::Explain(explain) = &mut statement else {
+            return NotSupportedSnafu {
+                feat: "non EXPLAIN ANALYZE VERBOSE analyze stream query",
+            }
+            .fail();
+        };
+        ensure!(
+            explain.analyze && explain.verbose,
+            NotSupportedSnafu {
+                feat: "non EXPLAIN ANALYZE VERBOSE analyze stream query"
+            }
+        );
+        match &explain.format {
+            None => {}
+            Some(format) if format.to_string().eq_ignore_ascii_case("json") => {
+                explain.format = None;
+            }
+            Some(_) => {
+                return NotSupportedSnafu {
+                    feat: "non-JSON analyze stream format",
+                }
+                .fail();
+            }
+        }
+        query_ctx.set_explain_format("JSON".to_string());
+
+        self.query_engine
             .planner()
-            .plan(&stmt, query_ctx.clone())
+            .plan(&QueryStatement::Sql(statement), query_ctx.clone())
+            .and_then(|plan| self.query_engine.execute(plan, query_ctx.clone()))
             .await
-            .unwrap();
-        let output = self.query_engine.execute(plan, query_ctx).await.unwrap();
-        vec![Ok(output)]
+            .map_err(BoxedError::new)
+            .context(ExecuteQuerySnafu)
     }
 
     async fn do_exec_plan(
         &self,
-        _stmt: Option<Statement>,
         plan: LogicalPlan,
+        _stmt: Option<Statement>,
         query_ctx: QueryContextRef,
     ) -> Result<Output> {
         Ok(self.query_engine.execute(plan, query_ctx).await.unwrap())

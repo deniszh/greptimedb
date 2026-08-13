@@ -19,10 +19,10 @@ use clap::{Parser, Subcommand};
 use cmd::datanode::builder::InstanceBuilder;
 use cmd::error::{InitTlsProviderSnafu, Result};
 use cmd::options::GlobalOptions;
-use cmd::{App, cli, datanode, flownode, frontend, metasrv, standalone};
+use cmd::{App, cli, datanode, flownode, frontend, metasrv, standalone, user};
 use common_base::Plugins;
 use common_version::{product_name, verbose_version, version};
-use servers::install_ring_crypto_provider;
+use servers::install_default_crypto_provider;
 
 #[derive(Parser)]
 #[command(name = product_name(), author, version, long_version = verbose_version(), about)]
@@ -60,6 +60,10 @@ enum SubCommand {
     /// Execute the cli tools.
     #[clap(name = "cli")]
     Cli(cli::Command),
+
+    /// Manage user credentials.
+    #[clap(name = "user")]
+    User(user::Command),
 }
 
 #[cfg(not(windows))]
@@ -98,7 +102,7 @@ async fn main() -> Result<()> {
 
 async fn main_body() -> Result<()> {
     setup_human_panic();
-    install_ring_crypto_provider().map_err(|msg| InitTlsProviderSnafu { msg }.build())?;
+    install_default_crypto_provider().map_err(|msg| InitTlsProviderSnafu { msg }.build())?;
     start(Command::parse()).await
 }
 
@@ -113,6 +117,7 @@ async fn start(cli: Command) -> Result<()> {
             }
             datanode::SubCommand::Objbench(ref bench) => bench.run().await,
             datanode::SubCommand::Scanbench(ref bench) => bench.run().await,
+            datanode::SubCommand::Parquetbench(ref bench) => bench.run().await,
         },
         SubCommand::Flownode(cmd) => {
             cmd.build(cmd.load_options(&cli.global_options)?)
@@ -144,6 +149,7 @@ async fn start(cli: Command) -> Result<()> {
                 .run()
                 .await
         }
+        SubCommand::User(cmd) => cmd.run(),
     }
 }
 

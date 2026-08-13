@@ -6,6 +6,7 @@ create database pg_catalog;
 SELECT session_user is not null;
 
 -- SQLNESS REPLACE PostgreSQL.* VERSION
+-- SQLNESS REPLACE [\s\-]+
 -- current_schema
 -- SQLNESS PROTOCOL POSTGRES
 select current_schema(), current_schemas(true), current_schemas(false), version(), current_database();
@@ -52,6 +53,7 @@ WHERE c.relkind IN ('r','p','v','m','S','f','')
       AND n.nspname <> 'pg_catalog'
       AND n.nspname !~ '^pg_toast'
       AND n.nspname <> 'information_schema'
+      AND n.nspname <> 'greptime_private'
   AND pg_catalog.pg_table_is_visible(c.oid)
 ORDER BY 1,2;
 
@@ -67,6 +69,7 @@ WHERE c.relkind IN ('r','p','')
       AND n.nspname <> 'pg_catalog'
       AND n.nspname !~ '^pg_toast'
       AND n.nspname <> 'information_schema'
+      AND n.nspname <> 'greptime_private'
   AND pg_catalog.pg_table_is_visible(c.oid)
 ORDER BY 1,2;
 
@@ -109,6 +112,7 @@ WHERE c.relkind IN ('r','p','')
       AND n.nspname <> 'pg_catalog'
       AND n.nspname !~ '^pg_toast'
       AND n.nspname <> 'information_schema'
+      AND n.nspname <> 'greptime_private'
   AND pg_catalog.pg_table_is_visible(c.oid)
 ORDER BY 1,2;
 
@@ -151,6 +155,7 @@ SELECT
     FROM information_schema.tables
     WHERE quote_ident(table_schema) NOT IN ('information_schema',
                                 'pg_catalog',
+                                'greptime_private',
                                 '_timescaledb_cache',
                                 '_timescaledb_catalog',
                                 '_timescaledb_internal',
@@ -200,6 +205,7 @@ where relnamespace in (
     where nspname <> 'public'
       and nspname <> 'information_schema'
       and nspname <> 'pg_catalog'
+      and nspname <> 'greptime_private'
 )
 order by relnamespace, relname;
 

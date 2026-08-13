@@ -25,22 +25,22 @@ use store_api::storage::RegionId;
 use crate::error::Result;
 use crate::procedure::repartition::collect::{Collect, ProcedureMeta};
 use crate::procedure::repartition::group::RepartitionGroupProcedure;
-use crate::procedure::repartition::plan::RegionDescriptor;
+use crate::procedure::repartition::plan::{SourceRegionDescriptor, TargetRegionDescriptor};
 use crate::procedure::repartition::{self, Context, State};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dispatch;
 
-fn build_region_mapping(
-    source_regions: &[RegionDescriptor],
-    target_regions: &[RegionDescriptor],
+pub(crate) fn build_region_mapping(
+    source_regions: &[SourceRegionDescriptor],
+    target_regions: &[TargetRegionDescriptor],
     transition_map: &[Vec<usize>],
 ) -> HashMap<RegionId, Vec<RegionId>> {
     transition_map
         .iter()
         .enumerate()
         .map(|(source_idx, indices)| {
-            let source_region = source_regions[source_idx].region_id;
+            let source_region = source_regions[source_idx].region_id();
             let target_regions = indices
                 .iter()
                 .map(|&target_idx| target_regions[target_idx].region_id)
@@ -56,7 +56,7 @@ impl State for Dispatch {
     async fn next(
         &mut self,
         ctx: &mut Context,
-        _procedure_ctx: &ProcedureContext,
+        procedure_ctx: &ProcedureContext,
     ) -> Result<(Box<dyn State>, Status)> {
         ctx.volatile_ctx.dispatch_start_time = Some(Instant::now());
         let table_id = ctx.persistent_ctx.table_id;
@@ -74,9 +74,11 @@ impl State for Dispatch {
             );
             let persistent_ctx = repartition::group::PersistentContext::new(
                 plan.group_id,
+                procedure_ctx.procedure_id,
                 table_id,
                 ctx.persistent_ctx.catalog_name.clone(),
                 ctx.persistent_ctx.schema_name.clone(),
+                ctx.persistent_ctx.table_name.clone(),
                 plan.source_regions.clone(),
                 plan.target_regions.clone(),
                 region_mapping,
@@ -106,7 +108,11 @@ impl State for Dispatch {
 
         Ok((
             Box::new(Collect::new(procedure_metas)),
-            Status::suspended(procedures, true),
+            // The state is not persisted after sub-procedures are spawned.
+            // If metasrv restarts before all sub-procedures complete,
+            // it restores from the `Dispatch` state and re-dispatches them.
+            // This is safe because the sub-procedures are idempotent.
+            Status::suspended(procedures, false),
         ))
     }
 

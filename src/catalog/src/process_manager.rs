@@ -58,6 +58,8 @@ pub enum QueryStatement {
     Sql(Statement),
     // The optional string is the alias of the PromQL query.
     Promql(EvalStmt, Option<String>),
+    /// Logical plan with original query string
+    Plan(String),
 }
 
 impl Display for QueryStatement {
@@ -71,6 +73,7 @@ impl Display for QueryStatement {
                     write!(f, "{}", eval_stmt)
                 }
             }
+            QueryStatement::Plan(query) => write!(f, "{}", query),
         }
     }
 }
@@ -170,7 +173,7 @@ impl ProcessManager {
         let mut processes = vec![];
         if let Some(remote_frontend_selector) = self.frontend_selector.as_ref() {
             let frontends = remote_frontend_selector
-                .select(|node| node.peer.addr != self.server_addr)
+                .select(|peer| peer.addr != self.server_addr)
                 .await
                 .context(error::InvokeFrontendSnafu)?;
             for mut f in frontends {
@@ -208,7 +211,7 @@ impl ProcessManager {
                 .frontend_selector
                 .as_ref()
                 .context(error::MetaClientMissingSnafu)?
-                .select(|node| node.peer.addr == server_addr)
+                .select(|peer| peer.addr == server_addr)
                 .await
                 .context(error::InvokeFrontendSnafu)?;
             ensure!(
@@ -304,15 +307,39 @@ impl Debug for CancellableProcess {
 pub struct SlowQueryTimer {
     start: Instant,
     stmt: QueryStatement,
+    schema_name: String,
     threshold: Duration,
     sample_ratio: f64,
     record_type: SlowQueriesRecordType,
     recorder: EventRecorderRef,
+    record_state: Arc<RwLock<SlowQueryRecordState>>,
+}
+
+#[derive(Default)]
+struct SlowQueryRecordState {
+    force_record: bool,
+    payload: serde_json::Value,
+}
+
+/// A handle to attach diagnostics to a slow query and force it to be recorded.
+#[derive(Clone)]
+pub struct SlowQueryRecorder {
+    record_state: Arc<RwLock<SlowQueryRecordState>>,
+}
+
+impl SlowQueryRecorder {
+    /// Attaches the payload and marks the query to bypass the threshold and sampling checks.
+    pub fn force_record_with_payload(&self, payload: serde_json::Value) {
+        let mut state = self.record_state.write().unwrap();
+        state.payload = payload;
+        state.force_record = true;
+    }
 }
 
 impl SlowQueryTimer {
     pub fn new(
         stmt: QueryStatement,
+        schema_name: String,
         threshold: Duration,
         sample_ratio: f64,
         record_type: SlowQueriesRecordType,
@@ -321,20 +348,30 @@ impl SlowQueryTimer {
         Self {
             start: Instant::now(),
             stmt,
+            schema_name,
             threshold,
             sample_ratio,
             record_type,
             recorder,
+            record_state: Arc::default(),
+        }
+    }
+
+    /// Returns a handle that can attach diagnostics and force this query to be recorded.
+    pub fn recorder(&self) -> SlowQueryRecorder {
+        SlowQueryRecorder {
+            record_state: self.record_state.clone(),
         }
     }
 }
 
 impl SlowQueryTimer {
-    fn send_slow_query_event(&self, elapsed: Duration) {
+    fn send_slow_query_event(&self, elapsed: Duration, payload: serde_json::Value) {
         let mut slow_query_event = SlowQueryEvent {
             cost: elapsed.as_millis() as u64,
             threshold: self.threshold.as_millis() as u64,
             query: "".to_string(),
+            schema_name: self.schema_name.clone(),
 
             // The following fields are only used for PromQL queries.
             is_promql: false,
@@ -342,6 +379,7 @@ impl SlowQueryTimer {
             promql_step: None,
             promql_start: None,
             promql_end: None,
+            payload,
         };
 
         match &self.stmt {
@@ -369,6 +407,9 @@ impl SlowQueryTimer {
             QueryStatement::Sql(stmt) => {
                 slow_query_event.query = stmt.to_string();
             }
+            QueryStatement::Plan(query) => {
+                slow_query_event.query = query.clone();
+            }
         }
 
         match self.record_type {
@@ -382,11 +423,13 @@ impl SlowQueryTimer {
                     cost = slow_query_event.cost,
                     threshold = slow_query_event.threshold,
                     query = slow_query_event.query,
+                    schema_name = slow_query_event.schema_name,
                     is_promql = slow_query_event.is_promql,
                     promql_range = slow_query_event.promql_range,
                     promql_step = slow_query_event.promql_step,
                     promql_start = slow_query_event.promql_start,
                     promql_end = slow_query_event.promql_end,
+                    payload = slow_query_event.payload.to_string(),
                 );
             }
         }
@@ -395,23 +438,98 @@ impl SlowQueryTimer {
 
 impl Drop for SlowQueryTimer {
     fn drop(&mut self) {
-        // Calculate the elapsed duration since the timer is created.
         let elapsed = self.start.elapsed();
-        if elapsed > self.threshold {
-            // Only capture a portion of slow queries based on sample_ratio.
-            // Generate a random number in [0, 1) and compare it with sample_ratio.
-            if self.sample_ratio >= 1.0 || random::<f64>() <= self.sample_ratio {
-                self.send_slow_query_event(elapsed);
-            }
+        let (force_record, payload) = {
+            let state = self.record_state.read().unwrap();
+            (state.force_record, state.payload.clone())
+        };
+
+        if force_record
+            || (elapsed > self.threshold
+                && (self.sample_ratio >= 1.0 || random::<f64>() <= self.sample_ratio))
+        {
+            self.send_slow_query_event(elapsed, payload);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use crate::process_manager::ProcessManager;
+    use common_event_recorder::{Event, EventRecorder, EventTypeFilter, EventTypeFilterRef};
+    use common_frontend::slow_query_event::SlowQueryEvent;
+    use common_telemetry::logging::SlowQueriesRecordType;
+    use serde_json::Value;
+
+    use crate::process_manager::{ProcessManager, QueryStatement, SlowQueryTimer};
+
+    #[derive(Debug, Default)]
+    struct RecordingEventRecorder {
+        events: Mutex<Vec<(String, Value)>>,
+    }
+
+    impl EventRecorder for RecordingEventRecorder {
+        fn record(&self, event: Box<dyn Event>) {
+            let event = event
+                .as_any()
+                .downcast_ref::<SlowQueryEvent>()
+                .expect("expected a slow query event");
+            self.events
+                .lock()
+                .unwrap()
+                .push((event.query.clone(), event.payload.clone()));
+        }
+
+        fn event_type_filter(&self) -> EventTypeFilterRef {
+            Arc::new(EventTypeFilter::All)
+        }
+
+        fn close(&self) {}
+    }
+
+    #[test]
+    fn test_forced_slow_query_bypasses_threshold_and_sampling() {
+        let event_recorder = Arc::new(RecordingEventRecorder::default());
+        let timer = SlowQueryTimer::new(
+            QueryStatement::Plan("EXPLAIN ANALYZE VERBOSE SELECT 1".to_string()),
+            "public".to_string(),
+            Duration::from_secs(3600),
+            0.0,
+            SlowQueriesRecordType::SystemTable,
+            event_recorder.clone(),
+        );
+        let payload = serde_json::json!({
+            "timed_out": true,
+            "metrics": [{"stage": 0}],
+        });
+        timer.recorder().force_record_with_payload(payload.clone());
+
+        drop(timer);
+
+        let events = event_recorder.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "EXPLAIN ANALYZE VERBOSE SELECT 1");
+        assert_eq!(events[0].1, payload);
+    }
+
+    #[test]
+    fn test_unforced_fast_query_is_not_recorded() {
+        let event_recorder = Arc::new(RecordingEventRecorder::default());
+        let timer = SlowQueryTimer::new(
+            QueryStatement::Plan("SELECT 1".to_string()),
+            "public".to_string(),
+            Duration::from_secs(3600),
+            0.0,
+            SlowQueriesRecordType::SystemTable,
+            event_recorder.clone(),
+        );
+
+        drop(timer);
+
+        assert!(event_recorder.events.lock().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn test_register_query() {

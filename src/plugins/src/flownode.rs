@@ -13,21 +13,37 @@
 // limitations under the License.
 
 use common_base::Plugins;
-use flow::FlownodeOptions;
 use flow::error::Result;
+use flow::{FlownodeBuilder, FlownodeInstance, FlownodeOptions};
 
 use crate::options::PluginOptions;
 
-#[allow(unused_mut)]
-pub async fn setup_flownode_plugins(
-    _plugins: &mut Plugins,
-    _plugin_options: &[PluginOptions],
+/// Sets up flownode plugins before the [`FlownodeBuilder`] is constructed.
+#[allow(unused_mut, unused_variables)]
+pub async fn setup_flownode_plugins_pre_build(
+    plugins: &mut Plugins,
+    plugin_options: &[PluginOptions],
     _fn_opts: &FlownodeOptions,
 ) -> Result<()> {
     Ok(())
 }
 
-pub async fn start_flownode_plugins(_plugins: Plugins) -> Result<()> {
+/// Sets up flownode plugins after the [`FlownodeBuilder`] is constructed
+/// but before [`FlownodeBuilder::build()`].
+///
+/// Plugins can read context from the builder (e.g., opts, catalog_manager, flow_metadata_manager)
+/// and insert additional plugins. After this call, [`FlownodeBuilder::set_plugins()`]
+/// should be called to sync plugins into the builder.
+#[allow(unused_variables)]
+pub async fn setup_flownode_plugins_post_build(
+    plugins: &mut Plugins,
+    plugin_options: &[PluginOptions],
+    builder: &FlownodeBuilder,
+) -> Result<()> {
+    Ok(())
+}
+
+pub async fn start_flownode_plugins(_instance: &FlownodeInstance) -> Result<()> {
     Ok(())
 }
 

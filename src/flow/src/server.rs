@@ -22,6 +22,7 @@ use api::v1::{RowDeleteRequests, RowInsertRequests};
 use cache::{PARTITION_INFO_CACHE_NAME, TABLE_FLOWNODE_SET_CACHE_NAME, TABLE_ROUTE_CACHE_NAME};
 use catalog::CatalogManagerRef;
 use common_base::Plugins;
+use common_datasource::object_store::LocalFileAccess;
 use common_error::ext::BoxedError;
 use common_meta::cache::{LayeredCacheRegistryRef, TableFlownodeSetCacheRef, TableRouteCacheRef};
 use common_meta::key::TableMetadataManagerRef;
@@ -57,14 +58,14 @@ use crate::adapter::flownode_impl::{FlowDualEngine, FlowDualEngineRef};
 use crate::adapter::{FlowStreamingEngineRef, create_worker};
 use crate::batching_mode::engine::BatchingEngine;
 use crate::error::{
-    CacheRequiredSnafu, ExternalSnafu, IllegalAuthConfigSnafu, ListFlowsSnafu, ParseAddrSnafu,
+    CacheRequiredSnafu, DatafusionSnafu, ExternalSnafu, ListFlowsSnafu, ParseAddrSnafu,
     ShutdownServerSnafu, StartServerSnafu, UnexpectedSnafu, to_status_with_last_err,
 };
 use crate::heartbeat::HeartbeatTask;
 use crate::metrics::{METRIC_FLOW_PROCESSING_TIME, METRIC_FLOW_ROWS};
 use crate::transform::register_function_to_query_engine;
 use crate::utils::{SizeReportSender, StateReportHandler};
-use crate::{Error, FlowAuthHeader, FlownodeOptions, FrontendClient, StreamingEngine};
+use crate::{Error, FlownodeOptions, FrontendClient, StreamingEngine};
 
 pub const FLOW_NODE_SERVER_NAME: &str = "FLOW_NODE_SERVER";
 /// wrapping flow node manager to avoid orphan rule with Arc<...>
@@ -193,6 +194,7 @@ impl FlownodeServer {
     async fn start_workers(&self) -> Result<(), Error> {
         let manager_ref = self.inner.flow_service.dual_engine.clone();
         let mut state_report_task_handler = self.inner.state_report_task_handler.lock().await;
+        let started_state_report_task = state_report_task_handler.is_none();
         if state_report_task_handler.is_none() {
             *state_report_task_handler = manager_ref.clone().start_state_report_task().await;
         }
@@ -206,13 +208,37 @@ impl FlownodeServer {
             .await
             .replace(handle);
 
-        self.inner
+        if let Err(err) = self
+            .inner
             .flow_service
             .dual_engine
             .start_flow_consistent_check_task()
-            .await?;
+            .await
+        {
+            self.rollback_started_workers(started_state_report_task)
+                .await;
+            return Err(err);
+        }
 
         Ok(())
+    }
+
+    async fn rollback_started_workers(&self, abort_state_report_task: bool) {
+        let tx = self.inner.worker_shutdown_tx.lock().await;
+        if tx.send(()).is_err() {
+            info!("Receiver dropped, the flow node server has already shutdown");
+        }
+        drop(tx);
+
+        if let Some(handle) = self.inner.streaming_task_handler.lock().await.take() {
+            handle.abort();
+        }
+
+        if abort_state_report_task
+            && let Some(handle) = self.inner.state_report_task_handler.lock().await.take()
+        {
+            handle.abort();
+        }
     }
 
     /// Stop the background task for streaming computation.
@@ -289,21 +315,6 @@ impl FlownodeInstance {
     }
 }
 
-pub fn get_flow_auth_options(fn_opts: &FlownodeOptions) -> Result<Option<FlowAuthHeader>, Error> {
-    if let Some(user_provider) = fn_opts.user_provider.as_ref() {
-        let static_provider = auth::static_user_provider_from_option(user_provider)
-            .context(IllegalAuthConfigSnafu)?;
-
-        let (usr, pwd) = static_provider
-            .get_one_user_pwd()
-            .context(IllegalAuthConfigSnafu)?;
-        let auth_header = FlowAuthHeader::from_user_pwd(&usr, &pwd);
-        return Ok(Some(auth_header));
-    }
-
-    Ok(None)
-}
-
 /// [`FlownodeInstance`] Builder
 pub struct FlownodeBuilder {
     opts: FlownodeOptions,
@@ -348,9 +359,33 @@ impl FlownodeBuilder {
         }
     }
 
+    pub fn opts(&self) -> &FlownodeOptions {
+        &self.opts
+    }
+
+    pub fn table_meta(&self) -> &TableMetadataManagerRef {
+        &self.table_meta
+    }
+
+    pub fn catalog_manager(&self) -> &CatalogManagerRef {
+        &self.catalog_manager
+    }
+
+    pub fn flow_metadata_manager(&self) -> &FlowMetadataManagerRef {
+        &self.flow_metadata_manager
+    }
+
+    pub fn frontend_client(&self) -> &Arc<FrontendClient> {
+        &self.frontend_client
+    }
+
+    pub fn set_plugins(&mut self, plugins: Plugins) {
+        self.plugins = plugins;
+    }
+
     pub async fn build(mut self) -> Result<FlownodeInstance, Error> {
         // TODO(discord9): does this query engine need those?
-        let query_engine_factory = QueryEngineFactory::new_with_plugins(
+        let query_engine_factory = QueryEngineFactory::try_new_with_plugins(
             // query engine in flownode is only used for translate plan with resolved table source.
             self.catalog_manager.clone(),
             None,
@@ -361,7 +396,10 @@ impl FlownodeBuilder {
             false,
             Default::default(),
             self.opts.query.clone(),
-        );
+        )
+        .context(DatafusionSnafu {
+            context: "Failed to build query engine",
+        })?;
         let manager = Arc::new(
             self.build_manager(query_engine_factory.query_engine())
                 .await?,
@@ -544,6 +582,7 @@ impl FrontendInvoker {
         layered_cache_registry: LayeredCacheRegistryRef,
         procedure_executor: ProcedureExecutorRef,
         node_manager: NodeManagerRef,
+        origin_frontend_addr: String,
     ) -> Result<FrontendInvoker, Error> {
         let table_route_cache: TableRouteCacheRef =
             layered_cache_registry.get().context(CacheRequiredSnafu {
@@ -565,11 +604,15 @@ impl FrontendInvoker {
                 name: TABLE_FLOWNODE_SET_CACHE_NAME,
             })?;
 
+        // TODO(auto_create_table): flow sink tables are created through a controlled
+        // `CREATE FLOW` path, not client writes, so they are intentionally exempt from
+        // the frontend's global auto-create switch. Revisit if flow should honor it.
         let inserter = Arc::new(Inserter::new(
             catalog_manager.clone(),
             partition_manager.clone(),
             node_manager.clone(),
             table_flownode_cache,
+            true,
         ));
 
         let deleter = Arc::new(Deleter::new(
@@ -589,6 +632,8 @@ impl FrontendInvoker {
             inserter.clone(),
             partition_manager,
             None,
+            origin_frontend_addr,
+            LocalFileAccess::Disabled,
         ));
 
         let invoker = FrontendInvoker::new(inserter, deleter, statement_executor);
@@ -678,12 +723,17 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use api::v1::HealthCheckRequest;
+    use api::v1::health_check_client::HealthCheckClient;
+    use api::v1::meta::Role;
     use catalog::memory::new_memory_catalog_manager;
     use common_base::Plugins;
     use common_meta::key::TableMetadataManager;
     use common_meta::key::flow::FlowMetadataManager;
     use common_meta::kv_backend::memory::MemoryKvBackend;
+    use meta_client::client::MetaClient;
     use query::options::QueryOptions;
+    use servers::grpc::GRPC_SERVER;
 
     use super::*;
     use crate::adapter::flownode_impl::FlowDualEngine;
@@ -692,6 +742,22 @@ mod tests {
     use crate::utils::SizeReportSender;
 
     async fn new_test_flownode_server() -> (FlownodeServer, SizeReportSender) {
+        let (frontend_client, _handler) =
+            FrontendClient::from_empty_grpc_handler(QueryOptions::default());
+
+        new_test_flownode_server_with_frontend_client(
+            frontend_client,
+            BatchingModeOptions::default(),
+            None,
+        )
+        .await
+    }
+
+    async fn new_test_flownode_server_with_frontend_client(
+        frontend_client: FrontendClient,
+        batching_opts: BatchingModeOptions,
+        node_id: Option<u32>,
+    ) -> (FlownodeServer, SizeReportSender) {
         let kv_backend = Arc::new(MemoryKvBackend::new());
         let table_meta = Arc::new(TableMetadataManager::new(kv_backend.clone()));
         table_meta.init().await.unwrap();
@@ -700,19 +766,17 @@ mod tests {
         let query_engine = crate::test_utils::create_test_query_engine();
 
         let streaming_engine = Arc::new(StreamingEngine::new(
-            None,
+            node_id,
             query_engine.clone(),
             table_meta.clone(),
         ));
-        let (frontend_client, _handler) =
-            FrontendClient::from_empty_grpc_handler(QueryOptions::default());
         let batching_engine = Arc::new(BatchingEngine::new(
             Arc::new(frontend_client),
             query_engine,
             flow_meta.clone(),
             table_meta,
             catalog_manager.clone(),
-            BatchingModeOptions::default(),
+            batching_opts,
         ));
         let dual_engine = Arc::new(FlowDualEngine::new(
             streaming_engine,
@@ -743,5 +807,59 @@ mod tests {
         report_sender.query(Duration::from_secs(3)).await.unwrap();
 
         server.stop_workers().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_start_workers_rolls_back_on_check_task_start_failure() {
+        let batching_opts = BatchingModeOptions {
+            experimental_frontend_scan_timeout: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let frontend_client = FrontendClient::from_meta_client(
+            Arc::new(MetaClient::new(0, Role::Frontend)),
+            QueryOptions::default(),
+            batching_opts.clone(),
+        )
+        .unwrap();
+        let (server, _report_sender) =
+            new_test_flownode_server_with_frontend_client(frontend_client, batching_opts, Some(1))
+                .await;
+
+        server.start_workers().await.unwrap_err();
+
+        assert!(server.inner.streaming_task_handler.lock().await.is_none());
+        assert!(
+            server
+                .inner
+                .state_report_task_handler
+                .lock()
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_builder_registers_reachable_health_check() {
+        // Arrange: compose the production gRPC service with an ephemeral local listener.
+        let (flownode_server, _report_sender) = new_test_flownode_server().await;
+        let mut opts = FlownodeOptions::default();
+        opts.grpc.bind_addr = "127.0.0.1:0".to_string();
+        let mut services = FlownodeServiceBuilder::new(&opts)
+            .with_default_grpc_server(&flownode_server)
+            .build()
+            .unwrap();
+        services.start_all().await.unwrap();
+        let addr = services.addr(GRPC_SERVER).unwrap();
+
+        // Act: call the shared health handler through the registered production server.
+        let mut client = HealthCheckClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        let result = client.health_check(HealthCheckRequest {}).await;
+
+        services.shutdown_all().await.unwrap();
+
+        // Assert: the service composition exposes a healthy endpoint.
+        assert!(result.is_ok());
     }
 }

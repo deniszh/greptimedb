@@ -28,22 +28,21 @@ pub struct StructType {
     fields: Arc<Vec<StructField>>,
 }
 
-impl TryFrom<&Fields> for StructType {
-    type Error = crate::error::Error;
-    fn try_from(value: &Fields) -> Result<Self, Self::Error> {
+impl From<&Fields> for StructType {
+    fn from(value: &Fields) -> Self {
         let fields = value
             .iter()
             .map(|field| {
-                Ok(StructField::new(
+                StructField::new(
                     field.name().clone(),
-                    ConcreteDataType::try_from(field.data_type())?,
+                    ConcreteDataType::from_arrow_type(field.data_type()),
                     field.is_nullable(),
-                ))
+                )
             })
-            .collect::<Result<Vec<StructField>, Self::Error>>()?;
-        Ok(StructType {
+            .collect::<Vec<_>>();
+        StructType {
             fields: Arc::new(fields),
-        })
+        }
     }
 }
 
@@ -145,10 +144,6 @@ impl StructField {
 
     pub fn is_nullable(&self) -> bool {
         self.nullable
-    }
-
-    pub(crate) fn insert_metadata(&mut self, key: impl ToString, value: impl ToString) {
-        self.metadata.insert(key.to_string(), value.to_string());
     }
 
     #[expect(unused)]

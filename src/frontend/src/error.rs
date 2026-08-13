@@ -16,7 +16,7 @@ use std::any::Any;
 
 use common_datasource::file_format::Format;
 use common_error::define_into_tonic_status;
-use common_error::ext::{BoxedError, ErrorExt};
+use common_error::ext::{BoxedError, ErrorExt, RetryHint};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use common_query::error::datafusion_status_code;
@@ -164,6 +164,16 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display(
+        "Ambiguous value column in table '{table_name}', candidates: {field_columns:?}"
+    ))]
+    AmbiguousValueColumn {
+        table_name: String,
+        field_columns: Vec<String>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to collect recordbatch"))]
     CollectRecordbatch {
         #[snafu(implicit)]
@@ -191,13 +201,6 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
         source: query::error::Error,
-    },
-
-    #[snafu(display("Operation to region server failed"))]
-    InvokeRegionServer {
-        #[snafu(implicit)]
-        location: Location,
-        source: servers::error::Error,
     },
 
     #[snafu(display("Not supported: {}", feat))]
@@ -285,9 +288,6 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
-
-    #[snafu(display("Invalid region request, reason: {}", reason))]
-    InvalidRegionRequest { reason: String },
 
     #[snafu(display("Table operation error"))]
     TableOperation {
@@ -377,6 +377,7 @@ impl ErrorExt for Error {
             | Error::IllegalPrimaryKeysDef { .. }
             | Error::SchemaExists { .. }
             | Error::ColumnNotFound { .. }
+            | Error::AmbiguousValueColumn { .. }
             | Error::UnsupportedFormat { .. }
             | Error::IllegalAuthConfig { .. }
             | Error::ColumnNoneDefaultValue { .. }
@@ -399,7 +400,7 @@ impl ErrorExt for Error {
 
             Error::PrometheusLabelValuesQueryPlan { source, .. } => source.status_code(),
 
-            Error::CollectRecordbatch { .. } => StatusCode::EngineExecuteQuery,
+            Error::CollectRecordbatch { source, .. } => source.status_code(),
 
             Error::SqlExecIntercepted { source, .. } => source.status_code(),
             Error::StartServer { source, .. } => source.status_code(),
@@ -415,8 +416,6 @@ impl ErrorExt for Error {
 
             Error::CacheRequired { .. } => StatusCode::Internal,
 
-            Error::InvalidRegionRequest { .. } => StatusCode::IllegalState,
-
             Error::TableNotFound { .. } => StatusCode::TableNotFound,
 
             Error::Catalog { source, .. } => source.status_code(),
@@ -427,7 +426,6 @@ impl ErrorExt for Error {
             | Error::ReadTable { source, .. }
             | Error::ExecLogicalPlan { source, .. } => source.status_code(),
 
-            Error::InvokeRegionServer { source, .. } => source.status_code(),
             Error::External { source, .. } | Error::InitPlugin { source, .. } => {
                 source.status_code()
             }
@@ -447,6 +445,45 @@ impl ErrorExt for Error {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn retry_hint(&self) -> RetryHint {
+        match self {
+            Error::InvalidateTableCache { source, .. }
+            | Error::HandleHeartbeatResponse { source, .. }
+            | Error::RequestQuery { source, .. } => source.retry_hint(),
+
+            Error::External { source, .. }
+            | Error::SqlExecIntercepted { source, .. }
+            | Error::InitPlugin { source, .. } => source.retry_hint(),
+
+            Error::StartServer { source, .. }
+            | Error::ShutdownServer { source, .. }
+            | Error::ExecutePromql { source, .. }
+            | Error::PromStoreRemoteQueryPlan { source, .. }
+            | Error::PrometheusMetricNamesQueryPlan { source, .. } => source.retry_hint(),
+
+            Error::ParseSql { source, .. } => source.retry_hint(),
+            Error::Catalog { source, .. } => source.retry_hint(),
+            Error::CreateMetaHeartbeatStream { source, .. } => source.retry_hint(),
+            Error::FindRegionPeer { source, .. } => source.retry_hint(),
+            Error::Table { source, .. } => source.retry_hint(),
+            Error::CollectRecordbatch { source, .. } => source.retry_hint(),
+            Error::PlanStatement { source, .. }
+            | Error::ReadTable { source, .. }
+            | Error::ExecLogicalPlan { source, .. }
+            | Error::DescribeStatement { source, .. } => source.retry_hint(),
+            Error::PrometheusLabelValuesQueryPlan { source, .. } => source.retry_hint(),
+            Error::Insert { source, .. } => source.retry_hint(),
+            Error::Permission { source, .. } => source.retry_hint(),
+            Error::TableOperation { source, .. } => source.retry_hint(),
+            Error::IllegalAuthConfig { source, .. } => source.retry_hint(),
+            Error::TomlFormat { source, .. } => source.retry_hint(),
+            Error::InvalidTlsConfig { error, .. } => error.retry_hint(),
+            Error::SubstraitDecodeLogicalPlan { source, .. } => source.retry_hint(),
+
+            _ => RetryHint::NonRetryable,
+        }
     }
 }
 

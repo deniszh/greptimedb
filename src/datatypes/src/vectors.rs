@@ -35,7 +35,7 @@ mod duration;
 mod eq;
 mod helper;
 mod interval;
-pub(crate) mod json;
+pub mod json;
 mod list;
 mod null;
 pub(crate) mod operations;
@@ -51,6 +51,7 @@ pub use boolean::{BooleanVector, BooleanVectorBuilder};
 pub use constant::ConstantVector;
 pub use date::{DateVector, DateVectorBuilder};
 pub use decimal::{Decimal128Vector, Decimal128VectorBuilder};
+pub(crate) use dictionary::StringDictionaryVectorBuilder;
 pub use dictionary::{DictionaryIter, DictionaryVector};
 pub use duration::{
     DurationMicrosecondVector, DurationMicrosecondVectorBuilder, DurationMillisecondVector,

@@ -14,14 +14,15 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use common_recordbatch::DfRecordBatch;
 use common_time::Timestamp;
 use common_time::timestamp::TimeUnit;
 use datafusion_common::DataFusionError;
 use datafusion_expr::{LogicalPlan, LogicalPlanBuilder, LogicalTableSource};
 use datatypes::arrow::array::{
-    ArrayRef, BooleanArray, TimestampMillisecondArray, TimestampNanosecondArray, UInt8Array,
-    UInt32Array, UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    UInt8Array, UInt32Array, UInt64Array,
 };
 use datatypes::arrow::error::ArrowError;
 use datatypes::arrow_array::StringArray;
@@ -29,6 +30,15 @@ use datatypes::schema::{ColumnSchema, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::{RegionGroup, RegionId, RegionNumber, RegionSeq, ScanRequest, TableId};
+
+/// Puffin index type for bloom filter indexes.
+pub const PUFFIN_INDEX_TYPE_BLOOM_FILTER: &str = "bloom_filter";
+/// Puffin index type for bloom-backed full-text indexes.
+pub const PUFFIN_INDEX_TYPE_FULLTEXT_BLOOM: &str = "fulltext_bloom";
+/// Puffin index type for Tantivy-backed full-text indexes.
+pub const PUFFIN_INDEX_TYPE_FULLTEXT_TANTIVY: &str = "fulltext_tantivy";
+/// Puffin index type for inverted indexes.
+pub const PUFFIN_INDEX_TYPE_INVERTED: &str = "inverted";
 
 /// An entry describing a SST file known by the engine's manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +87,10 @@ pub struct ManifestSstEntry {
     pub node_id: Option<u64>,
     /// Whether this file is visible in current version.
     pub visible: bool,
+    /// Minimum encoded primary key in the SST.
+    pub primary_key_min: Option<Bytes>,
+    /// Maximum encoded primary key in the SST.
+    pub primary_key_max: Option<Bytes>,
 }
 
 impl ManifestSstEntry {
@@ -106,6 +120,8 @@ impl ManifestSstEntry {
             ColumnSchema::new("origin_region_id", Ty::uint64_datatype(), false),
             ColumnSchema::new("node_id", Ty::uint64_datatype(), true),
             ColumnSchema::new("visible", Ty::boolean_datatype(), false),
+            ColumnSchema::new("primary_key_min", Ty::binary_datatype(), true),
+            ColumnSchema::new("primary_key_max", Ty::binary_datatype(), true),
         ]))
     }
 
@@ -142,6 +158,8 @@ impl ManifestSstEntry {
         let origin_region_ids = entries.iter().map(|e| e.origin_region_id.as_u64());
         let node_ids = entries.iter().map(|e| e.node_id);
         let visible_flags = entries.iter().map(|e| Some(e.visible));
+        let primary_key_min = entries.iter().map(|e| e.primary_key_min.as_deref());
+        let primary_key_max = entries.iter().map(|e| e.primary_key_max.as_deref());
 
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from_iter_values(table_dirs)),
@@ -166,6 +184,8 @@ impl ManifestSstEntry {
             Arc::new(UInt64Array::from_iter_values(origin_region_ids)),
             Arc::new(UInt64Array::from_iter(node_ids)),
             Arc::new(BooleanArray::from_iter(visible_flags)),
+            Arc::new(BinaryArray::from_iter(primary_key_min)),
+            Arc::new(BinaryArray::from_iter(primary_key_max)),
         ];
 
         DfRecordBatch::try_new(schema.arrow_schema().clone(), columns)
@@ -384,11 +404,8 @@ fn build_plan_helper(
 ) -> Result<LogicalPlan, DataFusionError> {
     let table_source = LogicalTableSource::new(schema.arrow_schema().clone());
 
-    let mut builder = LogicalPlanBuilder::scan(
-        table_name,
-        Arc::new(table_source),
-        scan_request.projection.clone(),
-    )?;
+    let projection = scan_request.projection;
+    let mut builder = LogicalPlanBuilder::scan(table_name, Arc::new(table_source), projection)?;
 
     for filter in scan_request.filters {
         builder = builder.filter(filter)?;
@@ -406,8 +423,8 @@ mod tests {
     use datafusion_common::TableReference;
     use datafusion_expr::{LogicalPlan, Operator, binary_expr, col, lit};
     use datatypes::arrow::array::{
-        Array, TimestampMillisecondArray, TimestampNanosecondArray, UInt8Array, UInt32Array,
-        UInt64Array,
+        Array, BinaryArray, TimestampMillisecondArray, TimestampNanosecondArray, UInt8Array,
+        UInt32Array, UInt64Array,
     };
     use datatypes::arrow_array::StringArray;
 
@@ -452,6 +469,8 @@ mod tests {
                 origin_region_id: region_id1,
                 node_id: Some(1),
                 visible: false,
+                primary_key_min: Some(Bytes::from_static(b"aaa")),
+                primary_key_max: Some(Bytes::from_static(b"zzz")),
             },
             ManifestSstEntry {
                 table_dir: "tdir2".to_string(),
@@ -476,6 +495,8 @@ mod tests {
                 origin_region_id: region_id2,
                 node_id: None,
                 visible: true,
+                primary_key_min: None,
+                primary_key_max: None,
             },
         ];
 
@@ -667,6 +688,22 @@ mod tests {
             .unwrap();
         assert!(!visible.value(0));
         assert!(visible.value(1));
+
+        let primary_key_min = batch
+            .column(22)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(b"aaa", primary_key_min.value(0));
+        assert!(primary_key_min.is_null(1));
+
+        let primary_key_max = batch
+            .column(23)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(b"zzz", primary_key_max.value(0));
+        assert!(primary_key_max.is_null(1));
     }
 
     #[test]
@@ -910,8 +947,9 @@ mod tests {
     #[test]
     fn test_manifest_build_plan() {
         // Note: filter must reference a column in the projected schema
+        let projection = Some(vec![0, 1, 2]);
         let request = ScanRequest {
-            projection: Some(vec![0, 1, 2]),
+            projection,
             filters: vec![binary_expr(col("table_id"), Operator::Gt, lit(0))],
             limit: Some(5),
             ..Default::default()
@@ -941,8 +979,9 @@ mod tests {
 
     #[test]
     fn test_storage_build_plan() {
+        let projection = Some(vec![0, 2]);
         let request = ScanRequest {
-            projection: Some(vec![0, 2]),
+            projection,
             filters: vec![binary_expr(col("file_path"), Operator::Eq, lit("/a"))],
             limit: Some(1),
             ..Default::default()

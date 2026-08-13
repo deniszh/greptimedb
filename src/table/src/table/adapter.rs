@@ -15,13 +15,15 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
+use common_catalog::consts::{METRIC_ENGINE, MITO_ENGINE, MITO2_ENGINE};
 use common_query::stream::StreamScanAdapter;
 use common_recordbatch::OrderOption;
-use datafusion::arrow::datatypes::SchemaRef as DfSchemaRef;
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef as DfSchemaRef};
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType as DfTableType};
 use datafusion::error::Result as DfResult;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_expr::TableProviderFilterPushDown as DfTableProviderFilterPushDown;
 use datafusion_expr::expr::Expr;
 use datafusion_physical_expr::PhysicalSortExpr;
@@ -38,9 +40,14 @@ pub struct DfTableProviderAdapter {
 
 impl DfTableProviderAdapter {
     pub fn new(table: TableRef) -> Self {
+        let preserve_pk_dictionary_encoding =
+            supports_pk_dictionary_encoding(&table.table_info().meta.engine);
         Self {
             table,
-            scan_req: Arc::default(),
+            scan_req: Arc::new(Mutex::new(ScanRequest {
+                preserve_pk_dictionary_encoding,
+                ..Default::default()
+            })),
         }
     }
 
@@ -66,6 +73,41 @@ impl DfTableProviderAdapter {
     }
 }
 
+/// Returns whether the engine can expose its primary-key strings as dictionaries during scans.
+pub fn supports_pk_dictionary_encoding(engine: &str) -> bool {
+    matches!(engine, MITO_ENGINE | MITO2_ENGINE | METRIC_ENGINE)
+}
+
+/// Returns a schema that dictionary encodes selected UTF-8 columns.
+pub fn dictionary_encode_string_columns(
+    schema: &DfSchemaRef,
+    mut should_encode: impl FnMut(usize) -> bool,
+) -> DfSchemaRef {
+    let mut changed = false;
+    let fields = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            if should_encode(index) && field.data_type() == &DataType::Utf8 {
+                changed = true;
+                Arc::new(field.as_ref().clone().with_data_type(DataType::Dictionary(
+                    Box::new(DataType::UInt32),
+                    Box::new(DataType::Utf8),
+                )))
+            } else {
+                field.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if changed {
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+    } else {
+        schema.clone()
+    }
+}
+
 impl std::fmt::Debug for DfTableProviderAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DfTableProviderAdapter")
@@ -81,7 +123,13 @@ impl TableProvider for DfTableProviderAdapter {
     }
 
     fn schema(&self) -> DfSchemaRef {
-        self.table.schema().arrow_schema().clone()
+        let table_info = self.table.table_info();
+        let schema = self.table.schema().arrow_schema().clone();
+        if !supports_pk_dictionary_encoding(&table_info.meta.engine) {
+            return schema;
+        }
+        let primary_keys = &table_info.meta.primary_key_indices;
+        dictionary_encode_string_columns(&schema, |index| primary_keys.contains(&index))
     }
 
     fn table_type(&self) -> DfTableType {
@@ -111,6 +159,11 @@ impl TableProvider for DfTableProviderAdapter {
             request.limit = limit;
             request.clone()
         };
+
+        if let Some(plan) = self.table.scan_to_plan(request.clone())? {
+            return Ok(plan);
+        }
+
         let stream = self.table.scan_to_stream(request).await?;
 
         // build sort physical expr
@@ -138,10 +191,76 @@ impl TableProvider for DfTableProviderAdapter {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<DfTableProviderFilterPushDown>> {
+        let schema = self.schema();
         let filters = filters.iter().map(|&x| x.clone()).collect::<Vec<_>>();
         Ok(self
             .table
             .supports_filters_pushdown(&filters.iter().collect::<Vec<_>>())
-            .map(|v| v.into_iter().map(Into::into).collect::<Vec<_>>())?)
+            .map(|v| {
+                v.into_iter()
+                    .zip(filters.iter())
+                    .map(|(ty, expr)| {
+                        if !is_scan_local(expr, &schema) {
+                            DfTableProviderFilterPushDown::Unsupported
+                        } else {
+                            ty.into()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })?)
+    }
+}
+
+/// Returns true if the expression can be safely evaluated by a remote scan.
+/// Rejects outer references and column references unknown to the schema.
+fn is_scan_local(expr: &Expr, schema: &DfSchemaRef) -> bool {
+    let mut problems = false;
+    let _ = expr.apply(|node| match node {
+        Expr::OuterReferenceColumn(_, _) => {
+            problems = true;
+            Ok(TreeNodeRecursion::Stop)
+        }
+        Expr::Column(col) => {
+            if schema.column_with_name(&col.name).is_none() {
+                problems = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        }
+        _ => Ok(TreeNodeRecursion::Continue),
+    });
+    !problems
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion_common::Column as DfColumn;
+
+    use super::*;
+
+    #[test]
+    fn test_is_scan_local_normal_column() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let expr = Expr::Column(DfColumn::new(Some("t"), "x"));
+        assert!(is_scan_local(&expr, &schema));
+    }
+
+    #[test]
+    fn test_is_scan_local_unknown_column() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let expr = Expr::Column(DfColumn::new(Some("t"), "z"));
+        assert!(!is_scan_local(&expr, &schema));
+    }
+
+    #[test]
+    fn test_is_scan_local_outer_ref() {
+        use datafusion::arrow::datatypes::Schema;
+        use datatypes::arrow::datatypes::{DataType, Field};
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let field = Arc::new(Field::new("x", DataType::Int64, true));
+        let expr = Expr::OuterReferenceColumn(field, DfColumn::new(Some("t"), "x"));
+        assert!(!is_scan_local(&expr, &schema));
     }
 }

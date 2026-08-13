@@ -38,17 +38,19 @@ use store_api::region_engine::{
 };
 use store_api::region_request::{
     AffectedRows, ApplyStagingManifestRequest, EnterStagingRequest, RegionAlterRequest,
-    RegionBuildIndexRequest, RegionBulkInsertsRequest, RegionCatchupRequest, RegionCloseRequest,
-    RegionCompactRequest, RegionCreateRequest, RegionDropRequest, RegionFlushRequest,
-    RegionOpenRequest, RegionRequest, RegionTruncateRequest, StagingPartitionDirective,
+    RegionBuildIndexRequest, RegionBulkInsertsRequest, RegionCatchupRequest, RegionCleanUpRequest,
+    RegionCloseRequest, RegionCompactRequest, RegionCreateRequest, RegionDropRequest,
+    RegionFlushRequest, RegionOpenRequest, RegionRequest, RegionTruncateRequest,
+    StagingPartitionDirective,
 };
-use store_api::storage::{FileId, RegionId};
+use store_api::storage::{FileId, RegionId, SequenceNumber};
 use tokio::sync::oneshot::{self, Receiver, Sender};
 
+use crate::compaction::{CompactionExecution, CompactionPickFinished};
 use crate::error::{
-    CompactRegionSnafu, ConvertColumnDataTypeSnafu, CreateDefaultSnafu, Error, FillDefaultSnafu,
-    FlushRegionSnafu, InvalidPartitionExprSnafu, InvalidRequestSnafu, MissingPartitionExprSnafu,
-    Result, UnexpectedSnafu,
+    CompactRegionSnafu, CompactionCancelledSnafu, ConvertColumnDataTypeSnafu, CreateDefaultSnafu,
+    Error, FillDefaultSnafu, FlushRegionSnafu, InvalidPartitionExprSnafu, InvalidRequestSnafu,
+    MissingPartitionExprSnafu, Result, UnexpectedSnafu,
 };
 use crate::flush::FlushReason;
 use crate::manifest::action::{RegionEdit, TruncateKind};
@@ -552,8 +554,15 @@ pub(crate) struct SenderBulkRequest {
     pub(crate) sender: OptionOutputTx,
     pub(crate) region_id: RegionId,
     pub(crate) request: BulkPart,
-    pub(crate) region_metadata: RegionMetadataRef,
+    pub(crate) region_metadata: Option<RegionMetadataRef>,
     pub(crate) partition_expr_version: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BulkInsertRequest {
+    pub(crate) metadata: Option<RegionMetadataRef>,
+    pub(crate) request: RegionBulkInsertsRequest,
+    pub(crate) sender: OptionOutputTx,
 }
 
 /// Request sent to a worker with timestamp
@@ -609,11 +618,7 @@ pub(crate) enum WorkerRequest {
     SyncRegion(RegionSyncRequest),
 
     /// Bulk inserts request and region metadata.
-    BulkInserts {
-        metadata: Option<RegionMetadataRef>,
-        request: RegionBulkInsertsRequest,
-        sender: OptionOutputTx,
-    },
+    BulkInserts(BulkInsertRequest),
 
     /// Remap manifests request.
     RemapManifests(RemapManifestsRequest),
@@ -708,6 +713,11 @@ impl WorkerRequest {
                 sender: sender.into(),
                 request: DdlRequest::Open((v, None)),
             }),
+            RegionRequest::CleanUp(v) => WorkerRequest::Ddl(SenderDdlRequest {
+                region_id,
+                sender: sender.into(),
+                request: DdlRequest::OfflineCleanup(v),
+            }),
             RegionRequest::Close(v) => WorkerRequest::Ddl(SenderDdlRequest {
                 region_id,
                 sender: sender.into(),
@@ -748,11 +758,13 @@ impl WorkerRequest {
                 sender: sender.into(),
                 request: DdlRequest::EnterStaging(v),
             }),
-            RegionRequest::BulkInserts(region_bulk_inserts_request) => WorkerRequest::BulkInserts {
-                metadata: region_metadata,
-                sender: sender.into(),
-                request: region_bulk_inserts_request,
-            },
+            RegionRequest::BulkInserts(region_bulk_inserts_request) => {
+                WorkerRequest::BulkInserts(BulkInsertRequest {
+                    metadata: region_metadata,
+                    sender: sender.into(),
+                    request: region_bulk_inserts_request,
+                })
+            }
             RegionRequest::ApplyStagingManifest(v) => WorkerRequest::Ddl(SenderDdlRequest {
                 region_id,
                 sender: sender.into(),
@@ -858,6 +870,7 @@ pub(crate) enum DdlRequest {
     Create(RegionCreateRequest),
     Drop(RegionDropRequest),
     Open((RegionOpenRequest, Option<WalEntryReceiver>)),
+    OfflineCleanup(RegionCleanUpRequest),
     Close(RegionCloseRequest),
     Alter(RegionAlterRequest),
     Flush(RegionFlushRequest),
@@ -883,6 +896,8 @@ pub(crate) struct SenderDdlRequest {
 /// Notification from a background job.
 #[derive(Debug)]
 pub(crate) enum BackgroundNotify {
+    /// Compaction planning has finished.
+    CompactionPickFinished(CompactionPickFinished),
     /// Flush has finished.
     FlushFinished(FlushFinished),
     /// Flush has failed.
@@ -893,12 +908,18 @@ pub(crate) enum BackgroundNotify {
     IndexBuildStopped(IndexBuildStopped),
     /// Index build has failed.
     IndexBuildFailed(IndexBuildFailed),
+    /// An index build must be retried against the latest schema generation.
+    IndexBuildRetry(BuildIndexRequest),
     /// Compaction has finished.
     CompactionFinished(CompactionFinished),
+    /// Compaction has been cancelled cooperatively.
+    CompactionCancelled(CompactionCancelled),
     /// Compaction has failed.
     CompactionFailed(CompactionFailed),
     /// Truncate result.
     Truncate(TruncateResult),
+    /// Discard unflushed data result.
+    DiscardUnflushed(DiscardUnflushedResult),
     /// Region change result.
     RegionChange(RegionChangeResult),
     /// Region edit result.
@@ -914,6 +935,8 @@ pub(crate) enum BackgroundNotify {
 pub(crate) struct FlushFinished {
     /// Region id.
     pub(crate) region_id: RegionId,
+    /// Reason to flush.
+    pub(crate) flush_reason: FlushReason,
     /// Entry id of flushed data.
     pub(crate) flushed_entry_id: EntryId,
     /// Flush result senders.
@@ -926,8 +949,6 @@ pub(crate) struct FlushFinished {
     pub(crate) memtables_to_remove: SmallVec<[MemtableId; 2]>,
     /// Whether the region is in staging mode.
     pub(crate) is_staging: bool,
-    /// Reason for flush.
-    pub(crate) flush_reason: FlushReason,
 }
 
 impl FlushFinished {
@@ -957,18 +978,22 @@ pub(crate) struct FlushFailed {
     pub(crate) err: Arc<Error>,
 }
 
+impl FlushFailed {
+    /// Returns whether the flush was cancelled cooperatively.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self.err.as_ref(), Error::FlushCancelled { .. })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct IndexBuildFinished {
-    #[allow(dead_code)]
-    pub(crate) region_id: RegionId,
-    pub(crate) edit: RegionEdit,
+    pub(crate) manifest_version: ManifestVersion,
+    pub(crate) file_meta: FileMeta,
 }
 
 /// Notifies an index build job has been stopped.
 #[derive(Debug)]
 pub(crate) struct IndexBuildStopped {
-    #[allow(dead_code)]
-    pub(crate) region_id: RegionId,
     pub(crate) file_id: FileId,
 }
 
@@ -983,12 +1008,34 @@ pub(crate) struct IndexBuildFailed {
 pub(crate) struct CompactionFinished {
     /// Region id.
     pub(crate) region_id: RegionId,
+    /// Identity and reservation lease of the accepted execution.
+    pub(crate) execution: CompactionExecution,
     /// Compaction result senders.
     pub(crate) senders: Vec<OutputTx>,
     /// Start time of compaction task.
     pub(crate) start_time: Instant,
     /// Region edit to apply.
     pub(crate) edit: RegionEdit,
+}
+
+/// Notifies a compaction job has been cancelled cooperatively.
+#[derive(Debug)]
+pub(crate) struct CompactionCancelled {
+    /// Region id.
+    pub(crate) region_id: RegionId,
+    /// Identity and reservation lease of the accepted execution.
+    pub(crate) execution: CompactionExecution,
+    /// Waiters to wake once the cancellation has been observed by the worker.
+    pub(crate) senders: Vec<OutputTx>,
+}
+
+impl CompactionCancelled {
+    pub(crate) fn on_success(self) {
+        for sender in self.senders {
+            sender.send(CompactionCancelledSnafu {}.fail());
+        }
+        info!("Compaction cancelled for region: {}", self.region_id);
+    }
 }
 
 impl CompactionFinished {
@@ -1019,6 +1066,8 @@ impl OnFailure for CompactionFinished {
 #[derive(Debug)]
 pub(crate) struct CompactionFailed {
     pub(crate) region_id: RegionId,
+    /// Identity and reservation lease of the accepted execution.
+    pub(crate) execution: CompactionExecution,
     /// The error source of the failure.
     pub(crate) err: Arc<Error>,
 }
@@ -1033,6 +1082,25 @@ pub(crate) struct TruncateResult {
     /// Truncate result.
     pub(crate) result: Result<()>,
     pub(crate) kind: TruncateKind,
+}
+
+/// Notifies the result of discarding unflushed data from a region.
+#[derive(Debug)]
+pub(crate) struct DiscardUnflushedResult {
+    /// Region id.
+    pub(crate) region_id: RegionId,
+    /// Result sender.
+    pub(crate) sender: OptionOutputTx,
+    /// Manifest update result.
+    pub(crate) result: Result<()>,
+    /// Last WAL entry covered by the discard operation.
+    pub(crate) discarded_entry_id: EntryId,
+    /// Last sequence covered by the discard operation.
+    pub(crate) discarded_sequence: SequenceNumber,
+    /// Estimated number of discarded rows.
+    pub(crate) discarded_rows: u64,
+    /// Estimated number of discarded bytes.
+    pub(crate) discarded_bytes: u64,
 }
 
 /// Notifies the region the result of writing region change action.
@@ -1075,13 +1143,52 @@ pub(crate) struct CopyRegionFromFinished {
     pub(crate) sender: Sender<Result<MitoCopyRegionFromResponse>>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct Waiters(SmallVec<[Sender<Result<()>>; 1]>);
+
+impl Waiters {
+    pub(crate) fn one(waiter: Sender<Result<()>>) -> Self {
+        let mut waiters = SmallVec::new();
+        waiters.push(waiter);
+        Self(waiters)
+    }
+
+    pub(crate) fn reply_with<F: Fn() -> Result<()>>(self, f: F) {
+        for tx in self.0 {
+            let _ = tx.send(f());
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+}
+
 /// Request to edit a region directly.
 #[derive(Debug)]
 pub(crate) struct RegionEditRequest {
     pub(crate) region_id: RegionId,
     pub(crate) edit: RegionEdit,
-    /// The sender to notify the result to the region engine.
-    pub(crate) tx: Sender<Result<()>>,
+    /// Whether to preload SST files into the write cache.
+    pub(crate) preload_sst_cache: bool,
+    /// The waiters that are waiting for this region edit's result.
+    pub(crate) waiters: Waiters,
+}
+
+impl RegionEditRequest {
+    pub(crate) fn new(
+        region_id: RegionId,
+        edit: RegionEdit,
+        preload_sst_cache: bool,
+        waiter: Sender<Result<()>>,
+    ) -> Self {
+        Self {
+            region_id,
+            edit,
+            preload_sst_cache,
+            waiters: Waiters::one(waiter),
+        }
+    }
 }
 
 /// Notifies the regin the result of editing region.
@@ -1089,12 +1196,12 @@ pub(crate) struct RegionEditRequest {
 pub(crate) struct RegionEditResult {
     /// Region id.
     pub(crate) region_id: RegionId,
-    /// Result sender.
-    pub(crate) sender: Sender<Result<()>>,
+    /// Result waiters.
+    pub(crate) waiters: Waiters,
     /// Region edit to apply.
     pub(crate) edit: RegionEdit,
     /// Result from the manifest manager.
-    pub(crate) result: Result<()>,
+    pub(crate) result: std::result::Result<(), Arc<Error>>,
     /// Whether region state need to be set to Writable after handling this request.
     pub(crate) update_region_state: bool,
     /// The region is in staging mode before handling this request.
@@ -1149,10 +1256,13 @@ pub(crate) struct CopyRegionFromRequest {
 mod tests {
     use api::v1::value::ValueData;
     use api::v1::{Row, SemanticType};
+    use common_error::ext::ErrorExt;
+    use common_error::status_code::StatusCode;
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::ColumnDefaultConstraint;
     use mito_codec::test_util::i64_value;
     use store_api::metadata::RegionMetadataBuilder;
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::error::Error;
@@ -1182,6 +1292,55 @@ mod tests {
         } else {
             panic!("Unexpected error {err}")
         }
+    }
+
+    fn waiter() -> (Sender<Result<()>>, Receiver<Result<()>>) {
+        oneshot::channel()
+    }
+
+    fn assert_waiter_ok(rx: &mut Receiver<Result<()>>) {
+        rx.try_recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn test_waiters_reply_with_single_waiter() {
+        let (tx, mut rx) = waiter();
+        Waiters::one(tx).reply_with(|| Ok(()));
+        assert_waiter_ok(&mut rx);
+    }
+
+    #[test]
+    fn test_waiters_reply_with_many_waiters() {
+        let (tx1, mut rx1) = waiter();
+        let (tx2, mut rx2) = waiter();
+        let (tx3, mut rx3) = waiter();
+
+        let waiters = Waiters(vec![tx1, tx2, tx3].into());
+        waiters.reply_with(|| Ok(()));
+
+        assert_waiter_ok(&mut rx1);
+        assert_waiter_ok(&mut rx2);
+        assert_waiter_ok(&mut rx3);
+    }
+
+    #[test]
+    fn test_waiters_merge() {
+        let (tx1, mut rx1) = waiter();
+        let (tx2, mut rx2) = waiter();
+        let (tx3, mut rx3) = waiter();
+        let (tx4, mut rx4) = waiter();
+
+        let mut waiters = Waiters::one(tx1);
+        waiters.merge(Waiters::one(tx2));
+        waiters.merge(Waiters(vec![tx3, tx4].into()));
+        assert_eq!(4, waiters.0.len());
+
+        waiters.reply_with(|| Ok(()));
+
+        assert_waiter_ok(&mut rx1);
+        assert_waiter_ok(&mut rx2);
+        assert_waiter_ok(&mut rx3);
+        assert_waiter_ok(&mut rx4);
     }
 
     #[test]
@@ -1214,6 +1373,22 @@ mod tests {
         assert_eq!(0, request.column_index_by_name("c0").unwrap());
         assert_eq!(1, request.column_index_by_name("c1").unwrap());
         assert_eq!(None, request.column_index_by_name("c2"));
+    }
+
+    #[test]
+    fn test_compaction_cancelled_sends_cancelled_error() {
+        let (tx, rx) = oneshot::channel();
+        let request = CompactionCancelled {
+            region_id: RegionId::new(1, 1),
+            execution: crate::compaction::CompactionExecution::for_test(0),
+            senders: vec![OutputTx::new(tx)],
+        };
+
+        request.on_success();
+
+        let err = rx.blocking_recv().unwrap().unwrap_err();
+        assert!(matches!(err, Error::CompactionCancelled { .. }));
+        assert_eq!(err.status_code(), StatusCode::Cancelled);
     }
 
     #[test]

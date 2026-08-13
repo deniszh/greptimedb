@@ -36,7 +36,9 @@ use store_api::metric_engine_consts::{
     LOGICAL_TABLE_METADATA_KEY, PHYSICAL_TABLE_METADATA_KEY, is_metric_engine_option_key,
 };
 use store_api::mito_engine_options::{
-    APPEND_MODE_KEY, COMPACTION_TYPE, MEMTABLE_TYPE, MERGE_MODE_KEY, SST_FORMAT_KEY,
+    APPEND_MODE_KEY, COMPACTION_TYPE, MEMTABLE_BULK_ENCODE_BYTES_THRESHOLD,
+    MEMTABLE_BULK_ENCODE_ROW_THRESHOLD, MEMTABLE_BULK_MAX_MERGE_GROUPS,
+    MEMTABLE_BULK_MERGE_THRESHOLD, MEMTABLE_TYPE, MERGE_MODE_KEY, SST_FORMAT_KEY,
     TWCS_FALLBACK_TO_LOCAL, TWCS_MAX_OUTPUT_FILE_SIZE, TWCS_TIME_WINDOW, TWCS_TRIGGER_FILE_NUM,
     is_mito_engine_option_key,
 };
@@ -46,6 +48,9 @@ use crate::error::{ParseTableOptionSnafu, Result};
 use crate::metadata::{TableId, TableVersion};
 use crate::table_reference::TableReference;
 
+mod semantic;
+pub use semantic::*;
+
 pub const FILE_TABLE_META_KEY: &str = "__private.file_table_meta";
 pub const FILE_TABLE_LOCATION_KEY: &str = "location";
 pub const FILE_TABLE_PATTERN_KEY: &str = "pattern";
@@ -54,10 +59,23 @@ pub const FILE_TABLE_FORMAT_KEY: &str = "format";
 pub const TABLE_DATA_MODEL: &str = "table_data_model";
 pub const TABLE_DATA_MODEL_TRACE_V1: &str = "greptime_trace_v1";
 
+/// Returns true if the table stores spans in the `greptime_trace_v1` data model
+/// (fixed span columns), the shape the Jaeger query path and the entity-graph
+/// derivation rely on.
+pub fn is_trace_v1_table(table_info: &crate::metadata::TableInfo) -> bool {
+    table_info
+        .meta
+        .options
+        .extra_options
+        .get(TABLE_DATA_MODEL)
+        .map(|v| v == TABLE_DATA_MODEL_TRACE_V1)
+        .unwrap_or(false)
+}
+
 pub const OTLP_METRIC_COMPAT_KEY: &str = "otlp_metric_compat";
 pub const OTLP_METRIC_COMPAT_PROM: &str = "prom";
 
-pub const VALID_TABLE_OPTION_KEYS: [&str; 13] = [
+pub const VALID_TABLE_OPTION_KEYS: [&str; 14] = [
     // common keys:
     WRITE_BUFFER_SIZE_KEY,
     TTL_KEY,
@@ -75,6 +93,7 @@ pub const VALID_TABLE_OPTION_KEYS: [&str; 13] = [
     // table model info
     TABLE_DATA_MODEL,
     OTLP_METRIC_COMPAT_KEY,
+    REPARTITION_COLUMN_HINT_KEY,
 ];
 
 pub const DDL_TIMEOUT: &str = "timeout";
@@ -88,6 +107,10 @@ static VALID_DB_OPT_KEYS: Lazy<HashSet<&str>> = Lazy::new(|| {
     set.insert(TTL_KEY);
     set.insert(STORAGE_KEY);
     set.insert(MEMTABLE_TYPE);
+    set.insert(MEMTABLE_BULK_MERGE_THRESHOLD);
+    set.insert(MEMTABLE_BULK_ENCODE_ROW_THRESHOLD);
+    set.insert(MEMTABLE_BULK_ENCODE_BYTES_THRESHOLD);
+    set.insert(MEMTABLE_BULK_MAX_MERGE_GROUPS);
     set.insert(APPEND_MODE_KEY);
     set.insert(MERGE_MODE_KEY);
     set.insert(SKIP_WAL_KEY);
@@ -123,13 +146,19 @@ pub fn validate_table_option(key: &str) -> bool {
         return true;
     }
 
+    // Semantic-layer keys share a reserved prefix instead of a fixed allowlist so
+    // the vocabulary can grow without touching this gate. See `semantic` module.
+    if is_semantic_option_key(key) {
+        return true;
+    }
+
     VALID_TABLE_OPTION_KEYS.contains(&key) || VALID_DDL_OPTION_KEYS.contains(&key)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct TableOptions {
-    /// Memtable size of memtable.
+    /// Per-region write buffer stall threshold. Writes are rejected at twice this size.
     pub write_buffer_size: Option<ReadableSize>,
     /// Time-to-live of table. Expired data will be automatically purged.
     pub ttl: Option<TimeToLive>,
@@ -139,12 +168,14 @@ pub struct TableOptions {
     pub extra_options: HashMap<String, String>,
 }
 
-pub const WRITE_BUFFER_SIZE_KEY: &str = "write_buffer_size";
+pub const WRITE_BUFFER_SIZE_KEY: &str = store_api::mito_engine_options::WRITE_BUFFER_SIZE_KEY;
 pub const TTL_KEY: &str = store_api::mito_engine_options::TTL_KEY;
 pub const STORAGE_KEY: &str = "storage";
 pub const COMMENT_KEY: &str = "comment";
 pub const AUTO_CREATE_TABLE_KEY: &str = "auto_create_table";
 pub const SKIP_WAL_KEY: &str = store_api::mito_engine_options::SKIP_WAL_KEY;
+pub const TRACE_TABLE_PARTITIONS_HINT_KEY: &str = "trace_table_partitions";
+pub const REPARTITION_COLUMN_HINT_KEY: &str = "repartition.column.hint";
 
 impl TableOptions {
     pub fn try_from_iter<T: ToString, U: IntoIterator<Item = (T, T)>>(
@@ -209,7 +240,7 @@ impl fmt::Display for TableOptions {
             key_vals.push(format!("{}={}", TTL_KEY, ttl));
         }
 
-        if self.skip_wal {
+        if self.skip_wal && !self.extra_options.contains_key(SKIP_WAL_KEY) {
             key_vals.push(format!("{}={}", SKIP_WAL_KEY, self.skip_wal));
         }
 
@@ -223,7 +254,7 @@ impl fmt::Display for TableOptions {
 
 impl From<&TableOptions> for HashMap<String, String> {
     fn from(opts: &TableOptions) -> Self {
-        let mut res = HashMap::with_capacity(2 + opts.extra_options.len());
+        let mut res = HashMap::with_capacity(3 + opts.extra_options.len());
         if let Some(write_buffer_size) = opts.write_buffer_size {
             let _ = res.insert(
                 WRITE_BUFFER_SIZE_KEY.to_string(),
@@ -233,11 +264,10 @@ impl From<&TableOptions> for HashMap<String, String> {
         if let Some(ttl_str) = opts.ttl.map(|ttl| ttl.to_string()) {
             let _ = res.insert(TTL_KEY.to_string(), ttl_str);
         }
-        res.extend(
-            opts.extra_options
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone())),
-        );
+        if opts.skip_wal {
+            let _ = res.insert(SKIP_WAL_KEY.to_string(), true.to_string());
+        }
+        res.extend(opts.extra_options.clone());
         res
     }
 }
@@ -291,6 +321,10 @@ pub enum AlterKind {
     UnsetTableOptions {
         keys: Vec<UnsetRegionOption>,
     },
+    SetRepartitionColumnHint {
+        column_name: String,
+    },
+    UnsetRepartitionColumnHint,
     SetIndexes {
         options: Vec<SetIndexOption>,
     },
@@ -417,6 +451,7 @@ pub struct CompactTableRequest {
     pub table_name: String,
     pub compact_options: compact_request::Options,
     pub parallelism: u32,
+    pub time_range: Option<TimestampRange>,
 }
 
 impl Default for CompactTableRequest {
@@ -427,6 +462,7 @@ impl Default for CompactTableRequest {
             table_name: Default::default(),
             compact_options: compact_request::Options::Regular(Default::default()),
             parallelism: 1,
+            time_range: None,
         }
     }
 }
@@ -481,7 +517,29 @@ mod tests {
         assert!(validate_table_option(TTL_KEY));
         assert!(validate_table_option(WRITE_BUFFER_SIZE_KEY));
         assert!(validate_table_option(STORAGE_KEY));
+        assert!(validate_table_option(MEMTABLE_BULK_MERGE_THRESHOLD));
+        assert!(validate_table_option(REPARTITION_COLUMN_HINT_KEY));
         assert!(!validate_table_option("foo"));
+
+        // Only whitelisted semantic keys are accepted.
+        assert!(validate_table_option(SEMANTIC_SIGNAL_TYPE));
+        assert!(validate_table_option(SEMANTIC_METRIC_TYPE));
+        // Unknown semantic key, near-miss, and the internal transport key are rejected.
+        assert!(!validate_table_option("greptime.semantic.future.key"));
+        assert!(!validate_table_option("greptime.semanticx"));
+        assert!(!validate_table_option(SEMANTIC_PER_TABLE_INDEX_KEY));
+    }
+
+    #[test]
+    fn test_validate_database_option() {
+        assert!(validate_database_option(MEMTABLE_TYPE));
+        assert!(validate_database_option(MEMTABLE_BULK_MERGE_THRESHOLD));
+        assert!(validate_database_option(MEMTABLE_BULK_ENCODE_ROW_THRESHOLD));
+        assert!(validate_database_option(
+            MEMTABLE_BULK_ENCODE_BYTES_THRESHOLD
+        ));
+        assert!(validate_database_option(MEMTABLE_BULK_MAX_MERGE_GROUPS));
+        assert!(!validate_database_option("foo"));
     }
 
     #[test]
@@ -511,6 +569,20 @@ mod tests {
 
         let options = TableOptions {
             write_buffer_size: None,
+            ttl: None,
+            extra_options: HashMap::from([(SKIP_WAL_KEY.to_string(), true.to_string())]),
+            skip_wal: true,
+        };
+        let serialized_map = HashMap::from(&options);
+        assert_eq!(
+            Some("true"),
+            serialized_map.get(SKIP_WAL_KEY).map(String::as_str)
+        );
+        let serialized = TableOptions::try_from_iter(&serialized_map).unwrap();
+        assert_eq!(options, serialized);
+
+        let options = TableOptions {
+            write_buffer_size: None,
             ttl: Default::default(),
             extra_options: HashMap::new(),
             skip_wal: false,
@@ -524,6 +596,15 @@ mod tests {
             ttl: Some(Duration::from_secs(1000).into()),
             extra_options: HashMap::from([("a".to_string(), "A".to_string())]),
             skip_wal: false,
+        };
+        let serialized_map = HashMap::from(&options);
+        let serialized = TableOptions::try_from_iter(&serialized_map).unwrap();
+        assert_eq!(options, serialized);
+
+        let options = TableOptions {
+            extra_options: HashMap::from([(SKIP_WAL_KEY.to_string(), false.to_string())]),
+            skip_wal: false,
+            ..Default::default()
         };
         let serialized_map = HashMap::from(&options);
         let serialized = TableOptions::try_from_iter(&serialized_map).unwrap();
@@ -566,5 +647,13 @@ mod tests {
             "write_buffer_size=128.0MiB ttl=16m 40s skip_wal=true",
             options.to_string()
         );
+
+        let options = TableOptions {
+            write_buffer_size: None,
+            ttl: None,
+            extra_options: HashMap::from([(SKIP_WAL_KEY.to_string(), "false".to_string())]),
+            skip_wal: false,
+        };
+        assert_eq!("skip_wal=false", options.to_string());
     }
 }

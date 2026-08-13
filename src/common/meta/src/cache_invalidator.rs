@@ -17,7 +17,6 @@ use std::sync::Arc;
 use crate::error::Result;
 use crate::flow_name::FlowName;
 use crate::instruction::{CacheIdent, DropFlow};
-use crate::key::MetadataKey;
 use crate::key::flow::flow_info::FlowInfoKey;
 use crate::key::flow::flow_name::FlowNameKey;
 use crate::key::flow::flow_route::FlowRouteKey;
@@ -28,7 +27,11 @@ use crate::key::schema_name::SchemaNameKey;
 use crate::key::table_info::TableInfoKey;
 use crate::key::table_name::TableNameKey;
 use crate::key::table_route::TableRouteKey;
+use crate::key::tombstone::to_tombstone_key;
 use crate::key::view_info::ViewInfoKey;
+use crate::key::{
+    MetadataKey, drop_generation_key, dropped_at_key, purging_key, retention_expires_at_key,
+};
 
 /// KvBackend cache invalidator
 #[async_trait::async_trait]
@@ -55,6 +58,13 @@ pub struct Context {
 pub trait CacheInvalidator: Send + Sync {
     async fn invalidate(&self, ctx: &Context, caches: &[CacheIdent]) -> Result<()>;
 
+    /// Invalidates every cache entry owned by this invalidator.
+    ///
+    /// This method is required so each implementer explicitly decides how
+    /// full-cache invalidation should behave. Implementations that intentionally
+    /// do nothing must document why a no-op is safe.
+    fn invalidate_all(&self) -> Result<()>;
+
     fn name(&self) -> &'static str {
         std::any::type_name::<Self>()
     }
@@ -67,6 +77,11 @@ pub struct DummyCacheInvalidator;
 #[async_trait::async_trait]
 impl CacheInvalidator for DummyCacheInvalidator {
     async fn invalidate(&self, _ctx: &Context, _caches: &[CacheIdent]) -> Result<()> {
+        Ok(())
+    }
+
+    fn invalidate_all(&self) -> Result<()> {
+        // Dummy invalidator owns no cache state, so there is nothing to clear.
         Ok(())
     }
 }
@@ -88,6 +103,15 @@ where
 
                     let key = ViewInfoKey::new(*table_id);
                     self.invalidate_key(&key.to_bytes()).await;
+
+                    for key in [
+                        dropped_at_key(*table_id),
+                        retention_expires_at_key(*table_id),
+                        drop_generation_key(*table_id),
+                        purging_key(*table_id),
+                    ] {
+                        self.invalidate_key(&to_tombstone_key(&key)).await;
+                    }
                 }
                 CacheIdent::TableName(table_name) => {
                     let key: TableNameKey = table_name.into();
@@ -149,8 +173,19 @@ where
                     let key = NodeAddressKey::with_flownode(*node_id);
                     self.invalidate_key(&key.to_bytes()).await;
                 }
+                CacheIdent::User(_) => {
+                    // User cache invalidation is handled by external
+                    // CacheInvalidator implementations.
+                }
             }
         }
+        Ok(())
+    }
+
+    fn invalidate_all(&self) -> Result<()> {
+        // KvCacheInvalidator only knows how to invalidate explicit metadata
+        // keys. There is no safe generic way to enumerate or clear the backend
+        // keyspace, so full invalidation is intentionally a no-op here.
         Ok(())
     }
 }

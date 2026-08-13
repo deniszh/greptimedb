@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use auth::{JAEGER_QUERY, PermissionReq, PermissionTableTarget, PermissionTableTargets};
 use catalog::CatalogManagerRef;
 use common_catalog::consts::{
     TRACE_TABLE_NAME, trace_operations_table_name, trace_services_table_name,
@@ -38,7 +39,7 @@ use datafusion_expr::{Expr, ExprFunctionExt, SortExpr, col, lit, lit_timestamp_n
 use query::QueryEngineRef;
 use serde_json::Value as JsonValue;
 use servers::error::{
-    CollectRecordbatchSnafu, DataFusionSnafu, Result as ServerResult, TableNotFoundSnafu,
+    AuthSnafu, CollectRecordbatchSnafu, DataFusionSnafu, Result as ServerResult, TableNotFoundSnafu,
 };
 use servers::http::jaeger::{JAEGER_QUERY_TABLE_NAME_KEY, QueryTraceParams, TraceUserAgent};
 use servers::otlp::trace::{
@@ -50,7 +51,6 @@ use servers::query_handler::JaegerQueryHandler;
 use session::context::QueryContextRef;
 use snafu::{OptionExt, ResultExt};
 use table::TableRef;
-use table::requests::{TABLE_DATA_MODEL, TABLE_DATA_MODEL_TRACE_V1};
 use table::table::adapter::DfTableProviderAdapter;
 
 use crate::instance::Instance;
@@ -58,9 +58,28 @@ use crate::instance::Instance;
 const DEFAULT_LIMIT: usize = 2000;
 const KEY_RN: &str = "greptime_rn";
 
+impl Instance {
+    async fn check_jaeger_query_permission(&self, ctx: &QueryContextRef) -> ServerResult<()> {
+        let table = ctx
+            .extension(JAEGER_QUERY_TABLE_NAME_KEY)
+            .unwrap_or(TRACE_TABLE_NAME);
+        let targets = PermissionTableTargets::resolved(vec![PermissionTableTarget::new(
+            ctx.current_catalog(),
+            ctx.current_schema(),
+            table,
+        )]);
+        let targets = self.resolve_query_permission_targets(targets, ctx).await?;
+        self.check_table_permission(ctx, PermissionReq::Action(JAEGER_QUERY), targets)
+            .context(AuthSnafu)?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl JaegerQueryHandler for Instance {
     async fn get_services(&self, ctx: QueryContextRef) -> ServerResult<Output> {
+        self.check_jaeger_query_permission(&ctx).await?;
+
         // It's equivalent to `SELECT DISTINCT(service_name) FROM {db}.{trace_table}`.
         Ok(query_trace_table(
             ctx,
@@ -81,6 +100,8 @@ impl JaegerQueryHandler for Instance {
         service_name: &str,
         span_kind: Option<&str>,
     ) -> ServerResult<Output> {
+        self.check_jaeger_query_permission(&ctx).await?;
+
         let mut filters = vec![col(SERVICE_NAME_COLUMN).eq(lit(service_name))];
 
         if let Some(span_kind) = span_kind {
@@ -129,6 +150,8 @@ impl JaegerQueryHandler for Instance {
         end_time: Option<i64>,
         limit: Option<usize>,
     ) -> ServerResult<Output> {
+        self.check_jaeger_query_permission(&ctx).await?;
+
         // It's equivalent to the following SQL query:
         //
         // ```
@@ -173,6 +196,8 @@ impl JaegerQueryHandler for Instance {
         ctx: QueryContextRef,
         query_params: QueryTraceParams,
     ) -> ServerResult<Output> {
+        self.check_jaeger_query_permission(&ctx).await?;
+
         let mut filters = vec![];
 
         // `service_name` is already validated in `from_jaeger_query_params()`, so no additional check needed here.
@@ -342,15 +367,7 @@ async fn query_trace_table(
             schema: ctx.current_schema(),
         })?;
 
-    let is_data_model_v1 = table
-        .clone()
-        .table_info()
-        .meta
-        .options
-        .extra_options
-        .get(TABLE_DATA_MODEL)
-        .map(|s| s.as_str())
-        == Some(TABLE_DATA_MODEL_TRACE_V1);
+    let is_data_model_v1 = table::requests::is_trace_v1_table(&table.table_info());
 
     // collect to set
     let col_names = table
@@ -408,7 +425,9 @@ async fn query_trace_table(
         RecordBatchStreamAdapter::try_new(stream).context(CollectRecordbatchSnafu)?,
     ));
 
-    Ok(output)
+    output
+        .map_dictionary_to_values()
+        .context(CollectRecordbatchSnafu)
 }
 
 async fn get_table(
@@ -485,7 +504,9 @@ async fn find_traces_rank_3(
         RecordBatchStreamAdapter::try_new(stream).context(CollectRecordbatchSnafu)?,
     ));
 
-    Ok(output)
+    output
+        .map_dictionary_to_values()
+        .context(CollectRecordbatchSnafu)
 }
 
 // The current implementation registers UDFs during the planning stage, which makes it difficult

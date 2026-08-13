@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use store_api::storage::{RegionId, RegionNumber, TableId};
+use store_api::storage::{RegionId, TableId};
 
 use crate::DatanodeId;
 use crate::cache_invalidator::CacheInvalidatorRef;
@@ -27,6 +27,7 @@ use crate::key::table_route::PhysicalTableRouteValue;
 use crate::node_manager::NodeManagerRef;
 use crate::region_keeper::MemoryRegionKeeperRef;
 use crate::region_registry::LeaderRegionRegistryRef;
+use crate::wal_provider::RegionWalOptions;
 
 pub mod allocator;
 pub mod alter_database;
@@ -43,13 +44,18 @@ pub mod drop_database;
 pub mod drop_flow;
 pub mod drop_table;
 pub mod drop_view;
+pub(crate) mod event;
 pub mod flow_meta;
+#[cfg(feature = "enterprise")]
+pub mod purge_dropped_table;
 pub mod table_meta;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_util;
 #[cfg(test)]
 pub(crate) mod tests;
 pub mod truncate_table;
+#[cfg(feature = "enterprise")]
+pub mod undrop_table;
 pub mod utils;
 
 /// Metadata allocated to a table.
@@ -59,9 +65,9 @@ pub struct TableMetadata {
     pub table_id: TableId,
     /// Route information for each region of the table.
     pub table_route: PhysicalTableRouteValue,
-    /// The encoded wal options for regions of the table.
+    /// The WAL options for regions of the table.
     // If a region does not have an associated wal options, no key for the region would be found in the map.
-    pub region_wal_options: HashMap<RegionNumber, String>,
+    pub region_wal_options: RegionWalOptions,
 }
 
 pub type RegionFailureDetectorControllerRef = Arc<dyn RegionFailureDetectorController>;
@@ -76,6 +82,9 @@ pub trait RegionFailureDetectorController: Send + Sync {
     /// Registers failure detectors for the given identifiers.
     async fn register_failure_detectors(&self, detecting_regions: Vec<DetectingRegion>);
 
+    /// Resets failure detectors for the given identifiers.
+    async fn reset_failure_detectors(&self, detecting_regions: Vec<DetectingRegion>);
+
     /// Deregisters failure detectors for the given identifiers.
     async fn deregister_failure_detectors(&self, detecting_regions: Vec<DetectingRegion>);
 }
@@ -87,6 +96,8 @@ pub struct NoopRegionFailureDetectorControl;
 #[async_trait::async_trait]
 impl RegionFailureDetectorController for NoopRegionFailureDetectorControl {
     async fn register_failure_detectors(&self, _detecting_regions: Vec<DetectingRegion>) {}
+
+    async fn reset_failure_detectors(&self, _detecting_regions: Vec<DetectingRegion>) {}
 
     async fn deregister_failure_detectors(&self, _detecting_regions: Vec<DetectingRegion>) {}
 }
@@ -112,6 +123,13 @@ pub struct DdlContext {
     pub flow_metadata_allocator: FlowMetadataAllocatorRef,
     /// controller of region failure detector.
     pub region_failure_detector_controller: RegionFailureDetectorControllerRef,
+    /// Whether table drops should stop after tombstoning metadata.
+    pub soft_drop_enabled: bool,
+    /// Fixed retention used to calculate new soft-drop deadlines.
+    pub soft_drop_retention: Option<Duration>,
+    /// Commits create-database metadata and the creator grant atomically.
+    pub create_database_metadata_committer:
+        Option<create_database::CreateDatabaseMetadataCommitterRef>,
 }
 
 impl DdlContext {
@@ -129,7 +147,10 @@ impl DdlContext {
     ///
     /// Once the regions were dropped, subsequent heartbeats no longer include these regions.
     /// Therefore, we should remove the failure detectors for these dropped regions.
-    async fn deregister_failure_detectors(&self, detecting_regions: Vec<DetectingRegion>) {
+    pub(crate) async fn deregister_failure_detectors(
+        &self,
+        detecting_regions: Vec<DetectingRegion>,
+    ) {
         self.region_failure_detector_controller
             .deregister_failure_detectors(detecting_regions)
             .await;

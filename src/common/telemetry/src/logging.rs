@@ -237,7 +237,7 @@ enum TraceState {
 }
 
 /// The logging options that used to initialize the logger.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggingOptions {
     /// The directory to store log files. If not set, logs will be written to stdout.
@@ -256,6 +256,9 @@ pub struct LoggingOptions {
     /// Whether to append logs to stdout. Default is true.
     pub append_stdout: bool,
 
+    /// Whether to write logs to files in `dir`. Default is true.
+    pub enable_file_logging: bool,
+
     /// Whether to enable tracing with OTLP. Default is false.
     pub enable_otlp_tracing: bool,
 
@@ -271,6 +274,9 @@ pub struct LoggingOptions {
     /// Additional HTTP headers for OTLP exporter.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub otlp_headers: HashMap<String, String>,
+
+    /// Whether to enable per-region metrics.
+    pub enable_per_region_metrics: bool,
 }
 
 /// The protocol of OTLP export.
@@ -338,19 +344,6 @@ pub enum LogFormat {
     Text,
 }
 
-impl PartialEq for LoggingOptions {
-    fn eq(&self, other: &Self) -> bool {
-        self.dir == other.dir
-            && self.level == other.level
-            && self.enable_otlp_tracing == other.enable_otlp_tracing
-            && self.otlp_endpoint == other.otlp_endpoint
-            && self.tracing_sample_ratio == other.tracing_sample_ratio
-            && self.append_stdout == other.append_stdout
-    }
-}
-
-impl Eq for LoggingOptions {}
-
 #[derive(Clone, Debug)]
 struct TraceContext {
     app_name: String,
@@ -369,10 +362,12 @@ impl Default for LoggingOptions {
             otlp_endpoint: None,
             tracing_sample_ratio: None,
             append_stdout: true,
+            enable_file_logging: true,
             // Rotation hourly, 24 files per day, keeps info log files of 30 days
             max_log_files: 720,
             otlp_export_protocol: None,
             otlp_headers: HashMap::new(),
+            enable_per_region_metrics: false,
         }
     }
 }
@@ -464,8 +459,10 @@ pub fn init_global_logging(
             None
         };
 
+        let file_logging_enabled = opts.enable_file_logging && !opts.dir.is_empty();
+
         // Configure the file logging layer with rolling policy.
-        let file_logging_layer = if !opts.dir.is_empty() {
+        let file_logging_layer = if file_logging_enabled {
             let rolling_appender = RollingFileAppender::builder()
                 .rotation(Rotation::HOURLY)
                 .filename_prefix("greptimedb")
@@ -496,7 +493,7 @@ pub fn init_global_logging(
         };
 
         // Configure the error file logging layer with rolling policy.
-        let err_file_logging_layer = if !opts.dir.is_empty() {
+        let err_file_logging_layer = if file_logging_enabled {
             let rolling_appender = RollingFileAppender::builder()
                 .rotation(Rotation::HOURLY)
                 .filename_prefix("greptimedb-err")
@@ -721,7 +718,8 @@ where
         + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
     if let Some(slow_query_opts) = slow_query_opts {
-        if !opts.dir.is_empty()
+        if opts.enable_file_logging
+            && !opts.dir.is_empty()
             && slow_query_opts.enable
             && slow_query_opts.record_type == SlowQueriesRecordType::Log
         {
@@ -786,6 +784,15 @@ mod tests {
         assert_eq!(opts.dir, "");
         assert_eq!(opts.level, None);
         assert!(opts.append_stdout);
+        assert!(opts.enable_file_logging);
+    }
+
+    #[test]
+    fn test_logging_options_deserialization_enable_file_logging() {
+        let json = r#"{"enable_file_logging": false}"#;
+        let opts: LoggingOptions = serde_json::from_str(json).unwrap();
+
+        assert!(!opts.enable_file_logging);
     }
 
     #[test]
@@ -868,5 +875,28 @@ mod tests {
         let http_json = r#""http""#;
         let protocol: OtlpExportProtocol = serde_json::from_str(http_json).unwrap();
         assert_eq!(protocol, OtlpExportProtocol::Http);
+    }
+
+    #[test]
+    fn test_logging_options_partial_eq_all_fields() {
+        let base = LoggingOptions::default();
+
+        let mut log_format = base.clone();
+        log_format.log_format = LogFormat::Json;
+        assert_ne!(base, log_format);
+
+        let mut max_log_files = base.clone();
+        max_log_files.max_log_files += 1;
+        assert_ne!(base, max_log_files);
+
+        let mut otlp_export_protocol = base.clone();
+        otlp_export_protocol.otlp_export_protocol = Some(OtlpExportProtocol::Http);
+        assert_ne!(base, otlp_export_protocol);
+
+        let mut otlp_headers = base.clone();
+        otlp_headers
+            .otlp_headers
+            .insert("key".to_string(), "value".to_string());
+        assert_ne!(base, otlp_headers);
     }
 }

@@ -42,7 +42,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
         // If the region is already in staging mode, verify the partition directive matches.
         if region.is_staging() {
-            let staging_partition_info = region.staging_partition_info.lock().unwrap().clone();
+            let staging_partition_info = region.manifest_ctx.staging_partition_info();
             // If the partition directive mismatches, return error.
             if staging_partition_info
                 .as_ref()
@@ -98,19 +98,22 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             return;
         }
 
-        if self.compaction_scheduler.is_compacting(region_id) {
-            // Safety: region is compacting, add ddl request to pending queue.
-            self.compaction_scheduler
-                .add_ddl_request_to_pending(SenderDdlRequest {
-                    region_id,
-                    sender,
-                    request: DdlRequest::EnterStaging(EnterStagingRequest {
-                        partition_directive,
-                    }),
-                });
-
-            return;
-        }
+        let (sender, partition_directive) = match self.compaction_scheduler.try_cancel_and_add_ddl(
+            region_id,
+            sender,
+            partition_directive,
+            |partition_directive| {
+                DdlRequest::EnterStaging(EnterStagingRequest {
+                    partition_directive,
+                })
+            },
+        ) {
+            Ok(()) => {
+                self.listener.on_compaction_cancel_requested(region_id);
+                return;
+            }
+            Err(request) => request,
+        };
 
         self.handle_enter_staging(region, partition_directive, sender);
     }
@@ -271,7 +274,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             .sender
             .send(enter_staging_result.result.map(|_| 0));
         // Handles the stalled requests.
-        self.handle_region_stalled_requests(&enter_staging_result.region_id)
+        self.handle_region_stalled_requests(&enter_staging_result.region_id, true)
             .await;
     }
 
@@ -279,10 +282,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         region: &MitoRegionRef,
         partition_directive: StagingPartitionDirective,
     ) {
-        let mut staging_partition_info = region.staging_partition_info.lock().unwrap();
-        debug_assert!(staging_partition_info.is_none());
-        *staging_partition_info = Some(StagingPartitionInfo::from_partition_directive(
-            partition_directive,
-        ));
+        region.manifest_ctx.set_staging_partition_info(
+            StagingPartitionInfo::from_partition_directive(partition_directive),
+        );
     }
 }

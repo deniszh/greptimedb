@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_error::ext::{BoxedError, ErrorExt};
+use common_error::ext::{BoxedError, ErrorExt, RetryHint};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use snafu::{Location, Snafu};
@@ -30,7 +30,7 @@ pub enum Error {
 
     #[snafu(display("Failed to list nodes from metasrv"))]
     Meta {
-        source: Box<meta_client::error::Error>,
+        source: Box<common_meta::error::Error>,
         #[snafu(implicit)]
         location: Location,
     },
@@ -74,5 +74,16 @@ impl ErrorExt for Error {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn retry_hint(&self) -> RetryHint {
+        use Error::*;
+
+        match self {
+            External { source, .. } => source.retry_hint(),
+            Meta { source, .. } => source.retry_hint(),
+            CreateChannel { source, .. } => source.retry_hint(),
+            _ => RetryHint::NonRetryable,
+        }
     }
 }

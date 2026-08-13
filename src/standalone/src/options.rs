@@ -14,6 +14,7 @@
 
 use common_base::readable_size::ReadableSize;
 use common_config::{Configurable, KvBackendConfig};
+use common_event_recorder::EventRecorderOptions;
 use common_memory_manager::OnExhaustedPolicy;
 use common_options::memory::MemoryOptions;
 use common_telemetry::logging::{LoggingOptions, SlowQueryOptions, TracingOptions};
@@ -38,6 +39,10 @@ pub struct StandaloneOptions {
     pub enable_telemetry: bool,
     pub default_timezone: Option<String>,
     pub default_column_prefix: Option<String>,
+    /// Server-side global switch for auto table creation on write.
+    /// Upper bound: when `false`, missing tables are never auto-created even if a
+    /// request sets the `auto_create_table` hint to `true`. Default: `true`.
+    pub auto_create_table: bool,
     /// Maximum total memory for all concurrent write request bodies and messages (HTTP, gRPC, Flight).
     /// Set to 0 to disable the limit. Default: "0" (unlimited)
     pub max_in_flight_write_bytes: ReadableSize,
@@ -67,6 +72,10 @@ pub struct StandaloneOptions {
     pub slow_query: SlowQueryOptions,
     pub query: QueryOptions,
     pub memory: MemoryOptions,
+    /// The event recorder options.
+    pub event_recorder: EventRecorderOptions,
+    /// Environment variable keys to read and report in heartbeat messages.
+    pub heartbeat_env_vars: Vec<String>,
 }
 
 impl Default for StandaloneOptions {
@@ -75,6 +84,7 @@ impl Default for StandaloneOptions {
             enable_telemetry: true,
             default_timezone: None,
             default_column_prefix: None,
+            auto_create_table: true,
             max_in_flight_write_bytes: ReadableSize(0),
             write_bytes_exhausted_policy: OnExhaustedPolicy::default(),
             http: HttpOptions::default(),
@@ -102,13 +112,19 @@ impl Default for StandaloneOptions {
             slow_query: SlowQueryOptions::default(),
             query: QueryOptions::default(),
             memory: MemoryOptions::default(),
+            event_recorder: EventRecorderOptions::default(),
+            heartbeat_env_vars: vec![],
         }
     }
 }
 
 impl Configurable for StandaloneOptions {
     fn env_list_keys() -> Option<&'static [&'static str]> {
-        Some(&["wal.broker_endpoints"])
+        Some(&[
+            "heartbeat_env_vars",
+            "wal.broker_endpoints",
+            "event_recorder.event_types",
+        ])
     }
 }
 
@@ -127,6 +143,7 @@ impl StandaloneOptions {
         let cloned_opts = self.clone();
         FrontendOptions {
             default_timezone: cloned_opts.default_timezone,
+            auto_create_table: cloned_opts.auto_create_table,
             max_in_flight_write_bytes: cloned_opts.max_in_flight_write_bytes,
             write_bytes_exhausted_policy: cloned_opts.write_bytes_exhausted_policy,
             http: cloned_opts.http,
@@ -141,6 +158,8 @@ impl StandaloneOptions {
             logging: cloned_opts.logging,
             user_provider: cloned_opts.user_provider,
             slow_query: cloned_opts.slow_query,
+            event_recorder: cloned_opts.event_recorder,
+            heartbeat_env_vars: cloned_opts.heartbeat_env_vars.clone(),
             ..Default::default()
         }
     }
@@ -157,6 +176,7 @@ impl StandaloneOptions {
             init_regions_in_background: cloned_opts.init_regions_in_background,
             init_regions_parallelism: cloned_opts.init_regions_parallelism,
             query: cloned_opts.query,
+            heartbeat_env_vars: cloned_opts.heartbeat_env_vars,
             ..Default::default()
         }
     }
@@ -170,5 +190,41 @@ impl StandaloneOptions {
                 .unwrap()
                 .sanitize(&self.storage.data_home);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common_event_recorder::EventTypeFilter;
+
+    use super::*;
+
+    #[test]
+    fn test_event_recorder_event_types_preserve_filter_semantics() {
+        let all: StandaloneOptions = toml::from_str("").unwrap();
+        let none: StandaloneOptions = toml::from_str("[event_recorder]\nevent_types = []").unwrap();
+        let selected: StandaloneOptions =
+            toml::from_str("[event_recorder]\nevent_types = ['create_database']").unwrap();
+
+        assert!(all.event_recorder.event_types.allows("future_event"));
+        assert_eq!(
+            none.event_recorder.event_types.as_ref(),
+            &EventTypeFilter::Only(Default::default())
+        );
+        assert!(
+            selected
+                .event_recorder
+                .event_types
+                .allows("create_database")
+        );
+        assert!(!selected.event_recorder.event_types.allows("drop_database"));
+
+        let frontend_options = selected.frontend_options();
+        assert!(Arc::ptr_eq(
+            &selected.event_recorder.event_types,
+            &frontend_options.event_recorder.event_types,
+        ));
     }
 }

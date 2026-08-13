@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{self, Error, Result};
 use crate::type_id::LogicalTypeId;
+use crate::types::json_type::JsonNativeType;
 use crate::types::{
     BinaryType, BooleanType, DateType, Decimal128Type, DictionaryType, DurationMicrosecondType,
     DurationMillisecondType, DurationNanosecondType, DurationSecondType, DurationType, Float32Type,
@@ -227,6 +228,11 @@ impl ConcreteDataType {
         matches!(self, ConcreteDataType::Json(_))
     }
 
+    /// Returns whether this is a JSON2 data type.
+    pub fn is_json2(&self) -> bool {
+        self.as_json().is_some_and(|json_type| json_type.is_json2())
+    }
+
     pub fn is_vector(&self) -> bool {
         matches!(self, ConcreteDataType::Vector(_))
     }
@@ -274,10 +280,6 @@ impl ConcreteDataType {
 
     pub fn is_null(&self) -> bool {
         matches!(self, ConcreteDataType::Null(NullType))
-    }
-
-    pub(crate) fn is_struct(&self) -> bool {
-        matches!(self, ConcreteDataType::Struct(_))
     }
 
     /// Try to cast the type as a [`ListType`].
@@ -479,7 +481,7 @@ impl TryFrom<&ArrowDataType> for ConcreteDataType {
             ArrowDataType::Decimal128(precision, scale) => {
                 ConcreteDataType::decimal128_datatype(*precision, *scale)
             }
-            ArrowDataType::Struct(fields) => ConcreteDataType::Struct(fields.try_into()?),
+            ArrowDataType::Struct(fields) => ConcreteDataType::Struct(StructType::from(fields)),
             ArrowDataType::Float16
             | ArrowDataType::Date64
             | ArrowDataType::FixedSizeBinary(_)
@@ -687,8 +689,8 @@ impl ConcreteDataType {
         Self::vector_datatype(0)
     }
 
-    pub fn json_native_datatype(inner_type: ConcreteDataType) -> ConcreteDataType {
-        ConcreteDataType::Json(JsonType::new_native((&inner_type).into()))
+    pub fn json2(native_type: JsonNativeType) -> ConcreteDataType {
+        ConcreteDataType::Json(JsonType::json2(Arc::new(native_type)))
     }
 }
 

@@ -41,6 +41,9 @@ use crate::read::flat_merge::FlatMergeReader;
 use crate::read::last_row::FlatLastRowReader;
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::RangeMeta;
+use crate::read::range_cache::{
+    build_range_cache_key, cache_flat_range_stream, cached_flat_range_stream,
+};
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{
     PartitionMetrics, PartitionMetricsList, SplitRecordBatchStream, compute_parallel_channel_size,
@@ -74,6 +77,9 @@ impl SeqScan {
         let mut properties = ScannerProperties::default()
             .with_append_mode(input.append_mode)
             .with_total_rows(input.total_rows());
+        if let Some(counters) = input.query_stat_counters.clone() {
+            properties.set_query_stat_counters(counters);
+        }
         let stream_ctx = Arc::new(StreamContext::seq_scan_ctx(input));
         properties.partitions = vec![stream_ctx.partition_ranges()];
 
@@ -127,7 +133,7 @@ impl SeqScan {
     ///
     /// # Panics
     /// Panics if the compaction flag is not set.
-    pub async fn build_flat_reader_for_compaction(&self) -> Result<BoxedRecordBatchStream> {
+    pub(crate) async fn build_flat_reader_for_compaction(&self) -> Result<BoxedRecordBatchStream> {
         assert!(self.stream_ctx.input.compaction);
 
         let metrics_set = ExecutionPlanMetricsSet::new();
@@ -181,19 +187,22 @@ impl SeqScan {
             sources,
             None,
             None,
+            false,
             compute_parallel_channel_size(DEFAULT_READ_BATCH_SIZE),
         )
         .await
     }
 
-    /// Builds a flat reader to read sources that returns RecordBatch. If `semaphore` is provided, reads sources in parallel
-    /// if possible.
+    /// Builds a flat reader to read sources that returns RecordBatch.
+    /// If `semaphore` is provided, reads sources in parallel if possible.
+    /// If `skip_dedup` is true, the merged stream is returned without applying flat dedup.
     #[tracing::instrument(level = tracing::Level::DEBUG, skip_all)]
     pub(crate) async fn build_flat_reader_from_sources(
         stream_ctx: &StreamContext,
         mut sources: Vec<BoxedRecordBatchStream>,
         semaphore: Option<Arc<Semaphore>>,
         part_metrics: Option<&PartitionMetrics>,
+        skip_dedup: bool,
         channel_size: usize,
     ) -> Result<BoxedRecordBatchStream> {
         if let Some(semaphore) = semaphore.as_ref() {
@@ -207,21 +216,31 @@ impl SeqScan {
             }
         }
 
-        let mapper = stream_ctx.input.mapper.as_flat().unwrap();
-        let schema = mapper.input_arrow_schema(stream_ctx.input.compaction);
+        let mapper = &stream_ctx.input.mapper;
+        let reader: BoxedRecordBatchStream = if sources.len() == 1 {
+            // Currently, we can't skip dedup when there is only one source because
+            // that source may have duplicate rows.
+            sources.pop().unwrap()
+        } else {
+            let schema = mapper.input_arrow_schema(stream_ctx.input.compaction);
+            let metrics_reporter = part_metrics.map(|m| m.merge_metrics_reporter());
+            let reader = FlatMergeReader::new(
+                schema,
+                sources,
+                stream_ctx.input.batch_size(),
+                metrics_reporter,
+            )
+            .await?;
+            Box::pin(reader.into_stream())
+        };
 
-        let metrics_reporter = part_metrics.map(|m| m.merge_metrics_reporter());
-        let reader =
-            FlatMergeReader::new(schema, sources, DEFAULT_READ_BATCH_SIZE, metrics_reporter)
-                .await?;
-
-        let dedup = !stream_ctx.input.append_mode;
+        let dedup = !skip_dedup && !stream_ctx.input.append_mode;
         let dedup_metrics_reporter = part_metrics.map(|m| m.dedup_metrics_reporter());
         let reader = if dedup {
             match stream_ctx.input.merge_mode {
                 MergeMode::LastRow => Box::pin(
                     FlatDedupReader::new(
-                        reader.into_stream().boxed(),
+                        reader,
                         FlatLastRow::new(stream_ctx.input.filter_deleted),
                         dedup_metrics_reporter,
                     )
@@ -229,7 +248,7 @@ impl SeqScan {
                 ) as _,
                 MergeMode::LastNonNull => Box::pin(
                     FlatDedupReader::new(
-                        reader.into_stream().boxed(),
+                        reader,
                         FlatLastNonNull::new(
                             mapper.field_column_start(),
                             stream_ctx.input.filter_deleted,
@@ -240,7 +259,7 @@ impl SeqScan {
                 ) as _,
             }
         } else {
-            Box::pin(reader.into_stream()) as _
+            reader
         };
 
         let reader = match &stream_ctx.input.series_row_selector {
@@ -251,6 +270,62 @@ impl SeqScan {
         };
 
         Ok(reader)
+    }
+
+    /// Builds a flat read stream for one partition range.
+    pub(crate) async fn build_flat_partition_range_read(
+        stream_ctx: &Arc<StreamContext>,
+        part_range: &PartitionRange,
+        compaction: bool,
+        part_metrics: &PartitionMetrics,
+        partition_pruner: Arc<PartitionPruner>,
+        file_scan_semaphore: Option<Arc<Semaphore>>,
+        merge_semaphore: Option<Arc<Semaphore>>,
+    ) -> Result<(BoxedRecordBatchStream, usize)> {
+        let cache_key = build_range_cache_key(stream_ctx, part_range);
+
+        if let Some(key) = cache_key.as_ref() {
+            if let Some(value) = stream_ctx.input.cache_strategy.get_range_result(key) {
+                part_metrics.inc_range_cache_hit();
+                return Ok((cached_flat_range_stream(value), DEFAULT_READ_BATCH_SIZE));
+            }
+            part_metrics.inc_range_cache_miss();
+        }
+
+        let mut sources = Vec::new();
+        let split_batch_size = build_flat_sources(
+            stream_ctx,
+            part_range,
+            compaction,
+            part_metrics,
+            partition_pruner,
+            &mut sources,
+            file_scan_semaphore,
+        )
+        .await?;
+        let estimated_rows_per_batch = split_batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE);
+        let channel_size = compute_parallel_channel_size(estimated_rows_per_batch);
+        let stream = Self::build_flat_reader_from_sources(
+            stream_ctx,
+            sources,
+            merge_semaphore,
+            Some(part_metrics),
+            false,
+            channel_size,
+        )
+        .await?;
+
+        let stream = match cache_key {
+            Some(key) => cache_flat_range_stream(
+                stream,
+                stream_ctx.input.cache_strategy.clone(),
+                key,
+                part_metrics.clone(),
+            ),
+            None => stream,
+        };
+
+        Ok((stream, estimated_rows_per_batch))
     }
 
     /// Scans the given partition when the part list is set properly.
@@ -331,23 +406,16 @@ impl SeqScan {
 
             // Scans each part.
             for part_range in partition_ranges {
-                let mut sources = Vec::new();
-                let split_batch_size = build_flat_sources(
+                let (mut reader, _) = Self::build_flat_partition_range_read(
                     &stream_ctx,
                     &part_range,
                     compaction,
                     &part_metrics,
                     partition_pruner.clone(),
-                    &mut sources,
                     file_scan_semaphore.clone(),
-                ).await?;
-
-                let channel_size = compute_parallel_channel_size(
-                    split_batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE),
-                );
-                let mut reader =
-                    Self::build_flat_reader_from_sources(&stream_ctx, sources, semaphore.clone(), Some(&part_metrics), channel_size)
-                        .await?;
+                    semaphore.clone(),
+                )
+                .await?;
 
                 let mut metrics = ScannerMetrics {
                     scan_cost: fetch_start.elapsed(),
@@ -511,6 +579,14 @@ impl RegionScanner for SeqScan {
     fn set_logical_region(&mut self, logical_region: bool) {
         self.properties.set_logical_region(logical_region);
     }
+
+    fn set_query_load_region_id(&mut self, region_id: store_api::storage::RegionId) {
+        self.properties.set_query_load_region_id(region_id);
+    }
+
+    fn snapshot_sequence(&self) -> Option<u64> {
+        self.stream_ctx.input.snapshot_sequence
+    }
 }
 
 impl DisplayAs for SeqScan {
@@ -584,6 +660,7 @@ pub(crate) async fn build_flat_sources(
     let mut ordered_sources = Vec::with_capacity(num_indices);
     ordered_sources.resize_with(num_indices, || None);
     let mut file_scan_tasks = Vec::new();
+    let pre_filter_mode = stream_ctx.range_pre_filter_mode(part_range);
 
     for (position, index) in range_meta.row_group_indices.iter().enumerate() {
         if stream_ctx.is_mem_range_index(*index) {
@@ -595,6 +672,13 @@ pub(crate) async fn build_flat_sources(
             );
             ordered_sources[position] = Some(Box::pin(stream) as _);
         } else if stream_ctx.is_file_range_index(*index) {
+            // Common manifest-level fast-skip shared by SeqScan and UnorderedScan.
+            // Compaction should keep reading its selected input ranges completely.
+            if !compaction
+                && partition_pruner.try_skip_manifest_pruned_file_range(*index, part_metrics)
+            {
+                continue;
+            }
             if let Some(semaphore_ref) = semaphore.as_ref() {
                 // run in parallel, controlled by semaphore
                 let stream_ctx = stream_ctx.clone();
@@ -627,8 +711,13 @@ pub(crate) async fn build_flat_sources(
                 ordered_sources[position] = Some(Box::pin(stream) as _);
             }
         } else {
-            let stream =
-                scan_util::maybe_scan_flat_other_ranges(stream_ctx, *index, part_metrics).await?;
+            let stream = scan_util::maybe_scan_flat_other_ranges(
+                stream_ctx,
+                *index,
+                part_metrics,
+                pre_filter_mode,
+            )
+            .await?;
             ordered_sources[position] = Some(stream);
         }
     }

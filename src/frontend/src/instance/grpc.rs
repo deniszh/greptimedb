@@ -26,9 +26,12 @@ use api::v1::{
 };
 use async_stream::try_stream;
 use async_trait::async_trait;
-use auth::{PermissionChecker, PermissionCheckerRef, PermissionReq};
+use auth::{
+    PermissionChecker, PermissionCheckerRef, PermissionReq, PermissionResp, PermissionTableTargets,
+};
 use common_error::ext::BoxedError;
 use common_grpc::flight::do_put::DoPutResponse;
+use common_meta::rpc::ddl::TriggerReason;
 use common_query::Output;
 use common_query::logical_plan::add_insert_to_logical_plan;
 use common_telemetry::tracing::{self};
@@ -68,11 +71,21 @@ impl GrpcQueryHandler for Instance {
             let interceptor = interceptor_ref.as_ref();
             interceptor.pre_execute(&request, ctx.clone())?;
 
-            self.plugins
-                .get::<PermissionCheckerRef>()
-                .as_ref()
-                .check_permission(ctx.current_user(), PermissionReq::GrpcRequest(&request))
-                .context(PermissionSnafu)?;
+            if !matches!(
+                &request,
+                Request::Query(query_request)
+                    if matches!(&query_request.query, Some(Query::Sql(_)))
+            ) {
+                self.plugins
+                    .get::<PermissionCheckerRef>()
+                    .as_ref()
+                    .check_permission_with_context(
+                        ctx.current_user(),
+                        PermissionReq::GrpcRequest(&request),
+                        Some(&ctx.current_schema()),
+                    )
+                    .context(PermissionSnafu)?;
+            }
 
             let output = match request {
                 Request::Inserts(requests) => self.handle_inserts(requests, ctx.clone()).await?,
@@ -121,8 +134,9 @@ impl GrpcQueryHandler for Instance {
                                 .context(PlanStatementSnafu)?;
 
                             let dummy_catalog_list =
-                                Arc::new(catalog::table_source::dummy_catalog::DummyCatalogList::new(
+                                Arc::new(catalog::table_source::dummy_catalog::DummyCatalogList::new_with_query_ctx(
                                     self.catalog_manager().clone(),
+                                    ctx.clone(),
                                 ));
 
                             let logical_plan = plan_decoder
@@ -130,7 +144,7 @@ impl GrpcQueryHandler for Instance {
                                 .await
                                 .context(SubstraitDecodeLogicalPlanSnafu)?;
                             let output =
-                                self.do_exec_plan_inner(None, logical_plan, ctx.clone()).await?;
+                                self.do_exec_plan_inner(logical_plan, None, ctx.clone()).await?;
 
                             attach_timer(output, timer)
                         }
@@ -169,9 +183,17 @@ impl GrpcQueryHandler for Instance {
 
                     match expr {
                         DdlExpr::CreateTable(mut expr) => {
+                            // Direct gRPC DDL bypasses the SQL parser, so validate the
+                            // request here (e.g. the time index must be a timestamp).
+                            operator::expr_helper::validate_create_expr(&expr)?;
                             let _ = self
                                 .statement_executor
-                                .create_table_inner(&mut expr, None, ctx.clone())
+                                .create_table_inner(
+                                    &mut expr,
+                                    None,
+                                    ctx.clone(),
+                                    TriggerReason::Manual,
+                                )
                                 .await?;
                             Output::new_with_affected_rows(0)
                         }
@@ -184,7 +206,7 @@ impl GrpcQueryHandler for Instance {
                         }
                         DdlExpr::AlterTable(expr) => {
                             self.statement_executor
-                                .alter_table_inner(expr, ctx.clone())
+                                .alter_table_inner(expr, ctx.clone(), TriggerReason::Manual)
                                 .await?
                         }
                         DdlExpr::CreateDatabase(expr) => {
@@ -237,8 +259,16 @@ impl GrpcQueryHandler for Instance {
 
                             Output::new_with_affected_rows(0)
                         }
-                        DdlExpr::DropView(_) => {
-                            todo!("implemented in the following PR")
+                        DdlExpr::DropView(expr) => {
+                            self.statement_executor
+                                .drop_view(
+                                    expr.catalog_name,
+                                    expr.schema_name,
+                                    expr.view_name,
+                                    expr.drop_if_exists,
+                                    ctx.clone(),
+                                )
+                                .await?
                         }
                         DdlExpr::CommentOn(expr) => {
                             self.statement_executor
@@ -327,6 +357,32 @@ fn fill_catalog_and_schema_from_context(ddl_expr: &mut DdlExpr, ctx: &QueryConte
 }
 
 impl Instance {
+    pub(crate) fn check_table_permission(
+        &self,
+        ctx: &QueryContextRef,
+        req: PermissionReq<'_>,
+        targets: PermissionTableTargets,
+    ) -> auth::error::Result<PermissionResp> {
+        self.plugins
+            .get::<PermissionCheckerRef>()
+            .as_ref()
+            .check_permission_with_table_targets(ctx.current_user(), req, targets)
+    }
+
+    /// Checks every logical table targeted by normalized row inserts.
+    pub(crate) fn check_row_insert_permission(
+        &self,
+        requests: &RowInsertRequests,
+        ctx: &QueryContextRef,
+        req: PermissionReq<'_>,
+    ) -> auth::error::Result<PermissionResp> {
+        let catalog = ctx.current_catalog();
+        let schema = ctx.current_schema();
+        let targets = PermissionTableTargets::from_row_insert_requests(catalog, &schema, requests);
+
+        self.check_table_permission(ctx, req, targets)
+    }
+
     fn handle_put_record_batch_stream_inner(
         &self,
         mut stream: servers::grpc::flight::PutRecordBatchRequestStream,
@@ -355,7 +411,14 @@ impl Instance {
                     plugins
                         .get::<PermissionCheckerRef>()
                         .as_ref()
-                        .check_permission(ctx.current_user(), PermissionReq::BulkInsert)
+                        .check_permission(
+                            ctx.current_user(),
+                            PermissionReq::BulkInsert {
+                                catalog: &table_name.catalog_name,
+                                schema: &table_name.schema_name,
+                                table: &table_name.table_name,
+                            },
+                        )
                         .context(PermissionSnafu)?;
 
                     // Resolve table reference
@@ -416,10 +479,12 @@ impl Instance {
             .new_plan_decoder()
             .context(PlanStatementSnafu)?;
 
-        let dummy_catalog_list =
-            Arc::new(catalog::table_source::dummy_catalog::DummyCatalogList::new(
+        let dummy_catalog_list = Arc::new(
+            catalog::table_source::dummy_catalog::DummyCatalogList::new_with_query_ctx(
                 self.catalog_manager().clone(),
-            ));
+                ctx.clone(),
+            ),
+        );
 
         // no optimize yet since we still need to add stuff
         let logical_plan = plan_decoder
@@ -467,7 +532,7 @@ impl Instance {
         let optimized_plan = state.optimize(&analyzed_plan).context(DataFusionSnafu)?;
 
         let output = self
-            .do_exec_plan_inner(None, optimized_plan, ctx.clone())
+            .do_exec_plan_inner(optimized_plan, None, ctx.clone())
             .await?;
 
         Ok(attach_timer(output, timer))

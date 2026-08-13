@@ -32,12 +32,14 @@ use snafu::{OptionExt, ResultExt, ensure};
 
 use crate::error::{
     self, InvalidAuthHeaderInvisibleASCIISnafu, InvalidAuthHeaderSnafu, InvalidParameterSnafu,
-    NotFoundInfluxAuthSnafu, Result, UnsupportedAuthSchemeSnafu, UrlDecodeSnafu,
+    NotFoundAuthHeaderSnafu, NotFoundInfluxAuthSnafu, Result, UnsupportedAuthSchemeSnafu,
+    UrlDecodeSnafu,
 };
 use crate::http::header::GREPTIME_TIMEZONE_HEADER_NAME;
 use crate::http::header::constants::GREPTIME_DB_HEADER_NAME;
 use crate::http::result::error_result::ErrorResponse;
-use crate::http::{AUTHORIZATION_HEADER, HTTP_API_PREFIX, PUBLIC_APIS};
+use crate::http::splunk::is_splunk_request;
+use crate::http::{AUTHORIZATION_HEADER, HTTP_API_PREFIX, PUBLIC_API_PREFIX};
 use crate::influxdb::{is_influxdb_request, is_influxdb_v2_request};
 
 /// AuthState is a holder state for [`UserProviderRef`]
@@ -104,7 +106,36 @@ async fn inner_auth_with_state<B>(
             return Ok(req);
         };
 
-    // 3. get username and pwd
+    // 3. bearer token auth (JWT / OAuth2). When an `Authorization: Bearer
+    //    <token>` header is present, authenticate via
+    //    [`UserProvider::auth_bearer_token`]; otherwise fall through to the
+    //    username/password path (Basic / influxdb / splunk) below.
+    if let Some(token) = extract_bearer_token(&req) {
+        match user_provider
+            .auth_bearer_token(token, &catalog, &schema)
+            .await
+        {
+            Ok(userinfo) => {
+                query_ctx.set_current_user(userinfo);
+                let _ = req.extensions_mut().insert(query_ctx);
+                return Ok(req);
+            }
+            Err(e) => {
+                warn!(e; "bearer token authentication failed");
+                crate::metrics::METRIC_AUTH_FAILURE
+                    .with_label_values(&[e.status_code().as_ref()])
+                    .inc();
+                // Splunk HEC clients expect `{"text":"Invalid token","code":4}`
+                // (FORBIDDEN), not the generic 401 `ErrorResponse`.
+                if is_splunk_request(&req) {
+                    return Err(splunk_hec_err(StatusCode::FORBIDDEN, 4));
+                }
+                return Err(err_response(e));
+            }
+        }
+    }
+
+    // 4. get username and pwd
     let (username, password) = match extract_username_and_password(&req) {
         Ok((username, password)) => (username, password),
         Err(e) => {
@@ -112,11 +143,19 @@ async fn inner_auth_with_state<B>(
             crate::metrics::METRIC_AUTH_FAILURE
                 .with_label_values(&[e.status_code().as_ref()])
                 .inc();
+            if is_splunk_request(&req) {
+                // HEC: missing header -> 2 ("token is required"), else 4 ("invalid token").
+                let (status, code) = match &e {
+                    error::Error::NotFoundAuthHeader { .. } => (StatusCode::UNAUTHORIZED, 2),
+                    _ => (StatusCode::FORBIDDEN, 4),
+                };
+                return Err(splunk_hec_err(status, code));
+            }
             return Err(err_response(e));
         }
     };
 
-    // 4. auth
+    // 5. auth
     match user_provider
         .auth(
             auth::Identity::UserId(&username, None),
@@ -136,6 +175,10 @@ async fn inner_auth_with_state<B>(
             crate::metrics::METRIC_AUTH_FAILURE
                 .with_label_values(&[e.status_code().as_ref()])
                 .inc();
+            // HEC: bad credentials -> 4 ("invalid token", 403).
+            if is_splunk_request(&req) {
+                return Err(splunk_hec_err(StatusCode::FORBIDDEN, 4));
+            }
             Err(err_response(e))
         }
     }
@@ -150,6 +193,20 @@ pub async fn check_http_auth(
         Ok(req) => next.run(req).await,
         Err(resp) => resp,
     }
+}
+
+/// HEC-shaped auth error (`{"text","code"}`) so Splunk clients can branch on `code`.
+fn splunk_hec_err(status: StatusCode, code: u32) -> Response {
+    let text = match code {
+        2 => "Token is required",
+        4 => "Invalid token",
+        _ => "Unauthorized",
+    };
+    (
+        status,
+        axum::Json(serde_json::json!({ "text": text, "code": code })),
+    )
+        .into_response()
 }
 
 fn err_response(err: impl ErrorExt) -> Response {
@@ -239,10 +296,33 @@ fn get_influxdb_credentials<B>(request: &Request<B>) -> Result<Option<(Username,
     }
 }
 
+fn get_splunk_credentials<B>(request: &Request<B>) -> Result<Option<(Username, Password)>> {
+    let Some(header) = request.headers().get(http::header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let (auth_scheme, credential) = header
+        .to_str()
+        .context(InvalidAuthHeaderInvisibleASCIISnafu)?
+        .split_once(' ')
+        .context(InvalidAuthHeaderSnafu)?;
+
+    let (username, password) = match auth_scheme.to_lowercase().as_str() {
+        "splunk" => {
+            let (u, p) = credential.split_once(':').context(InvalidAuthHeaderSnafu)?;
+            (u.to_string(), p.to_string().into())
+        }
+        "basic" => decode_basic(credential)?,
+        _ => UnsupportedAuthSchemeSnafu { name: auth_scheme }.fail()?,
+    };
+    Ok(Some((username, password)))
+}
+
 pub fn extract_username_and_password<B>(request: &Request<B>) -> Result<(Username, Password)> {
     Ok(if is_influxdb_request(request) {
         // compatible with influxdb auth
         get_influxdb_credentials(request)?.context(NotFoundInfluxAuthSnafu)?
+    } else if is_splunk_request(request) {
+        get_splunk_credentials(request)?.context(NotFoundAuthHeaderSnafu)?
     } else {
         // normal http auth
         let scheme = auth_header(request)?;
@@ -292,6 +372,29 @@ impl From<AuthScheme> for api::v1::auth_header::AuthScheme {
 
 type Credential<'a> = &'a str;
 
+/// Extracts an opaque bearer token from an `Authorization: Bearer <token>`
+/// header (the standard or `x-greptime-auth` header).
+///
+/// Returns `None` for any other scheme (`Basic`, influxdb `Token`, splunk
+/// `Splunk`, …) so the caller can fall through to the username/password path.
+fn extract_bearer_token<B>(req: &Request<B>) -> Option<&str> {
+    let header = req
+        .headers()
+        .get(AUTHORIZATION_HEADER)
+        .or_else(|| req.headers().get(http::header::AUTHORIZATION))?;
+    let value = header.to_str().ok()?;
+    // HTTP authentication schemes are case-insensitive (RFC 9110 §11.1), so
+    // match the scheme with `eq_ignore_ascii_case` — but never lowercase the
+    // *token* itself, which is opaque and case-sensitive. Returns a borrow
+    // into the request's headers, so there is no allocation.
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim_start();
+    (!token.is_empty()).then_some(token)
+}
+
 fn auth_header<B>(req: &Request<B>) -> Result<AuthScheme> {
     let auth_header = req
         .headers()
@@ -321,7 +424,7 @@ fn decode_basic(credential: Credential) -> Result<(Username, Password)> {
 fn need_auth<B>(req: &Request<B>) -> bool {
     let path = req.uri().path();
 
-    for api in PUBLIC_APIS {
+    for api in PUBLIC_API_PREFIX {
         if path.starts_with(api) {
             return false;
         }
@@ -397,15 +500,67 @@ mod tests {
     }
 
     #[test]
+    fn test_splunk_auth() {
+        let splunk_uri = "http://127.0.0.1/v1/splunk/services/collector/event";
+        let splunk_req = |auth: Option<&str>| {
+            let mut req = Request::builder().uri(splunk_uri);
+            if let Some(auth) = auth {
+                req = req.header(http::header::AUTHORIZATION, auth);
+            }
+            req.body(()).unwrap()
+        };
+
+        // is_splunk_request matches our mount, not other endpoints.
+        assert!(is_splunk_request(&splunk_req(None)));
+        assert!(!is_splunk_request(
+            &Request::builder()
+                .uri("http://127.0.0.1/v1/influxdb/write")
+                .body(())
+                .unwrap()
+        ));
+        assert!(!is_splunk_request(
+            &Request::builder()
+                .uri("http://127.0.0.1/v1/sql")
+                .body(())
+                .unwrap()
+        ));
+
+        // `Splunk <user:pass>` -> (user, pass).
+        let (username, password) =
+            get_splunk_credentials(&splunk_req(Some("Splunk teamA:secretA")))
+                .unwrap()
+                .unwrap();
+        assert_eq!(username, "teamA");
+        assert_eq!(password.expose_secret(), "secretA");
+
+        // standard Basic is also accepted (parity with influxdb).
+        let basic = basic_auth("u", "p");
+        let (username, password) = get_splunk_credentials(&splunk_req(Some(&basic)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(username, "u");
+        assert_eq!(password.expose_secret(), "p");
+
+        // missing header -> None; token without ':' -> error.
+        assert!(get_splunk_credentials(&splunk_req(None)).unwrap().is_none());
+        assert!(get_splunk_credentials(&splunk_req(Some("Splunk no_colon_token"))).is_err());
+
+        // full dispatch routes a splunk request through the splunk scheme.
+        let (username, password) =
+            extract_username_and_password(&splunk_req(Some("Splunk teamA:secretA"))).unwrap();
+        assert_eq!(username, "teamA");
+        assert_eq!(password.expose_secret(), "secretA");
+    }
+
+    #[test]
     fn test_decode_basic() {
-        // base64encode("username:password") == "dXNlcm5hbWU6cGFzc3dvcmQ="
-        let credential = "dXNlcm5hbWU6cGFzc3dvcmQ=";
-        let (username, pwd) = decode_basic(credential).unwrap();
+        let credential = basic_auth_credentials("username", "password");
+        let (username, pwd) = decode_basic(&credential).unwrap();
         assert_eq!("username", username);
         assert_eq!("password", pwd.expose_secret());
 
-        let wrong_credential = "dXNlcm5hbWU6cG Fzc3dvcmQ=";
-        let result = decode_basic(wrong_credential);
+        let wrong_credential = credential.replacen('c', "c ", 1);
+        let result = decode_basic(&wrong_credential);
         assert_matches!(result.err(), Some(error::Error::InvalidBase64Value { .. }));
     }
 
@@ -415,8 +570,8 @@ mod tests {
         let re: Result<AuthScheme> = auth_scheme_str.try_into();
         assert!(re.is_err());
 
-        let auth_scheme_str = "basic dGVzdDp0ZXN0";
-        let scheme: AuthScheme = auth_scheme_str.try_into().unwrap();
+        let auth_scheme_str = basic_auth("test", "test");
+        let scheme: AuthScheme = auth_scheme_str.as_str().try_into().unwrap();
         assert_matches!(scheme, AuthScheme::Basic(username, pwd) if username == "test" && pwd.expose_secret() == "test");
 
         let unsupported = "digest";
@@ -425,20 +580,49 @@ mod tests {
     }
 
     #[test]
+    fn test_inner_auth_assigns_remote_query_id() {
+        let req =
+            mock_http_request(None, Some("http://127.0.0.1/v1/sql?db=greptime-public")).unwrap();
+        let req = futures::executor::block_on(inner_auth::<()>(None, req)).unwrap();
+        let query_ctx = req
+            .extensions()
+            .get::<session::context::QueryContext>()
+            .unwrap();
+
+        assert!(query_ctx.remote_query_id().is_some());
+    }
+
+    #[test]
     fn test_auth_header() {
-        // base64encode("username:password") == "dXNlcm5hbWU6cGFzc3dvcmQ="
-        let req = mock_http_request(Some("Basic dXNlcm5hbWU6cGFzc3dvcmQ="), None).unwrap();
+        let header_value = basic_auth("username", "password");
+        let req = mock_http_request(Some(&header_value), None).unwrap();
 
         let auth_scheme = auth_header(&req).unwrap();
         assert_matches!(auth_scheme, AuthScheme::Basic(username, pwd) if username == "username" && pwd.expose_secret() == "password");
 
-        let wrong_req = mock_http_request(Some("Basic dXNlcm5hbWU6 cGFzc3dvcmQ="), None).unwrap();
+        let wrong_auth_header = header_value.replacen('c', "c ", 1);
+        let wrong_req = mock_http_request(Some(&wrong_auth_header), None).unwrap();
         let res = auth_header(&wrong_req);
         assert_matches!(res.err(), Some(error::Error::InvalidAuthHeader { .. }));
 
-        let wrong_req = mock_http_request(Some("Digest dXNlcm5hbWU6cGFzc3dvcmQ="), None).unwrap();
+        let wrong_req = mock_http_request(
+            Some(&format!(
+                "Digest {}",
+                basic_auth_credentials("username", "password")
+            )),
+            None,
+        )
+        .unwrap();
         let res = auth_header(&wrong_req);
         assert_matches!(res.err(), Some(error::Error::UnsupportedAuthScheme { .. }));
+    }
+
+    fn basic_auth(username: &str, password: &str) -> String {
+        format!("Basic {}", basic_auth_credentials(username, password))
+    }
+
+    fn basic_auth_credentials(username: &str, password: &str) -> String {
+        BASE64_STANDARD.encode(format!("{username}:{password}"))
     }
 
     fn mock_http_request(auth_header: Option<&str>, uri: Option<&str>) -> Result<Request<()>> {
@@ -544,5 +728,175 @@ mod tests {
             extract_influxdb_user_from_query("p=4&u=123"),
             (Some("123"), Some("4"))
         );
+    }
+
+    #[test]
+    fn test_extract_bearer_token() {
+        let bearer = |scheme: &str, val: &str| {
+            mock_http_request(Some(&format!("{scheme} {val}")), None).unwrap()
+        };
+
+        // Standard bearer scheme, on either header.
+        assert_eq!(
+            extract_bearer_token(&bearer("Bearer", "abc.def.ghi")),
+            Some("abc.def.ghi")
+        );
+        assert_eq!(extract_bearer_token(&bearer("bearer", "tok")), Some("tok"));
+        // HTTP schemes are case-insensitive (RFC 9110 §11.1); the token
+        // itself is opaque and must NOT be lowercased.
+        assert_eq!(
+            extract_bearer_token(&bearer("BEARER", "ABC.DEF.GHI")),
+            Some("ABC.DEF.GHI")
+        );
+        assert_eq!(extract_bearer_token(&bearer("BeArEr", "tok")), Some("tok"));
+        let mut req = mock_http_request(Some("Bearer xyz"), None).unwrap();
+        req.headers_mut().insert(
+            AUTHORIZATION_HEADER,
+            "Bearer from-x-greptime".parse().unwrap(),
+        );
+        assert_eq!(extract_bearer_token(&req), Some("from-x-greptime"));
+
+        // Non-bearer schemes are ignored so the caller falls through to Basic.
+        assert_eq!(extract_bearer_token(&bearer("Basic", "dXNlcjpwYXNz")), None);
+        assert_eq!(extract_bearer_token(&bearer("Token", "u:p")), None);
+        assert_eq!(extract_bearer_token(&bearer("Splunk", "u:p")), None);
+
+        // No header, empty token.
+        assert_eq!(
+            extract_bearer_token(&mock_http_request(None, None).unwrap()),
+            None
+        );
+        assert_eq!(extract_bearer_token(&bearer("Bearer", "")), None);
+    }
+
+    /// A `UserProvider` that resolves exactly one bearer token to a known user
+    /// and rejects everything else (including password auth).
+    struct TokenUserProvider {
+        token: String,
+        user: auth::UserInfoRef,
+    }
+
+    #[async_trait::async_trait]
+    impl auth::UserProvider for TokenUserProvider {
+        fn name(&self) -> &str {
+            "token-test"
+        }
+
+        async fn authenticate(
+            &self,
+            _: auth::Identity<'_>,
+            _: auth::Password<'_>,
+        ) -> auth::error::Result<auth::UserInfoRef> {
+            unreachable!("password auth should not be reached for a bearer request")
+        }
+
+        async fn authorize(
+            &self,
+            _: &str,
+            _: &str,
+            _: &auth::UserInfoRef,
+        ) -> auth::error::Result<()> {
+            Ok(())
+        }
+
+        async fn auth_bearer_token(
+            &self,
+            token: &str,
+            _: &str,
+            _: &str,
+        ) -> auth::error::Result<auth::UserInfoRef> {
+            if token == self.token {
+                Ok(self.user.clone())
+            } else {
+                auth::error::UnsupportedAuthMethodSnafu {
+                    method: "bearer token",
+                }
+                .fail()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bearer_token_dispatches_to_auth_bearer_token() {
+        let provider = TokenUserProvider {
+            token: "good-token".to_string(),
+            user: auth::userinfo_by_name(Some("alice".into())),
+        };
+        let req = mock_http_request(Some("Bearer good-token"), None).unwrap();
+
+        let req = inner_auth::<()>(
+            Some(std::sync::Arc::new(provider) as auth::UserProviderRef),
+            req,
+        )
+        .await
+        .expect("valid bearer token authenticates");
+
+        let user = req
+            .extensions()
+            .get::<session::context::QueryContext>()
+            .expect("query context is populated")
+            .current_user();
+        assert_eq!(user.username(), "alice");
+    }
+
+    #[tokio::test]
+    async fn test_bearer_token_failure_rejects() {
+        let provider = TokenUserProvider {
+            token: "good-token".to_string(),
+            user: auth::userinfo_by_name(Some("alice".into())),
+        };
+        let req = mock_http_request(Some("Bearer bad-token"), None).unwrap();
+
+        let result = inner_auth::<()>(
+            Some(std::sync::Arc::new(provider) as auth::UserProviderRef),
+            req,
+        )
+        .await;
+        assert!(result.is_err(), "an invalid bearer token is rejected");
+    }
+
+    #[tokio::test]
+    async fn test_default_provider_rejects_bearer() {
+        // A password-only provider uses the default `auth_bearer_token`, which rejects.
+        let provider =
+            auth::user_provider_from_option("static_user_provider:cmd:alice=s3cret").unwrap();
+        let req = mock_http_request(Some("Bearer some-jwt"), None).unwrap();
+        let result = inner_auth::<()>(Some(provider), req).await;
+        assert!(
+            result.is_err(),
+            "password-only providers reject bearer tokens"
+        );
+    }
+
+    /// A bearer-token failure on a Splunk HEC request must keep the HEC
+    /// contract — `{"text":"Invalid token","code":4}` with FORBIDDEN —
+    /// instead of falling through to the generic 401 `ErrorResponse`.
+    /// Regression for the bearer/splunk routing gap.
+    #[tokio::test]
+    async fn test_bearer_failure_on_splunk_keeps_hec_contract() {
+        let provider = TokenUserProvider {
+            token: "good-token".to_string(),
+            user: auth::userinfo_by_name(Some("alice".into())),
+        };
+        let req = mock_http_request(
+            Some("Bearer bad-token"),
+            Some("http://127.0.0.1/v1/splunk/services/collector/event"),
+        )
+        .unwrap();
+
+        let resp = inner_auth::<()>(
+            Some(std::sync::Arc::new(provider) as auth::UserProviderRef),
+            req,
+        )
+        .await
+        .expect_err("an invalid bearer token is rejected");
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["code"], 4);
+        assert_eq!(payload["text"], "Invalid token");
     }
 }

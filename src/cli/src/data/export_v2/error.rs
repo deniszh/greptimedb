@@ -14,9 +14,10 @@
 
 use std::any::Any;
 
-use common_error::ext::ErrorExt;
+use common_error::ext::{ErrorExt, RetryHint};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
+use object_store::error::retry_hint_from_opendal_error;
 use snafu::{Location, Snafu};
 
 #[derive(Snafu)]
@@ -67,6 +68,14 @@ pub enum Error {
     TextDecode {
         #[snafu(source)]
         error: std::string::FromUtf8Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("I/O error while {}: {}", operation, error))]
+    Io {
+        operation: &'static str,
+        error: std::io::Error,
         #[snafu(implicit)]
         location: Location,
     },
@@ -183,6 +192,18 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display(
+        "Snapshot verification failed: {} error(s), {} warning(s)",
+        errors,
+        warnings
+    ))]
+    SnapshotVerifyFailed {
+        errors: usize,
+        warnings: usize,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -195,7 +216,8 @@ impl ErrorExt for Error {
             | Error::SchemaOnlyModeMismatch { .. }
             | Error::ResumeConfigMismatch { .. }
             | Error::ManifestVersionMismatch { .. }
-            | Error::SchemaOnlyArgsNotAllowed { .. } => StatusCode::InvalidArguments,
+            | Error::SchemaOnlyArgsNotAllowed { .. }
+            | Error::SnapshotVerifyFailed { .. } => StatusCode::InvalidArguments,
             Error::TimeParseInvalidFormat { .. }
             | Error::TimeParseEndBeforeStart { .. }
             | Error::ChunkTimeWindowRequiresBounds { .. } => StatusCode::InvalidArguments,
@@ -210,6 +232,8 @@ impl ErrorExt for Error {
             | Error::UnexpectedValueType { .. }
             | Error::UrlParse { .. } => StatusCode::Internal,
 
+            Error::Io { .. } => StatusCode::External,
+
             Error::Database { error, .. } => error.status_code(),
 
             Error::SnapshotNotFound { .. } => StatusCode::InvalidArguments,
@@ -219,5 +243,15 @@ impl ErrorExt for Error {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn retry_hint(&self) -> RetryHint {
+        match self {
+            Error::StorageOperation { error, .. } | Error::BuildObjectStore { error, .. } => {
+                retry_hint_from_opendal_error(error)
+            }
+            Error::Database { error, .. } => error.retry_hint(),
+            _ => RetryHint::NonRetryable,
+        }
     }
 }

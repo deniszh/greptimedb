@@ -22,12 +22,14 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use catalog::table_source::DfTableSourceProvider;
 use common_error::ext::BoxedError;
+use common_query::promql_annotations::promql_annotation_collector;
 use common_telemetry::tracing;
 use datafusion::common::{DFSchema, plan_err};
+use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionState;
 use datafusion::sql::planner::PlannerContext;
-use datafusion_common::ToDFSchema;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::{ScalarValue, ToDFSchema};
 use datafusion_expr::expr::{Exists, InSubquery};
 use datafusion_expr::{
     Analyze, Explain, ExplainFormat, Expr as DfExpr, LogicalPlan, LogicalPlanBuilder, PlanType,
@@ -82,6 +84,31 @@ impl DfLogicalPlanner {
         Self {
             engine_state,
             session_state,
+        }
+    }
+
+    /// Derive a [`SessionState`] whose [`ExecutionProps`] includes
+    /// `query_execution_start_time` if a scheduled time extension is present
+    /// in the query context.
+    fn derive_session_state_with_scheduled_time(
+        &self,
+        query_ctx: &QueryContextRef,
+    ) -> Result<SessionState> {
+        let extensions = query_ctx.extensions();
+        match crate::options::parse_scheduled_time_datetime(&extensions)? {
+            Some(dt) => {
+                let execution_props = self
+                    .session_state
+                    .execution_props()
+                    .clone()
+                    .with_query_execution_start_time(dt);
+                Ok(
+                    SessionStateBuilder::new_from_existing(self.session_state.clone())
+                        .with_execution_props(execution_props)
+                        .build(),
+                )
+            }
+            None => Ok(self.session_state.clone()),
         }
     }
 
@@ -178,15 +205,16 @@ impl DfLogicalPlanner {
             .fail()?;
         }
 
+        let scheduled_state = self.derive_session_state_with_scheduled_time(&query_ctx)?;
         let table_provider = DfTableSourceProvider::new(
             self.engine_state.catalog_manager().clone(),
             self.engine_state.disallow_cross_catalog_query(),
             query_ctx.clone(),
             Arc::new(DefaultPlanDecoder::new(
-                self.session_state.clone(),
+                scheduled_state.clone(),
                 &query_ctx,
             )?),
-            self.session_state
+            scheduled_state
                 .config_options()
                 .sql_parser
                 .enable_ident_normalization,
@@ -194,7 +222,7 @@ impl DfLogicalPlanner {
 
         let context_provider = DfContextProviderAdapter::try_new(
             self.engine_state.clone(),
-            self.session_state.clone(),
+            scheduled_state.clone(),
             Some(&df_stmt),
             query_ctx.clone(),
         )
@@ -230,7 +258,7 @@ impl DfLogicalPlanner {
             .await?;
 
         // Optimize logical plan by extension rules
-        let context = QueryEngineContext::new(self.session_state.clone(), query_ctx);
+        let context = QueryEngineContext::new(scheduled_state, query_ctx);
         let plan = self
             .engine_state
             .optimize_by_extension_rules(plan, &context)?;
@@ -248,9 +276,10 @@ impl DfLogicalPlanner {
         normalize_ident: bool,
         query_ctx: QueryContextRef,
     ) -> Result<DfExpr> {
+        let scheduled_state = self.derive_session_state_with_scheduled_time(&query_ctx)?;
         let context_provider = DfContextProviderAdapter::try_new(
             self.engine_state.clone(),
-            self.session_state.clone(),
+            scheduled_state,
             None,
             query_ctx,
         )
@@ -271,8 +300,17 @@ impl DfLogicalPlanner {
 
     #[tracing::instrument(skip_all)]
     async fn plan_pql(&self, stmt: &EvalStmt, query_ctx: QueryContextRef) -> Result<LogicalPlan> {
+        let mut scheduled_state = self.derive_session_state_with_scheduled_time(&query_ctx)?;
+        let promql_annotations = query_ctx.remote_query_id().map(promql_annotation_collector);
+        if let Some(collector) = &promql_annotations {
+            scheduled_state
+                .config_mut()
+                .options_mut()
+                .extensions
+                .insert(collector.clone());
+        }
         let plan_decoder = Arc::new(DefaultPlanDecoder::new(
-            self.session_state.clone(),
+            scheduled_state.clone(),
             &query_ctx,
         )?);
         let table_provider = DfTableSourceProvider::new(
@@ -280,17 +318,22 @@ impl DfLogicalPlanner {
             self.engine_state.disallow_cross_catalog_query(),
             query_ctx.clone(),
             plan_decoder,
-            self.session_state
+            scheduled_state
                 .config_options()
                 .sql_parser
                 .enable_ident_normalization,
         );
-        let plan = PromPlanner::stmt_to_plan(table_provider, stmt, &self.engine_state)
-            .await
-            .map_err(BoxedError::new)
-            .context(QueryPlanSnafu)?;
+        let plan = PromPlanner::stmt_to_plan_with_annotations(
+            table_provider,
+            stmt,
+            &self.engine_state,
+            promql_annotations,
+        )
+        .await
+        .map_err(BoxedError::new)
+        .context(QueryPlanSnafu)?;
 
-        let context = QueryEngineContext::new(self.session_state.clone(), query_ctx);
+        let context = QueryEngineContext::new(scheduled_state, query_ctx);
         Ok(self
             .engine_state
             .optimize_by_extension_rules(plan, &context)?)
@@ -451,6 +494,19 @@ impl DfLogicalPlanner {
                         casted_placeholders.insert(ph.id.clone());
                     }
 
+                    // Handle arrow_cast(Placeholder, 'type_string') generated by SQL rewriter
+                    if let DfExpr::ScalarFunction(scalar_func) = e
+                        && scalar_func.name() == "arrow_cast"
+                        && scalar_func.args.len() == 2
+                        && let DfExpr::Placeholder(ph) = &scalar_func.args[0]
+                        && let DfExpr::Literal(ScalarValue::Utf8(Some(type_str)), _) =
+                            &scalar_func.args[1]
+                        && let Ok(data_type) = type_str.parse::<DataType>()
+                    {
+                        placeholder_types.insert(ph.id.clone(), Some(data_type));
+                        casted_placeholders.insert(ph.id.clone());
+                    }
+
                     // Handle bare (non-casted) placeholders
                     if let DfExpr::Placeholder(ph) = e
                         && !casted_placeholders.contains(&ph.id)
@@ -481,6 +537,36 @@ impl DfLogicalPlanner {
         Ok(())
     }
 
+    fn infer_limit_placeholder_types(
+        plan: &LogicalPlan,
+        placeholder_types: &mut HashMap<String, Option<DataType>>,
+    ) -> Result<()> {
+        plan.apply(|node| {
+            if let LogicalPlan::Limit(limit) = node {
+                for expr in limit.skip.iter().chain(limit.fetch.iter()) {
+                    expr.apply(|e| {
+                        if let DfExpr::Placeholder(ph) = e {
+                            placeholder_types
+                                .entry(ph.id.clone())
+                                .and_modify(|existing| {
+                                    if existing.is_none() {
+                                        *existing = Some(DataType::Int64);
+                                    }
+                                })
+                                .or_insert(Some(DataType::Int64));
+                        }
+
+                        Ok(TreeNodeRecursion::Continue)
+                    })?;
+                }
+            }
+
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        Ok(())
+    }
+
     /// Gets inferred parameter types from a logical plan.
     /// Returns a map where each parameter ID is mapped to:
     /// - Some(DataType) if the parameter type could be inferred
@@ -488,7 +574,8 @@ impl DfLogicalPlanner {
     ///
     /// This function first uses DataFusion's `get_parameter_types()` to infer types.
     /// If any parameters have `None` values (i.e., DataFusion couldn't infer their types),
-    /// it falls back to using `extract_placeholder_cast_types()` to detect explicit casts.
+    /// it falls back to using `extract_placeholder_cast_types()` to detect explicit casts
+    /// and applies context-specific inference such as LIMIT/OFFSET placeholders.
     ///
     /// This is because datafusion can only infer types for a limited cases.
     ///
@@ -497,19 +584,15 @@ impl DfLogicalPlanner {
     pub fn get_inferred_parameter_types(
         plan: &LogicalPlan,
     ) -> Result<HashMap<String, Option<DataType>>> {
-        let param_types = plan.get_parameter_types().context(PlanSqlSnafu)?;
+        let mut param_types = plan.get_parameter_types().context(PlanSqlSnafu)?;
 
         let has_none = param_types.values().any(|v| v.is_none());
 
-        if !has_none {
-            Ok(param_types)
-        } else {
+        if has_none {
             let cast_types = Self::extract_placeholder_cast_types(plan)?;
 
-            let mut merged = param_types;
-
             for (id, opt_type) in cast_types {
-                merged
+                param_types
                     .entry(id)
                     .and_modify(|existing| {
                         if existing.is_none() {
@@ -519,8 +602,10 @@ impl DfLogicalPlanner {
                     .or_insert(opt_type);
             }
 
-            Ok(merged)
+            Self::infer_limit_placeholder_types(plan, &mut param_types)?;
         }
+
+        Ok(param_types)
     }
 }
 
@@ -781,6 +866,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_inferred_parameter_types_limit_offset() {
+        let plan = parse_sql_to_plan("SELECT id FROM test LIMIT $1 OFFSET $2").await;
+        let types = DfLogicalPlanner::get_inferred_parameter_types(&plan).unwrap();
+
+        assert_eq!(types.get("$1"), Some(&Some(DataType::Int64)));
+        assert_eq!(types.get("$2"), Some(&Some(DataType::Int64)));
+    }
+
+    #[tokio::test]
     async fn test_plan_pql_applies_extension_rules() {
         for inner_agg in ["count", "sum", "avg", "min", "max", "stddev", "stdvar"] {
             let plan = parse_promql_to_plan(&format!(
@@ -868,5 +962,26 @@ mod tests {
         assert_eq!(types.get("$2"), Some(&Some(DataType::Utf8)));
         assert_eq!(types.get("$3"), Some(&Some(DataType::Int32)));
         assert_eq!(types.get("$4"), Some(&Some(DataType::Utf8)));
+    }
+
+    #[tokio::test]
+    async fn test_get_inferred_parameter_types_arrow_cast() {
+        let plan = parse_sql_to_plan("SELECT $1::INT64, $2::FLOAT64, $3::INT16, $4::INT32, $5::UINT8, $6::UINT16, $7::UINT32").await;
+        let types = DfLogicalPlanner::get_inferred_parameter_types(&plan).unwrap();
+
+        assert_eq!(types.get("$1"), Some(&Some(DataType::Int64)));
+        assert_eq!(types.get("$2"), Some(&Some(DataType::Float64)));
+        assert_eq!(types.get("$3"), Some(&Some(DataType::Int16)));
+        assert_eq!(types.get("$4"), Some(&Some(DataType::Int32)));
+        assert_eq!(types.get("$5"), Some(&Some(DataType::UInt8)));
+        assert_eq!(types.get("$6"), Some(&Some(DataType::UInt16)));
+        assert_eq!(types.get("$7"), Some(&Some(DataType::UInt32)));
+
+        let plan = parse_sql_to_plan("SELECT $1::INT8, $2::FLOAT8, $3::INT2, $4::INT8").await;
+        let types = DfLogicalPlanner::get_inferred_parameter_types(&plan).unwrap();
+
+        assert_eq!(types.get("$1"), Some(&Some(DataType::Int64)));
+        assert_eq!(types.get("$2"), Some(&Some(DataType::Float64)));
+        assert_eq!(types.get("$3"), Some(&Some(DataType::Int16)));
     }
 }

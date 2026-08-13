@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ahash::{HashMap, HashSet};
+use ahash::HashSet;
 use api::v1::{RowInsertRequests, Value};
 use common_grpc::precision::Precision;
 use common_query::prelude::{GREPTIME_COUNT, greptime_timestamp, greptime_value};
@@ -20,26 +20,36 @@ use lazy_static::lazy_static;
 use otel_arrow_rust::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
 use otel_arrow_rust::proto::opentelemetry::common::v1::{AnyValue, KeyValue, any_value};
 use otel_arrow_rust::proto::opentelemetry::metrics::v1::{metric, number_data_point, *};
-use regex::Regex;
 use session::protocol_ctx::{MetricType, OtlpMetricCtx};
+use table::requests::{
+    METADATA_QUALITY_DECLARED, SEMANTIC_METRIC_METADATA_QUALITY, SEMANTIC_METRIC_ORIGINAL_NAME,
+    SEMANTIC_METRIC_TEMPORALITY, SEMANTIC_METRIC_TYPE, SEMANTIC_METRIC_UNIT,
+};
 
 use crate::error::Result;
 use crate::otlp::trace::{KEY_SERVICE_INSTANCE_ID, KEY_SERVICE_NAME};
 use crate::row_writer::{self, MultiTableData, TableData};
+pub use crate::semantic::SemanticIndex;
+use crate::semantic::{
+    METRIC_TYPE_COUNTER, METRIC_TYPE_GAUGE, METRIC_TYPE_HISTOGRAM, METRIC_TYPE_SUMMARY,
+    METRIC_TYPE_UPDOWN_COUNTER,
+};
+
+mod translator;
+
+pub use translator::legacy_normalize_otlp_name;
+pub(crate) use translator::ucum_to_openmetrics_unit;
+use translator::{translate_label_name, translate_metric_name};
 
 /// the default column count for table writer
 const APPROXIMATE_COLUMN_COUNT: usize = 8;
 
 const COUNT_TABLE_SUFFIX: &str = "_count";
 const SUM_TABLE_SUFFIX: &str = "_sum";
+const BUCKET_TABLE_SUFFIX: &str = "_bucket";
 
 const JOB_KEY: &str = "job";
 const INSTANCE_KEY: &str = "instance";
-
-const UNDERSCORE: &str = "_";
-const DOUBLE_UNDERSCORE: &str = "__";
-const TOTAL: &str = "total";
-const RATIO: &str = "ratio";
 
 // see: https://prometheus.io/docs/guides/opentelemetry/#promoting-resource-attributes
 const DEFAULT_PROMOTE_ATTRS: [&str; 19] = [
@@ -67,48 +77,6 @@ const DEFAULT_PROMOTE_ATTRS: [&str; 19] = [
 lazy_static! {
     static ref DEFAULT_PROMOTE_ATTRS_SET: HashSet<String> =
         HashSet::from_iter(DEFAULT_PROMOTE_ATTRS.iter().map(|s| s.to_string()));
-    static ref NON_ALPHA_NUM_CHAR: Regex = Regex::new(r"[^a-zA-Z0-9]").unwrap();
-    static ref UNIT_MAP: HashMap<String, String> = [
-        // Time
-        ("d", "days"),
-        ("h", "hours"),
-        ("min", "minutes"),
-        ("s", "seconds"),
-        ("ms", "milliseconds"),
-        ("us", "microseconds"),
-        ("ns", "nanoseconds"),
-        // Bytes
-        ("By", "bytes"),
-        ("KiBy", "kibibytes"),
-        ("MiBy", "mebibytes"),
-        ("GiBy", "gibibytes"),
-        ("TiBy", "tibibytes"),
-        ("KBy", "kilobytes"),
-        ("MBy", "megabytes"),
-        ("GBy", "gigabytes"),
-        ("TBy", "terabytes"),
-        // SI
-        ("m", "meters"),
-        ("V", "volts"),
-        ("A", "amperes"),
-        ("J", "joules"),
-        ("W", "watts"),
-        ("g", "grams"),
-        // Misc
-        ("Cel", "celsius"),
-        ("Hz", "hertz"),
-        ("1", ""),
-        ("%", "percent"),
-    ].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-    static ref PER_UNIT_MAP: HashMap<String, String> = [
-        ("s", "second"),
-        ("m", "minute"),
-        ("h", "hour"),
-        ("d", "day"),
-        ("w", "week"),
-        ("mo", "month"),
-        ("y", "year"),
-    ].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 }
 
 const OTEL_SCOPE_NAME: &str = "name";
@@ -121,12 +89,14 @@ const OTEL_SCOPE_SCHEMA_URL: &str = "schema_url";
 /// <https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto>
 /// for data structure of OTLP metrics.
 ///
-/// Returns `InsertRequests` and total number of rows to ingest
+/// Returns `InsertRequests`, total number of rows to ingest, and the per-table
+/// semantic index for the auto-create path to stamp as table options.
 pub fn to_grpc_insert_requests(
     request: ExportMetricsServiceRequest,
     metric_ctx: &mut OtlpMetricCtx,
-) -> Result<(RowInsertRequests, usize)> {
+) -> Result<(RowInsertRequests, usize, SemanticIndex)> {
     let mut table_writer = MultiTableData::default();
+    let mut semantic_index = SemanticIndex::default();
 
     for resource in &request.resource_metrics {
         let resource_attrs = resource.resource.as_ref().map(|r| {
@@ -152,12 +122,98 @@ pub fn to_grpc_insert_requests(
                     resource_attrs.as_ref(),
                     scope_attrs.as_ref(),
                     metric_ctx,
+                    &mut semantic_index,
                 )?;
             }
         }
     }
 
-    Ok(table_writer.into_row_insert_requests())
+    let (requests, rows) = table_writer.into_row_insert_requests();
+    Ok((requests, rows, semantic_index))
+}
+
+/// The tables a metric emits and their per-table `metric.type`. Histogram fans
+/// out into `_bucket` (the histogram) plus `_sum`/`_count` counters; summary
+/// fans out into the quantile table plus `_count`/`_sum` counters (legacy
+/// summary stays a single table).
+fn emitted_semantic_tables(
+    metric_type: &MetricType,
+    is_legacy: bool,
+    base: &str,
+) -> Vec<(String, &'static str)> {
+    match metric_type {
+        MetricType::Gauge => vec![(base.to_string(), METRIC_TYPE_GAUGE)],
+        MetricType::MonotonicSum => vec![(base.to_string(), METRIC_TYPE_COUNTER)],
+        MetricType::NonMonotonicSum => vec![(base.to_string(), METRIC_TYPE_UPDOWN_COUNTER)],
+        MetricType::Histogram => vec![
+            (
+                format!("{base}{BUCKET_TABLE_SUFFIX}"),
+                METRIC_TYPE_HISTOGRAM,
+            ),
+            (format!("{base}{SUM_TABLE_SUFFIX}"), METRIC_TYPE_COUNTER),
+            (format!("{base}{COUNT_TABLE_SUFFIX}"), METRIC_TYPE_COUNTER),
+        ],
+        MetricType::Summary if is_legacy => vec![(base.to_string(), METRIC_TYPE_SUMMARY)],
+        MetricType::Summary => vec![
+            (base.to_string(), METRIC_TYPE_SUMMARY),
+            (format!("{base}{COUNT_TABLE_SUFFIX}"), METRIC_TYPE_COUNTER),
+            (format!("{base}{SUM_TABLE_SUFFIX}"), METRIC_TYPE_COUNTER),
+        ],
+        // ExponentialHistogram is a no-op today; Init never reaches encoding.
+        MetricType::ExponentialHistogram | MetricType::Init => vec![],
+    }
+}
+
+/// Maps OTLP `aggregation_temporality` to the semantic value, or `None` when the
+/// instrument has no temporality (gauge/summary) or it is unspecified.
+fn temporality_value(data: &metric::Data) -> Option<&'static str> {
+    let raw = match data {
+        metric::Data::Sum(sum) => sum.aggregation_temporality,
+        metric::Data::Histogram(hist) => hist.aggregation_temporality,
+        _ => return None,
+    };
+    match AggregationTemporality::try_from(raw) {
+        Ok(AggregationTemporality::Delta) => Some("delta"),
+        Ok(AggregationTemporality::Cumulative) => Some("cumulative"),
+        _ => None,
+    }
+}
+
+/// Records the declared metric-level semantic keys for every table this metric
+/// emits.
+fn record_metric_semantics(
+    index: &mut SemanticIndex,
+    metric: &Metric,
+    name: &str,
+    metric_ctx: &OtlpMetricCtx,
+) {
+    let emitted = emitted_semantic_tables(&metric_ctx.metric_type, metric_ctx.is_legacy, name);
+    if emitted.is_empty() {
+        return;
+    }
+
+    let temporality = metric.data.as_ref().and_then(temporality_value);
+    let unit = metric.unit.trim();
+    // `original_name` is meaningful only when translation renamed the metric.
+    let original_name = (name != metric.name.as_str()).then_some(metric.name.as_str());
+
+    for (table, metric_type) in &emitted {
+        index.record_scalar(table, SEMANTIC_METRIC_TYPE, metric_type);
+        index.record_scalar(
+            table,
+            SEMANTIC_METRIC_METADATA_QUALITY,
+            METADATA_QUALITY_DECLARED,
+        );
+        if let Some(temporality) = temporality {
+            index.record_scalar(table, SEMANTIC_METRIC_TEMPORALITY, temporality);
+        }
+        if !unit.is_empty() {
+            index.record_scalar(table, SEMANTIC_METRIC_UNIT, unit);
+        }
+        if let Some(original_name) = original_name {
+            index.record_scalar(table, SEMANTIC_METRIC_ORIGINAL_NAME, original_name);
+        }
+    }
 }
 
 fn from_metric_type(data: &metric::Data) -> MetricType {
@@ -248,135 +304,29 @@ fn process_scope_attrs(scope: &ScopeMetrics, metric_ctx: &OtlpMetricCtx) -> Opti
     })
 }
 
-// See https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/145942706622aba5c276ca47f48df438228bfea4/pkg/translator/prometheus/normalize_name.go#L55
-pub fn normalize_metric_name(metric: &Metric, metric_type: &MetricType) -> String {
-    // Split metric name in "tokens" (remove all non-alphanumeric), filtering out empty strings
-    let mut name_tokens: Vec<String> = NON_ALPHA_NUM_CHAR
-        .split(&metric.name)
-        .filter_map(|s| {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
-        .collect();
-
-    // Append unit if it exists
-    if !metric.unit.is_empty() {
-        let (main, per) = build_unit_suffix(&metric.unit);
-        if let Some(main) = main
-            && !name_tokens.contains(&main)
-        {
-            name_tokens.push(main);
-        }
-        if let Some(per) = per
-            && !name_tokens.contains(&per)
-        {
-            name_tokens.push("per".to_string());
-            name_tokens.push(per);
-        }
-    }
-
-    // Append _total for Counters (monotonic sums)
-    if matches!(metric_type, MetricType::MonotonicSum) {
-        // Remove existing "total" tokens first, then append
-        name_tokens.retain(|t| t != TOTAL);
-        name_tokens.push(TOTAL.to_string());
-    }
-
-    // Append _ratio for metrics with unit "1" (gauges only)
-    if metric.unit == "1" && matches!(metric_type, MetricType::Gauge) {
-        // Remove existing "ratio" tokens first, then append
-        name_tokens.retain(|t| t != RATIO);
-        name_tokens.push(RATIO.to_string());
-    }
-
-    // Build the string from the tokens, separated with underscores
-    let name = name_tokens.join(UNDERSCORE);
-
-    // Metric name cannot start with a digit, so prefix it with "_" in this case
-    if let Some((_, first)) = name.char_indices().next()
-        && first.is_ascii_digit()
-    {
-        format!("_{}", name)
-    } else {
-        name
-    }
-}
-
-fn build_unit_suffix(unit: &str) -> (Option<String>, Option<String>) {
-    let (main, per) = unit.split_once('/').unwrap_or((unit, ""));
-    (check_unit(main, &UNIT_MAP), check_unit(per, &PER_UNIT_MAP))
-}
-
-fn check_unit(unit_str: &str, unit_map: &HashMap<String, String>) -> Option<String> {
-    let u = unit_str.trim();
-    // Skip units that are empty, contain "{" or "}" characters
-    if !u.is_empty() && !u.contains('{') && !u.contains('}') {
-        let u = unit_map.get(u).map(|s| s.as_ref()).unwrap_or(u);
-        let u = clean_unit_name(u);
-        if !u.is_empty() {
-            return Some(u);
-        }
-    }
-    None
-}
-
-fn clean_unit_name(name: &str) -> String {
-    // Split on non-alphanumeric characters, filter out empty strings, then join with underscores
-    // This matches the Go implementation: strings.FieldsFunc + strings.Join
-    NON_ALPHA_NUM_CHAR
-        .split(name)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<&str>>()
-        .join(UNDERSCORE)
-}
-
-// See https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/145942706622aba5c276ca47f48df438228bfea4/pkg/translator/prometheus/normalize_label.go#L27
-pub fn normalize_label_name(name: &str) -> String {
-    if name.is_empty() {
-        return name.to_string();
-    }
-
-    let n = NON_ALPHA_NUM_CHAR.replace_all(name, UNDERSCORE);
-    if let Some((_, first)) = n.char_indices().next()
-        && first.is_ascii_digit()
-    {
-        return format!("key_{}", n);
-    }
-    if n.starts_with(UNDERSCORE) && !n.starts_with(DOUBLE_UNDERSCORE) {
-        return format!("key{}", n);
-    }
-    n.to_string()
-}
-
-/// Normalize otlp instrumentation, metric and attribute names
-///
-/// <https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/metrics/api.md#instrument-name-syntax>
-/// - since the name are case-insensitive, we transform them to lowercase for
-///   better sql usability
-/// - replace `.` and `-` with `_`
-pub fn legacy_normalize_otlp_name(name: &str) -> String {
-    name.to_lowercase().replace(['.', '-'], "_")
-}
-
 fn encode_metrics(
     table_writer: &mut MultiTableData,
     metric: &Metric,
     resource_attrs: Option<&Vec<KeyValue>>,
     scope_attrs: Option<&Vec<KeyValue>>,
     metric_ctx: &OtlpMetricCtx,
+    semantic_index: &mut SemanticIndex,
 ) -> Result<()> {
     let name = if metric_ctx.is_legacy {
         legacy_normalize_otlp_name(&metric.name)
     } else {
-        normalize_metric_name(metric, &metric_ctx.metric_type)
+        translate_metric_name(
+            metric,
+            &metric_ctx.metric_type,
+            metric_ctx.metric_translation_strategy,
+        )
     };
 
-    // note that we don't store description or unit, we might want to deal with
-    // these fields in the future.
+    // Stamp semantic metadata against the same table name(s) the data is written
+    // to below. `unit` is captured here (it is otherwise discarded by the row
+    // encoders) along with the declared type/temporality.
+    record_metric_semantics(semantic_index, metric, &name, metric_ctx);
+
     if let Some(data) = &metric.data {
         match data {
             metric::Data::Gauge(gauge) => {
@@ -419,7 +369,8 @@ fn encode_metrics(
                     metric_ctx,
                 )?;
             }
-            // TODO(sunng87) leave ExponentialHistogram for next release
+            // TODO: Convert OTLP exponential histograms into the canonical native-histogram
+            // Struct. See docs/rfcs/2026-08-04-native-histograms.md.
             metric::Data::ExponentialHistogram(_hist) => {}
         }
     }
@@ -440,6 +391,7 @@ fn write_attributes(
     row: &mut Vec<Value>,
     attrs: Option<&Vec<KeyValue>>,
     attribute_type: AttributeType,
+    metric_ctx: &OtlpMetricCtx,
 ) -> Result<()> {
     let Some(attrs) = attrs else {
         return Ok(());
@@ -452,10 +404,13 @@ fn write_attributes(
             .and_then(|val| {
                 let key = match attribute_type {
                     AttributeType::Resource | AttributeType::DataPoint => {
-                        normalize_label_name(&attr.key)
+                        translate_label_name(&attr.key, metric_ctx.metric_translation_strategy)
                     }
                     AttributeType::Scope => {
-                        format!("otel_scope_{}", normalize_label_name(&attr.key))
+                        format!(
+                            "otel_scope_{}",
+                            translate_label_name(&attr.key, metric_ctx.metric_translation_strategy)
+                        )
                     }
                     AttributeType::Legacy => legacy_normalize_otlp_name(&attr.key),
                 };
@@ -526,14 +481,38 @@ fn write_tags_and_timestamp(
     metric_ctx: &OtlpMetricCtx,
 ) -> Result<()> {
     if metric_ctx.is_legacy {
-        write_attributes(table, row, resource_attrs, AttributeType::Legacy)?;
-        write_attributes(table, row, scope_attrs, AttributeType::Legacy)?;
-        write_attributes(table, row, data_point_attrs, AttributeType::Legacy)?;
+        write_attributes(
+            table,
+            row,
+            resource_attrs,
+            AttributeType::Legacy,
+            metric_ctx,
+        )?;
+        write_attributes(table, row, scope_attrs, AttributeType::Legacy, metric_ctx)?;
+        write_attributes(
+            table,
+            row,
+            data_point_attrs,
+            AttributeType::Legacy,
+            metric_ctx,
+        )?;
     } else {
         // TODO(shuiyisong): check `__type__` and `__unit__` tags in prometheus
-        write_attributes(table, row, resource_attrs, AttributeType::Resource)?;
-        write_attributes(table, row, scope_attrs, AttributeType::Scope)?;
-        write_attributes(table, row, data_point_attrs, AttributeType::DataPoint)?;
+        write_attributes(
+            table,
+            row,
+            resource_attrs,
+            AttributeType::Resource,
+            metric_ctx,
+        )?;
+        write_attributes(table, row, scope_attrs, AttributeType::Scope, metric_ctx)?;
+        write_attributes(
+            table,
+            row,
+            data_point_attrs,
+            AttributeType::DataPoint,
+            metric_ctx,
+        )?;
     }
 
     write_timestamp(table, row, timestamp_nanos, metric_ctx.is_legacy)?;
@@ -636,9 +615,9 @@ fn encode_histogram(
 ) -> Result<()> {
     let normalized_name = name;
 
-    let bucket_table_name = format!("{}_bucket", normalized_name);
-    let sum_table_name = format!("{}_sum", normalized_name);
-    let count_table_name = format!("{}_count", normalized_name);
+    let bucket_table_name = format!("{}{}", normalized_name, BUCKET_TABLE_SUFFIX);
+    let sum_table_name = format!("{}{}", normalized_name, SUM_TABLE_SUFFIX);
+    let count_table_name = format!("{}{}", normalized_name, COUNT_TABLE_SUFFIX);
 
     let data_points_len = hist.data_points.len();
     // Note that the row and columns number here is approximate
@@ -728,12 +707,6 @@ fn encode_histogram(
     table_writer.add_table_data(sum_table_name, sum_table);
     table_writer.add_table_data(count_table_name, count_table);
 
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn encode_exponential_histogram(_name: &str, _hist: &ExponentialHistogram) -> Result<()> {
-    // TODO(sunng87): implement this using a prometheus compatible way
     Ok(())
 }
 
@@ -870,6 +843,7 @@ fn encode_summary(
 
 #[cfg(test)]
 mod tests {
+    use common_query::prelude::set_default_prefix;
     use otel_arrow_rust::proto::opentelemetry::common::v1::AnyValue;
     use otel_arrow_rust::proto::opentelemetry::common::v1::any_value::Value as Val;
     use otel_arrow_rust::proto::opentelemetry::metrics::v1::number_data_point::Value;
@@ -879,570 +853,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn test_legacy_normalize_otlp_name() {
-        assert_eq!(
-            legacy_normalize_otlp_name("jvm.memory.free"),
-            "jvm_memory_free"
-        );
-        assert_eq!(
-            legacy_normalize_otlp_name("jvm-memory-free"),
-            "jvm_memory_free"
-        );
-        assert_eq!(
-            legacy_normalize_otlp_name("jvm_memory_free"),
-            "jvm_memory_free"
-        );
-        assert_eq!(
-            legacy_normalize_otlp_name("JVM_MEMORY_FREE"),
-            "jvm_memory_free"
-        );
-        assert_eq!(
-            legacy_normalize_otlp_name("JVM_memory_FREE"),
-            "jvm_memory_free"
-        );
-    }
-
-    #[test]
-    fn test_normalize_metric_name() {
-        let test_cases = vec![
-            // Default case
-            (Metric::default(), MetricType::Init, ""),
-            // Basic metric with just name
-            (
-                Metric {
-                    name: "foo".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Init,
-                "foo",
-            ),
-            // Metric with unit "s" should append "seconds"
-            (
-                Metric {
-                    name: "foo".to_string(),
-                    unit: "s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Init,
-                "foo_seconds",
-            ),
-            // Metric already ending with unit suffix should not duplicate
-            (
-                Metric {
-                    name: "foo_seconds".to_string(),
-                    unit: "s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Init,
-                "foo_seconds",
-            ),
-            // Monotonic sum should append "total"
-            (
-                Metric {
-                    name: "foo".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "foo_total",
-            ),
-            // Metric already ending with "total" should not duplicate
-            (
-                Metric {
-                    name: "foo_total".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "foo_total",
-            ),
-            // Monotonic sum with unit should append both unit and "total"
-            (
-                Metric {
-                    name: "foo".to_string(),
-                    unit: "s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "foo_seconds_total",
-            ),
-            // Metric with unit suffix and monotonic sum
-            (
-                Metric {
-                    name: "foo_seconds".to_string(),
-                    unit: "s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "foo_seconds_total",
-            ),
-            // Metric already ending with "total" and has unit
-            (
-                Metric {
-                    name: "foo_total".to_string(),
-                    unit: "s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "foo_seconds_total",
-            ),
-            // Metric already ending with both unit and "total"
-            (
-                Metric {
-                    name: "foo_seconds_total".to_string(),
-                    unit: "s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "foo_seconds_total",
-            ),
-            // Metric with unusual order (total_seconds) should be normalized
-            (
-                Metric {
-                    name: "foo_total_seconds".to_string(),
-                    unit: "s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "foo_seconds_total",
-            ),
-            // Gauge with unit "1" should append "ratio"
-            (
-                Metric {
-                    name: "foo".to_string(),
-                    unit: "1".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Gauge,
-                "foo_ratio",
-            ),
-            // Complex unit like "m/s" should be converted to "meters_per_second"
-            (
-                Metric {
-                    name: "foo".to_string(),
-                    unit: "m/s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Init,
-                "foo_meters_per_second",
-            ),
-            // Metric with partial unit match
-            (
-                Metric {
-                    name: "foo_second".to_string(),
-                    unit: "m/s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Init,
-                "foo_second_meters",
-            ),
-            // Metric already containing the main unit
-            (
-                Metric {
-                    name: "foo_meters".to_string(),
-                    unit: "m/s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Init,
-                "foo_meters_per_second",
-            ),
-        ];
-
-        for (metric, metric_type, expected) in test_cases {
-            let result = normalize_metric_name(&metric, &metric_type);
-            assert_eq!(
-                result, expected,
-                "Failed for metric name: '{}', unit: '{}', type: {:?}",
-                metric.name, metric.unit, metric_type
-            );
-        }
-    }
-
-    #[test]
-    fn test_normalize_metric_name_edge_cases() {
-        let test_cases = vec![
-            // Edge case: name with multiple non-alphanumeric chars in a row
-            (
-                Metric {
-                    name: "foo--bar__baz".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Init,
-                "foo_bar_baz",
-            ),
-            // Edge case: name starting and ending with non-alphanumeric
-            (
-                Metric {
-                    name: "-foo_bar-".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Init,
-                "foo_bar",
-            ),
-            // Edge case: name with only special chars (should be empty)
-            (
-                Metric {
-                    name: "--___--".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Init,
-                "",
-            ),
-            // Edge case: name starting with digit
-            (
-                Metric {
-                    name: "2xx_requests".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Init,
-                "_2xx_requests",
-            ),
-        ];
-
-        for (metric, metric_type, expected) in test_cases {
-            let result = normalize_metric_name(&metric, &metric_type);
-            assert_eq!(
-                result, expected,
-                "Failed for metric name: '{}', unit: '{}', type: {:?}",
-                metric.name, metric.unit, metric_type
-            );
-        }
-    }
-
-    #[test]
-    fn test_normalize_label_name() {
-        let test_cases = vec![
-            ("", ""),
-            ("foo", "foo"),
-            ("foo_bar/baz:abc", "foo_bar_baz_abc"),
-            ("1foo", "key_1foo"),
-            ("_foo", "key_foo"),
-            ("__bar", "__bar"),
-        ];
-
-        for (input, expected) in test_cases {
-            let result = normalize_label_name(input);
-            assert_eq!(
-                result, expected,
-                "unexpected result for input '{}'; got '{}'; want '{}'",
-                input, result, expected
-            );
-        }
-    }
-
-    #[test]
-    fn test_clean_unit_name() {
-        // Test the improved clean_unit_name function
-        assert_eq!(clean_unit_name("faults"), "faults");
-        assert_eq!(clean_unit_name("{faults}"), "faults"); // clean_unit_name still processes braces internally
-        assert_eq!(clean_unit_name("req/sec"), "req_sec");
-        assert_eq!(clean_unit_name("m/s"), "m_s");
-        assert_eq!(clean_unit_name("___test___"), "test");
-        assert_eq!(
-            clean_unit_name("multiple__underscores"),
-            "multiple_underscores"
-        );
-        assert_eq!(clean_unit_name(""), "");
-        assert_eq!(clean_unit_name("___"), "");
-        assert_eq!(clean_unit_name("bytes.per.second"), "bytes_per_second");
-    }
-
-    #[test]
-    fn test_normalize_metric_name_braced_units() {
-        // Test that units with braces are rejected (not processed)
-        let test_cases = vec![
-            (
-                Metric {
-                    name: "test.metric".to_string(),
-                    unit: "{faults}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "test_metric_total", // braced units are rejected, no unit suffix added
-            ),
-            (
-                Metric {
-                    name: "test.metric".to_string(),
-                    unit: "{operations}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Gauge,
-                "test_metric", // braced units are rejected, no unit suffix added
-            ),
-            (
-                Metric {
-                    name: "test.metric".to_string(),
-                    unit: "{}".to_string(), // empty braces should be ignored due to contains('{') || contains('}')
-                    ..Default::default()
-                },
-                MetricType::Gauge,
-                "test_metric",
-            ),
-            (
-                Metric {
-                    name: "test.metric".to_string(),
-                    unit: "faults".to_string(), // no braces, should work normally
-                    ..Default::default()
-                },
-                MetricType::Gauge,
-                "test_metric_faults",
-            ),
-        ];
-
-        for (metric, metric_type, expected) in test_cases {
-            let result = normalize_metric_name(&metric, &metric_type);
-            assert_eq!(
-                result, expected,
-                "Failed for metric name: '{}', unit: '{}', type: {:?}. Got: '{}', Expected: '{}'",
-                metric.name, metric.unit, metric_type, result, expected
-            );
-        }
-    }
-
-    #[test]
-    fn test_normalize_metric_name_with_testdata() {
-        // Test cases extracted from real OTLP metrics data from testdata.txt
-        let test_cases = vec![
-            // Basic system metrics with various units
-            (
-                Metric {
-                    name: "system.paging.faults".to_string(),
-                    unit: "{faults}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "system_paging_faults_total", // braced units are rejected, no unit suffix added
-            ),
-            (
-                Metric {
-                    name: "system.paging.operations".to_string(),
-                    unit: "{operations}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "system_paging_operations_total", // braced units are rejected, no unit suffix added
-            ),
-            (
-                Metric {
-                    name: "system.paging.usage".to_string(),
-                    unit: "By".to_string(),
-                    ..Default::default()
-                },
-                MetricType::NonMonotonicSum,
-                "system_paging_usage_bytes",
-            ),
-            // Load average metrics - gauge with custom unit
-            (
-                Metric {
-                    name: "system.cpu.load_average.15m".to_string(),
-                    unit: "{thread}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Gauge,
-                "system_cpu_load_average_15m", // braced units are rejected, no unit suffix added
-            ),
-            (
-                Metric {
-                    name: "system.cpu.load_average.1m".to_string(),
-                    unit: "{thread}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Gauge,
-                "system_cpu_load_average_1m", // braced units are rejected, no unit suffix added
-            ),
-            // Disk I/O with bytes unit
-            (
-                Metric {
-                    name: "system.disk.io".to_string(),
-                    unit: "By".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "system_disk_io_bytes_total",
-            ),
-            // Time-based metrics with seconds unit
-            (
-                Metric {
-                    name: "system.disk.io_time".to_string(),
-                    unit: "s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "system_disk_io_time_seconds_total",
-            ),
-            (
-                Metric {
-                    name: "system.disk.operation_time".to_string(),
-                    unit: "s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "system_disk_operation_time_seconds_total",
-            ),
-            // CPU time metric
-            (
-                Metric {
-                    name: "system.cpu.time".to_string(),
-                    unit: "s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "system_cpu_time_seconds_total",
-            ),
-            // Process counts
-            (
-                Metric {
-                    name: "system.processes.count".to_string(),
-                    unit: "{processes}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::NonMonotonicSum,
-                "system_processes_count", // braced units are rejected, no unit suffix added
-            ),
-            (
-                Metric {
-                    name: "system.processes.created".to_string(),
-                    unit: "{processes}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "system_processes_created_total", // braced units are rejected, no unit suffix added
-            ),
-            // Memory usage with bytes
-            (
-                Metric {
-                    name: "system.memory.usage".to_string(),
-                    unit: "By".to_string(),
-                    ..Default::default()
-                },
-                MetricType::NonMonotonicSum,
-                "system_memory_usage_bytes",
-            ),
-            // Uptime as gauge
-            (
-                Metric {
-                    name: "system.uptime".to_string(),
-                    unit: "s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Gauge,
-                "system_uptime_seconds",
-            ),
-            // Network metrics
-            (
-                Metric {
-                    name: "system.network.connections".to_string(),
-                    unit: "{connections}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::NonMonotonicSum,
-                "system_network_connections", // braced units are rejected, no unit suffix added
-            ),
-            (
-                Metric {
-                    name: "system.network.dropped".to_string(),
-                    unit: "{packets}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "system_network_dropped_total", // braced units are rejected, no unit suffix added
-            ),
-            (
-                Metric {
-                    name: "system.network.errors".to_string(),
-                    unit: "{errors}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "system_network_errors_total", // braced units are rejected, no unit suffix added
-            ),
-            (
-                Metric {
-                    name: "system.network.io".to_string(),
-                    unit: "By".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "system_network_io_bytes_total",
-            ),
-            (
-                Metric {
-                    name: "system.network.packets".to_string(),
-                    unit: "{packets}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "system_network_packets_total", // braced units are rejected, no unit suffix added
-            ),
-            // Filesystem metrics
-            (
-                Metric {
-                    name: "system.filesystem.inodes.usage".to_string(),
-                    unit: "{inodes}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::NonMonotonicSum,
-                "system_filesystem_inodes_usage", // braced units are rejected, no unit suffix added
-            ),
-            (
-                Metric {
-                    name: "system.filesystem.usage".to_string(),
-                    unit: "By".to_string(),
-                    ..Default::default()
-                },
-                MetricType::NonMonotonicSum,
-                "system_filesystem_usage_bytes",
-            ),
-            // Edge cases with special characters and numbers
-            (
-                Metric {
-                    name: "system.load.1".to_string(),
-                    unit: "1".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Gauge,
-                "system_load_1_ratio",
-            ),
-            (
-                Metric {
-                    name: "http.request.2xx".to_string(),
-                    unit: "{requests}".to_string(),
-                    ..Default::default()
-                },
-                MetricType::MonotonicSum,
-                "http_request_2xx_total", // braced units are rejected, no unit suffix added
-            ),
-            // Metric with dots and underscores mixed
-            (
-                Metric {
-                    name: "jvm.memory.heap_usage".to_string(),
-                    unit: "By".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Gauge,
-                "jvm_memory_heap_usage_bytes",
-            ),
-            // Complex unit with per-second
-            (
-                Metric {
-                    name: "http.request.rate".to_string(),
-                    unit: "1/s".to_string(),
-                    ..Default::default()
-                },
-                MetricType::Gauge,
-                "http_request_rate_per_second",
-            ),
-        ];
-
-        for (metric, metric_type, expected) in test_cases {
-            let result = normalize_metric_name(&metric, &metric_type);
-            assert_eq!(
-                result, expected,
-                "Failed for metric name: '{}', unit: '{}', type: {:?}. Got: '{}', Expected: '{}'",
-                metric.name, metric.unit, metric_type, result, expected
-            );
-        }
-    }
 
     fn keyvalue(key: &str, value: &str) -> KeyValue {
         KeyValue {
@@ -1636,6 +1046,47 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_legacy_summary_keeps_legacy_column_names() {
+        set_default_prefix(Some("custom")).unwrap();
+        let mut tables = MultiTableData::default();
+        let summary = Summary {
+            data_points: vec![SummaryDataPoint {
+                attributes: vec![keyvalue("host", "testserver")],
+                time_unix_nano: 100,
+                count: 25,
+                quantile_values: vec![ValueAtQuantile {
+                    quantile: 0.90,
+                    value: 1000.0,
+                }],
+                ..Default::default()
+            }],
+        };
+
+        encode_summary(
+            &mut tables,
+            "datamon",
+            &summary,
+            None,
+            None,
+            &OtlpMetricCtx {
+                is_legacy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let table = tables.get_or_default_table_data("datamon", 0, 0);
+        assert_eq!(
+            table
+                .columns()
+                .iter()
+                .map(|column| column.column_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["host", "custom_timestamp", "greptime_p90", GREPTIME_COUNT,]
+        );
+    }
+
+    #[test]
     fn test_encode_histogram() {
         let mut tables = MultiTableData::default();
 
@@ -1720,5 +1171,194 @@ mod tests {
                 greptime_value()
             ]
         );
+    }
+
+    use std::collections::BTreeMap;
+
+    use table::requests::validate_semantic_option;
+
+    fn decode(index: &SemanticIndex) -> BTreeMap<String, BTreeMap<String, String>> {
+        let nested: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>> =
+            serde_json::from_str(&index.encode("public").expect("non-empty index")).unwrap();
+        nested.into_values().next().unwrap()
+    }
+
+    fn record(metric: &Metric, metric_type: MetricType, name: &str) -> SemanticIndex {
+        let ctx = OtlpMetricCtx {
+            metric_type,
+            ..Default::default()
+        };
+        let mut index = SemanticIndex::default();
+        record_metric_semantics(&mut index, metric, name, &ctx);
+        index
+    }
+
+    #[test]
+    fn test_metric_type_constants_validate() {
+        for value in [
+            METRIC_TYPE_COUNTER,
+            METRIC_TYPE_UPDOWN_COUNTER,
+            METRIC_TYPE_GAUGE,
+            METRIC_TYPE_HISTOGRAM,
+            METRIC_TYPE_SUMMARY,
+        ] {
+            assert!(
+                validate_semantic_option(SEMANTIC_METRIC_TYPE, value),
+                "metric.type value `{value}` must be in the vocabulary domain"
+            );
+        }
+        for value in ["delta", "cumulative"] {
+            assert!(validate_semantic_option(SEMANTIC_METRIC_TEMPORALITY, value));
+        }
+    }
+
+    #[test]
+    fn test_record_monotonic_sum() {
+        let metric = Metric {
+            name: "claude_code.cost.usage".to_string(),
+            unit: "USD".to_string(),
+            data: Some(metric::Data::Sum(Sum {
+                aggregation_temporality: AggregationTemporality::Delta as i32,
+                is_monotonic: true,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let index = record(
+            &metric,
+            MetricType::MonotonicSum,
+            "claude_code_cost_usage_USD_total",
+        );
+        let decoded = decode(&index);
+        let t = &decoded["claude_code_cost_usage_USD_total"];
+
+        assert_eq!(
+            t.get(SEMANTIC_METRIC_TYPE).map(String::as_str),
+            Some("counter")
+        );
+        assert_eq!(
+            t.get(SEMANTIC_METRIC_TEMPORALITY).map(String::as_str),
+            Some("delta")
+        );
+        assert_eq!(t.get(SEMANTIC_METRIC_UNIT).map(String::as_str), Some("USD"));
+        assert_eq!(
+            t.get(SEMANTIC_METRIC_ORIGINAL_NAME).map(String::as_str),
+            Some("claude_code.cost.usage")
+        );
+        assert_eq!(
+            t.get(SEMANTIC_METRIC_METADATA_QUALITY).map(String::as_str),
+            Some("declared")
+        );
+    }
+
+    #[test]
+    fn test_record_non_monotonic_sum() {
+        let metric = Metric {
+            name: "queue_size".to_string(),
+            data: Some(metric::Data::Sum(Sum {
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                is_monotonic: false,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let index = record(&metric, MetricType::NonMonotonicSum, "queue_size");
+        let decoded = decode(&index);
+        let t = &decoded["queue_size"];
+        assert_eq!(
+            t.get(SEMANTIC_METRIC_TYPE).map(String::as_str),
+            Some("updown_counter")
+        );
+        assert_eq!(
+            t.get(SEMANTIC_METRIC_TEMPORALITY).map(String::as_str),
+            Some("cumulative")
+        );
+        // Name unchanged by translation -> no original_name.
+        assert_eq!(t.get(SEMANTIC_METRIC_ORIGINAL_NAME), None);
+    }
+
+    #[test]
+    fn test_record_gauge_has_no_temporality() {
+        let metric = Metric {
+            name: "temperature".to_string(),
+            data: Some(metric::Data::Gauge(Gauge::default())),
+            ..Default::default()
+        };
+        let index = record(&metric, MetricType::Gauge, "temperature");
+        let decoded = decode(&index);
+        let t = &decoded["temperature"];
+        assert_eq!(
+            t.get(SEMANTIC_METRIC_TYPE).map(String::as_str),
+            Some("gauge")
+        );
+        assert_eq!(t.get(SEMANTIC_METRIC_TEMPORALITY), None);
+    }
+
+    #[test]
+    fn test_record_histogram_fans_out_with_distinct_types() {
+        let metric = Metric {
+            name: "request.duration".to_string(),
+            unit: "s".to_string(),
+            data: Some(metric::Data::Histogram(Histogram {
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let index = record(&metric, MetricType::Histogram, "request_duration");
+        let decoded = decode(&index);
+
+        let bucket = &decoded["request_duration_bucket"];
+        assert_eq!(
+            bucket.get(SEMANTIC_METRIC_TYPE).map(String::as_str),
+            Some("histogram")
+        );
+        assert_eq!(
+            bucket.get(SEMANTIC_METRIC_UNIT).map(String::as_str),
+            Some("s")
+        );
+
+        for companion in ["request_duration_sum", "request_duration_count"] {
+            let t = &decoded[companion];
+            assert_eq!(
+                t.get(SEMANTIC_METRIC_TYPE).map(String::as_str),
+                Some("counter")
+            );
+            assert_eq!(
+                t.get(SEMANTIC_METRIC_TEMPORALITY).map(String::as_str),
+                Some("cumulative")
+            );
+        }
+    }
+
+    #[test]
+    fn test_record_summary_fans_out() {
+        let metric = Metric {
+            name: "rpc.latency".to_string(),
+            data: Some(metric::Data::Summary(Summary::default())),
+            ..Default::default()
+        };
+        let index = record(&metric, MetricType::Summary, "rpc_latency");
+        let decoded = decode(&index);
+
+        assert_eq!(
+            decoded["rpc_latency"]
+                .get(SEMANTIC_METRIC_TYPE)
+                .map(String::as_str),
+            Some("summary")
+        );
+        // Summary has no temporality.
+        assert_eq!(
+            decoded["rpc_latency"].get(SEMANTIC_METRIC_TEMPORALITY),
+            None
+        );
+        for companion in ["rpc_latency_count", "rpc_latency_sum"] {
+            assert_eq!(
+                decoded[companion]
+                    .get(SEMANTIC_METRIC_TYPE)
+                    .map(String::as_str),
+                Some("counter")
+            );
+        }
     }
 }

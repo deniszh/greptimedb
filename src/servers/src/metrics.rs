@@ -128,6 +128,13 @@ lazy_static! {
         &[METRIC_DB_LABEL]
     )
     .unwrap();
+    /// The native histograms count of Prometheus remote write.
+    pub static ref PROM_STORE_REMOTE_WRITE_HISTOGRAMS: IntCounterVec = register_int_counter_vec!(
+        "greptime_servers_prometheus_remote_write_histograms",
+        "frontend prometheus remote write native histograms",
+        &[METRIC_DB_LABEL]
+    )
+    .unwrap();
     pub static ref PENDING_BATCHES: IntGauge = register_int_gauge!(
         "greptime_prom_store_pending_batches",
         "Number of pending batches waiting to be flushed"
@@ -168,6 +175,12 @@ lazy_static! {
     pub static ref FLUSH_FAILURES: IntCounter = register_int_counter!(
         "greptime_pending_rows_flush_failures",
         "Total pending rows flush failures"
+    )
+    .unwrap();
+    pub static ref FLOW_NOTIFICATION_DROPPED: IntCounterVec = register_int_counter_vec!(
+        "greptime_prom_store_flow_notification_dropped_total",
+        "Total flow notifications dropped by the pending rows batcher",
+        &["reason"]
     )
     .unwrap();
     pub static ref PENDING_ROWS_BATCH_INGEST_STAGE_ELAPSED: HistogramVec = register_histogram_vec!(

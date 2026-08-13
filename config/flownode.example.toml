@@ -22,14 +22,14 @@ node_id = 14
 ## if failed to find available frontend after frontend_scan_timeout elapsed, return error
 ## which prevent flownode from starting
 #+experimental_frontend_scan_timeout="30s"
-## Frontend activity timeout
-## if frontend is down(not sending heartbeat) for more than frontend_activity_timeout,
-## it will be removed from the list that flownode use to connect
-#+experimental_frontend_activity_timeout="60s"
 ## Maximum number of filters allowed in a single query
 #+experimental_max_filter_num_per_query=20
 ## Time window merge distance
 #+experimental_time_window_merge_threshold=3
+## Whether to enable experimental flow incremental source reads.
+## When disabled, batching flows always execute full-snapshot queries.
+## Can be overridden per flow with WITH (experimental_enable_incremental_read = 'true').
+#+experimental_enable_incremental_read=false
 ## Read preference of the Frontend client.
 #+read_preference="Leader"
 [flow.batching_mode.frontend_tls]
@@ -96,14 +96,6 @@ metadata_cache_ttl = "10m"
 # TTI of the metadata cache.
 metadata_cache_tti = "5m"
 
-## The heartbeat options.
-[heartbeat]
-## Interval for sending heartbeat messages to the metasrv.
-interval = "3s"
-
-## Interval for retrying to send heartbeat messages to the metasrv.
-retry_interval = "3s"
-
 ## The logging options.
 [logging]
 ## The directory to store the log files. If set to empty, logs will not be written to files.
@@ -121,6 +113,9 @@ otlp_endpoint = "http://localhost:4318/v1/traces"
 
 ## Whether to append logs to stdout.
 append_stdout = true
+
+## Whether to write logs to files in `dir`.
+enable_file_logging = true
 
 ## The log format. Can be `text`/`json`.
 log_format = "text"

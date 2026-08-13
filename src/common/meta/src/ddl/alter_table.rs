@@ -16,37 +16,46 @@ mod executor;
 mod metadata;
 mod region_request;
 
+use std::collections::HashSet;
 use std::vec;
 
 use api::region::RegionResponse;
-use api::v1::RenameTable;
 use api::v1::alter_table_expr::Kind;
+use api::v1::{RenameTable, SetTableOptions, UnsetTableOptions};
 use async_trait::async_trait;
+use common_catalog::consts::{METRIC_ENGINE, MITO_ENGINE};
 use common_error::ext::BoxedError;
 use common_procedure::error::{FromJsonSnafu, Result as ProcedureResult, ToJsonSnafu};
 use common_procedure::{
-    Context as ProcedureContext, ContextProvider, Error as ProcedureError, LockKey, PoisonKey,
-    PoisonKeys, Procedure, ProcedureId, Status, StringKey,
+    Context as ProcedureContext, ContextProvider, Error as ProcedureError, EventContext,
+    EventTrigger, LockKey, PoisonKey, PoisonKeys, Procedure, ProcedureId, Status, StringKey,
 };
 use common_telemetry::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, ensure};
 use store_api::metadata::ColumnMetadata;
 use store_api::metric_engine_consts::TABLE_COLUMN_METADATA_EXTENSION_KEY;
+use store_api::storage::RegionId;
 use strum::AsRefStr;
 use table::metadata::{TableId, TableInfo};
+use table::requests::{REPARTITION_COLUMN_HINT_KEY, SKIP_WAL_KEY};
 use table::table_reference::TableReference;
 
 use crate::ddl::DdlContext;
 use crate::ddl::alter_table::executor::AlterTableExecutor;
+use crate::ddl::event::table::{
+    TableDdlEvent, TableDdlEventType, TableDdlLocator, alter_table_kind_name,
+};
 use crate::ddl::utils::{
     MultipleResults, extract_column_metadatas, handle_multiple_results, map_to_procedure_error,
     sync_follower_regions,
 };
-use crate::error::{AbortProcedureSnafu, NoLeaderSnafu, PutPoisonSnafu, Result, RetryLaterSnafu};
+use crate::error::{
+    AbortProcedureSnafu, NoLeaderSnafu, PutPoisonSnafu, Result, RetryLaterSnafu, UnsupportedSnafu,
+};
 use crate::key::table_info::TableInfoValue;
 use crate::key::{DeserializedValueWithBytes, RegionDistribution};
-use crate::lock_key::{CatalogLock, SchemaLock, TableLock, TableNameLock};
+use crate::lock_key::{CatalogLock, RegionLock, SchemaLock, TableLock, TableNameLock};
 use crate::metrics;
 use crate::poison_key::table_poison_key;
 use crate::rpc::ddl::AlterTableTask;
@@ -65,6 +74,9 @@ pub struct AlterTableProcedure {
     /// The alter table executor.
     executor: AlterTableExecutor,
 }
+
+#[derive(Debug)]
+pub(crate) struct RegionRouteChanged;
 
 /// Builds the executor from the [`AlterTableData`].
 ///
@@ -86,8 +98,17 @@ impl AlterTableProcedure {
     pub const TYPE_NAME: &'static str = "metasrv-procedure::AlterTable";
 
     pub fn new(table_id: TableId, task: AlterTableTask, context: DdlContext) -> Result<Self> {
+        Self::new_with_region_locks(table_id, task, vec![], context)
+    }
+
+    pub(crate) fn new_with_region_locks(
+        table_id: TableId,
+        task: AlterTableTask,
+        region_locks: Vec<RegionId>,
+        context: DdlContext,
+    ) -> Result<Self> {
         task.validate()?;
-        let data = AlterTableData::new(task, table_id);
+        let data = AlterTableData::new(task, table_id, region_locks);
         let executor = build_executor_from_alter_expr(&data);
         Ok(Self {
             context,
@@ -126,11 +147,61 @@ impl AlterTableProcedure {
 
         // Safety: Checked in `AlterTableProcedure::new`.
         let alter_kind = self.data.task.alter_table.kind.as_ref().unwrap();
-        if matches!(alter_kind, Kind::RenameTable { .. }) {
-            self.data.state = AlterTableState::UpdateMetadata;
-        } else {
-            self.data.state = AlterTableState::SubmitAlterRegionRequests;
-        };
+        if enables_skip_wal(alter_kind) {
+            ensure!(
+                only_enables_skip_wal(alter_kind),
+                UnsupportedSnafu {
+                    operation: "combining skip_wal = 'true' with other table options".to_string()
+                }
+            );
+            let engine = table_info_value.table_info.meta.engine.as_str();
+            ensure!(
+                engine == MITO_ENGINE || engine == METRIC_ENGINE,
+                UnsupportedSnafu {
+                    operation: format!("setting skip_wal on {engine} engine tables")
+                }
+            );
+            // Persist the irreversible intent before any region stops writing WAL.
+            let (physical_table_id, physical_table_route) = self
+                .context
+                .table_metadata_manager
+                .table_route_manager()
+                .get_physical_table_route(self.data.table_id())
+                .await?;
+            ensure!(
+                physical_table_id == self.data.table_id(),
+                UnsupportedSnafu {
+                    operation: "setting skip_wal on logical tables".to_string()
+                }
+            );
+            let current_region_ids = physical_table_route
+                .region_routes
+                .iter()
+                .map(|route| route.region.id)
+                .collect::<HashSet<_>>();
+            let locked_region_ids = self
+                .data
+                .region_locks
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            if physical_table_route.region_routes.len() != self.data.region_locks.len()
+                || current_region_ids != locked_region_ids
+            {
+                // Procedure lock keys are fixed at submission. Finish this attempt so the
+                // DDL manager can submit another procedure with locks for the current route.
+                return Ok(Status::done_with_output(RegionRouteChanged));
+            }
+            ensure!(
+                !find_leaders(&physical_table_route.region_routes).is_empty(),
+                NoLeaderSnafu {
+                    table_id: physical_table_id
+                }
+            );
+            self.data.region_distribution =
+                Some(region_distribution(&physical_table_route.region_routes));
+        }
+        self.data.state = self.data.flow().after_prepare();
         Ok(Status::executing(true))
     }
 
@@ -178,6 +249,39 @@ impl AlterTableProcedure {
         ensure!(!leaders.is_empty(), NoLeaderSnafu { table_id });
         // Puts the poison before submitting alter region requests to datanodes.
         self.put_poison(ctx_provider, procedure_id).await?;
+        let flow = self.data.flow();
+        if flow == AlterTableFlow::MetadataFirst {
+            let results = self
+                .executor
+                .on_alter_skip_wal_regions(
+                    &self.context.node_manager,
+                    &physical_table_route.region_routes,
+                    alter_kind,
+                )
+                .await;
+
+            return match handle_multiple_results(results) {
+                MultipleResults::PartialRetryable(error) => Err(error),
+                MultipleResults::PartialNonRetryable(error)
+                | MultipleResults::AllNonRetryable(error) => {
+                    // The metadata already enables skip-WAL. Retry the idempotent request
+                    // so later attempts can update the remaining replicas.
+                    Err(BoxedError::new(error)).context(RetryLaterSnafu {
+                        clean_poisons: true,
+                    })
+                }
+                MultipleResults::AllRetryable(error) => {
+                    Err(BoxedError::new(error)).context(RetryLaterSnafu {
+                        clean_poisons: true,
+                    })
+                }
+                MultipleResults::Ok(results) => {
+                    self.handle_alter_region_response(results)?;
+                    Ok(Status::executing_with_clean_poisons(true))
+                }
+            };
+        }
+
         let results = self
             .executor
             .on_alter_regions(
@@ -236,7 +340,7 @@ impl AlterTableProcedure {
                 "altering table result doesn't contains extension key `{TABLE_COLUMN_METADATA_EXTENSION_KEY}`,leaving the table's column metadata unchanged"
             );
         }
-        self.data.state = AlterTableState::UpdateMetadata;
+        self.data.state = self.data.flow().after_regions();
         Ok(())
     }
 
@@ -268,6 +372,8 @@ impl AlterTableProcedure {
         let table_info_value = self.data.table_info_value.as_ref().unwrap();
         // Safety: Checked in `AlterTableProcedure::new`.
         let alter_kind = self.data.task.alter_table.kind.as_ref().unwrap();
+        let flow = self.data.flow();
+        let metadata_only_alter = flow == AlterTableFlow::MetadataOnly;
 
         // Gets the table info from the cache or builds it.
         let  new_info = match &self.new_table_info {
@@ -290,13 +396,14 @@ impl AlterTableProcedure {
                 self.data.region_distribution.as_ref(),
                 new_info,
                 &self.data.column_metadatas,
+                metadata_only_alter,
             )
             .await?;
 
         info!(
             "Updated table metadata for table {table_ref}, table_id: {table_id}, kind: {alter_kind:?}"
         );
-        self.data.state = AlterTableState::InvalidateTableCache;
+        self.data.state = flow.after_metadata();
         Ok(Status::executing(true))
     }
 
@@ -315,6 +422,10 @@ impl AlterTableProcedure {
         lock_key.push(CatalogLock::Read(table_ref.catalog).into());
         lock_key.push(SchemaLock::read(table_ref.catalog, table_ref.schema).into());
         lock_key.push(TableLock::Write(table_id).into());
+
+        for region_id in &self.data.region_locks {
+            lock_key.push(RegionLock::Write(*region_id).into());
+        }
 
         // Safety: Checked in `AlterTableProcedure::new`.
         let alter_kind = self.data.task.alter_table.kind.as_ref().unwrap();
@@ -335,6 +446,79 @@ impl AlterTableProcedure {
     #[cfg(test)]
     pub(crate) fn mut_data(&mut self) -> &mut AlterTableData {
         &mut self.data
+    }
+}
+
+fn enables_skip_wal(alter_kind: &Kind) -> bool {
+    let Kind::SetTableOptions(SetTableOptions { table_options }) = alter_kind else {
+        return false;
+    };
+
+    table_options
+        .iter()
+        .any(|option| option.key == SKIP_WAL_KEY && option.value == "true")
+}
+
+pub(crate) fn only_enables_skip_wal(alter_kind: &Kind) -> bool {
+    let Kind::SetTableOptions(SetTableOptions { table_options }) = alter_kind else {
+        return false;
+    };
+
+    table_options.len() == 1
+        && table_options[0].key == SKIP_WAL_KEY
+        && table_options[0].value == "true"
+}
+
+fn is_metadata_only_alter(alter_kind: &Kind) -> bool {
+    match alter_kind {
+        Kind::RenameTable { .. } => true,
+        Kind::SetTableOptions(SetTableOptions { table_options }) => {
+            table_options.len() == 1 && table_options[0].key.as_str() == REPARTITION_COLUMN_HINT_KEY
+        }
+        Kind::UnsetTableOptions(UnsetTableOptions { keys }) => {
+            keys.len() == 1 && keys[0].as_str() == REPARTITION_COLUMN_HINT_KEY
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlterTableFlow {
+    RegionFirst,
+    MetadataFirst,
+    MetadataOnly,
+}
+
+impl AlterTableFlow {
+    fn from_kind(kind: &Kind) -> Self {
+        if only_enables_skip_wal(kind) {
+            Self::MetadataFirst
+        } else if is_metadata_only_alter(kind) {
+            Self::MetadataOnly
+        } else {
+            Self::RegionFirst
+        }
+    }
+
+    fn after_prepare(self) -> AlterTableState {
+        match self {
+            Self::RegionFirst => AlterTableState::SubmitAlterRegionRequests,
+            Self::MetadataFirst | Self::MetadataOnly => AlterTableState::UpdateMetadata,
+        }
+    }
+
+    fn after_regions(self) -> AlterTableState {
+        match self {
+            Self::RegionFirst => AlterTableState::UpdateMetadata,
+            Self::MetadataFirst | Self::MetadataOnly => AlterTableState::InvalidateTableCache,
+        }
+    }
+
+    fn after_metadata(self) -> AlterTableState {
+        match self {
+            Self::MetadataFirst => AlterTableState::SubmitAlterRegionRequests,
+            Self::RegionFirst | Self::MetadataOnly => AlterTableState::InvalidateTableCache,
+        }
     }
 }
 
@@ -378,6 +562,33 @@ impl Procedure for AlterTableProcedure {
     fn poison_keys(&self) -> PoisonKeys {
         PoisonKeys::new(vec![self.table_poison_key()])
     }
+
+    fn event(&self, ctx: &EventContext<'_>) -> Option<Box<dyn common_event_recorder::Event>> {
+        if !ctx
+            .event_type_filter
+            .allows(TableDdlEventType::AlterTable.as_str())
+        {
+            return None;
+        }
+        let table_ref = self.data.table_ref();
+        let locator = TableDdlLocator::new(table_ref.catalog, table_ref.schema, table_ref.table)
+            .with_table_id(self.data.table_id());
+        let event = match &ctx.trigger {
+            EventTrigger::Submitted => {
+                let kind = self
+                    .data
+                    .task
+                    .alter_table
+                    .kind
+                    .as_ref()
+                    .and_then(alter_table_kind_name);
+                TableDdlEvent::alter_table_submitted(locator, kind)
+            }
+            _ => TableDdlEvent::lifecycle(TableDdlEventType::AlterTable, [locator]),
+        };
+
+        Some(Box::new(event))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, AsRefStr)]
@@ -404,10 +615,13 @@ pub struct AlterTableData {
     table_info_value: Option<DeserializedValueWithBytes<TableInfoValue>>,
     /// Region distribution for table in case we need to update region options.
     region_distribution: Option<RegionDistribution>,
+    /// Region locks held by irreversible region-option alters.
+    #[serde(default)]
+    region_locks: Vec<RegionId>,
 }
 
 impl AlterTableData {
-    pub fn new(task: AlterTableTask, table_id: TableId) -> Self {
+    pub fn new(task: AlterTableTask, table_id: TableId, region_locks: Vec<RegionId>) -> Self {
         Self {
             state: AlterTableState::Prepare,
             task,
@@ -415,6 +629,7 @@ impl AlterTableData {
             column_metadatas: vec![],
             table_info_value: None,
             region_distribution: None,
+            region_locks,
         }
     }
 
@@ -430,6 +645,11 @@ impl AlterTableData {
         self.table_info_value
             .as_ref()
             .map(|value| &value.table_info)
+    }
+
+    fn flow(&self) -> AlterTableFlow {
+        // Safety: Checked in `AlterTableProcedure::new`.
+        AlterTableFlow::from_kind(self.task.alter_table.kind.as_ref().unwrap())
     }
 
     #[cfg(test)]

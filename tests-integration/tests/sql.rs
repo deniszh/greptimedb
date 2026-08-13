@@ -13,15 +13,16 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::time::Duration;
 
 use auth::user_provider_from_option;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
-use common_catalog::consts::DEFAULT_PRIVATE_SCHEMA_NAME;
+use common_catalog::consts::{DEFAULT_PRIVATE_SCHEMA_NAME, DEFAULT_SCHEMA_NAME};
 use common_frontend::slow_query_event::{
     SLOW_QUERY_TABLE_COST_COLUMN_NAME, SLOW_QUERY_TABLE_IS_PROMQL_COLUMN_NAME,
     SLOW_QUERY_TABLE_NAME, SLOW_QUERY_TABLE_QUERY_COLUMN_NAME,
-    SLOW_QUERY_TABLE_THRESHOLD_COLUMN_NAME,
+    SLOW_QUERY_TABLE_SCHEMA_NAME_COLUMN_NAME, SLOW_QUERY_TABLE_THRESHOLD_COLUMN_NAME,
 };
 use sqlx::mysql::{MySqlConnection, MySqlDatabaseError, MySqlPoolOptions};
 use sqlx::postgres::{PgDatabaseError, PgPoolOptions};
@@ -82,8 +83,11 @@ macro_rules! sql_tests {
                 test_postgres_datestyle,
                 test_postgres_intervalstyle,
                 test_postgres_parameter_inference,
+                test_postgres_uint64_parameter,
+                test_postgres_explain_bind_parameter,
                 test_postgres_array_types,
                 test_mysql_prepare_stmt_insert_timestamp,
+                test_mysql_federated_prepare_stmt,
                 test_declare_fetch_close_cursor,
                 test_alter_update_on,
             );
@@ -717,10 +721,11 @@ pub async fn test_mysql_slow_query(store_type: StorageType) {
 
     let table = format!("{}.{}", DEFAULT_PRIVATE_SCHEMA_NAME, SLOW_QUERY_TABLE_NAME);
     let query = format!(
-        "SELECT {}, {}, {}, {} FROM {table} WHERE {} = ?",
+        "SELECT {}, {}, {}, {}, {} FROM {table} WHERE {} = ?",
         SLOW_QUERY_TABLE_COST_COLUMN_NAME,
         SLOW_QUERY_TABLE_THRESHOLD_COLUMN_NAME,
         SLOW_QUERY_TABLE_QUERY_COLUMN_NAME,
+        SLOW_QUERY_TABLE_SCHEMA_NAME_COLUMN_NAME,
         SLOW_QUERY_TABLE_IS_PROMQL_COLUMN_NAME,
         SLOW_QUERY_TABLE_QUERY_COLUMN_NAME,
     );
@@ -744,10 +749,12 @@ pub async fn test_mysql_slow_query(store_type: StorageType) {
     let cost: u64 = row.get(0);
     let threshold: u64 = row.get(1);
     let query: String = row.get(2);
-    let is_promql: bool = row.get(3);
+    let schema_name: String = row.get(3);
+    let is_promql: bool = row.get(4);
 
     assert!(cost > 0 && threshold > 0 && cost > threshold);
     assert_eq!(query, slow_query);
+    assert_eq!(schema_name, DEFAULT_SCHEMA_NAME);
     assert!(!is_promql);
 
     let _ = fe_mysql_server.shutdown().await;
@@ -844,10 +851,11 @@ pub async fn test_postgres_slow_query(store_type: StorageType) {
 
     let table = format!("{}.{}", DEFAULT_PRIVATE_SCHEMA_NAME, SLOW_QUERY_TABLE_NAME);
     let query = format!(
-        "SELECT {}, {}, {}, {} FROM {table} WHERE {} = $1",
+        "SELECT {}, {}, {}, {}, {} FROM {table} WHERE {} = $1",
         SLOW_QUERY_TABLE_COST_COLUMN_NAME,
         SLOW_QUERY_TABLE_THRESHOLD_COLUMN_NAME,
         SLOW_QUERY_TABLE_QUERY_COLUMN_NAME,
+        SLOW_QUERY_TABLE_SCHEMA_NAME_COLUMN_NAME,
         SLOW_QUERY_TABLE_IS_PROMQL_COLUMN_NAME,
         SLOW_QUERY_TABLE_QUERY_COLUMN_NAME,
     );
@@ -870,10 +878,12 @@ pub async fn test_postgres_slow_query(store_type: StorageType) {
     let cost: Decimal = row.get(0);
     let threshold: Decimal = row.get(1);
     let query: String = row.get(2);
-    let is_promql: bool = row.get(3);
+    let schema_name: String = row.get(3);
+    let is_promql: bool = row.get(4);
 
     assert!(cost > 0.into() && threshold > 0.into() && cost > threshold);
     assert_eq!(query, slow_query);
+    assert_eq!(schema_name, DEFAULT_SCHEMA_NAME);
     assert!(!is_promql);
 
     let _ = fe_pg_server.shutdown().await;
@@ -1150,6 +1160,19 @@ pub async fn test_postgres_intervalstyle(store_type: StorageType) {
     let client = validate_intervalstyle(client, "postgres", true).await;
     let client = validate_intervalstyle(client, "postgres_verbose", true).await;
     let client = validate_intervalstyle(client, "invalid_style", false).await;
+    assert!(
+        client
+            .simple_query("SET INTERVALSTYLE = postgres")
+            .await
+            .is_ok()
+    );
+    let result = get_row(
+        client
+            .simple_query("SELECT INTERVAL '1 day 2 hours 3 minutes'")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result, "1 day 02:03:00");
 
     let expected_formats: HashMap<&str, &str> = HashMap::from([
         ("iso_8601", "P1DT2H3M"),
@@ -1293,6 +1316,184 @@ pub async fn test_postgres_parameter_inference(store_type: StorageType) {
     assert_eq!(1, rows.len());
 
     // Shutdown the client.
+    drop(client);
+    rx.await.unwrap();
+
+    let _ = fe_pg_server.shutdown().await;
+    guard.remove_all().await;
+}
+
+pub async fn test_postgres_uint64_parameter(store_type: StorageType) {
+    let (mut guard, fe_pg_server) =
+        setup_pg_server(store_type, "test_postgres_uint64_parameter").await;
+    let addr = fe_pg_server.bind_addr().unwrap().to_string();
+
+    let (client, connection) = tokio_postgres::connect(&format!("postgres://{addr}/public"), NoTls)
+        .await
+        .unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+        tx.send(()).unwrap();
+    });
+
+    let _ = client
+        .simple_query("create table demo_u64(v bigint unsigned, ts timestamp time index)")
+        .await
+        .unwrap();
+
+    let dt = NaiveDate::from_yo_opt(2015, 100)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    let _ = client
+        .execute(
+            "INSERT INTO demo_u64 VALUES($1, $2)",
+            &[&Decimal::from(123456u64), &dt],
+        )
+        .await
+        .unwrap();
+
+    let rows = client
+        .query(
+            "SELECT count(*) FROM demo_u64 WHERE v = $1",
+            &[&Decimal::from(123456u64)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(1, rows.len());
+    let count: i64 = rows[0].get(0);
+    assert_eq!(count, 1);
+
+    let scalar_statement = client
+        .prepare("SELECT arrow_cast($1, 'UInt64')")
+        .await
+        .unwrap();
+    let scalar_null_statement = client
+        .prepare("SELECT arrow_cast($1, 'UInt64') IS NULL")
+        .await
+        .unwrap();
+    let array_statement = client
+        .prepare("SELECT arrow_cast($1, 'List(UInt64)')")
+        .await
+        .unwrap();
+    let array_null_statement = client
+        .prepare("SELECT arrow_cast($1, 'List(UInt64)') IS NULL")
+        .await
+        .unwrap();
+
+    let ordinary = Decimal::from(42);
+    let max = Decimal::from_str("18446744073709551615").unwrap();
+    for value in [&ordinary, &max] {
+        let row = client.query_one(&scalar_statement, &[value]).await.unwrap();
+        assert_eq!(*value, row.get::<_, Decimal>(0));
+    }
+
+    let scalar_null: Option<Decimal> = None;
+    let row = client
+        .query_one(&scalar_null_statement, &[&scalar_null])
+        .await
+        .unwrap();
+    assert!(row.get::<_, bool>(0));
+
+    let array_values = vec![Some(ordinary), None, Some(max)];
+    let row = client
+        .query_one(&array_statement, &[&array_values])
+        .await
+        .unwrap();
+    assert_eq!(array_values, row.get::<_, Vec<Option<Decimal>>>(0));
+
+    let array_null: Option<Vec<Option<Decimal>>> = None;
+    let row = client
+        .query_one(&array_null_statement, &[&array_null])
+        .await
+        .unwrap();
+    assert!(row.get::<_, bool>(0));
+
+    for value in [
+        Decimal::from(-1),
+        Decimal::from_str("18446744073709551616").unwrap(),
+    ] {
+        let error = client
+            .query(&scalar_statement, &[&value])
+            .await
+            .unwrap_err();
+        assert_pg_numeric_range_error(error);
+
+        let error = client
+            .query(&array_statement, &[&vec![Some(value)]])
+            .await
+            .unwrap_err();
+        assert_pg_numeric_range_error(error);
+    }
+
+    drop(client);
+    rx.await.unwrap();
+
+    let _ = fe_pg_server.shutdown().await;
+    guard.remove_all().await;
+}
+
+fn assert_pg_numeric_range_error(error: tokio_postgres::Error) {
+    let error = error.as_db_error().expect("expected PostgreSQL user error");
+    assert_eq!("22023", error.code().code());
+    assert_eq!("numeric_value_out_of_range", error.message());
+}
+
+pub async fn test_postgres_explain_bind_parameter(store_type: StorageType) {
+    // Regression test for #8029: EXPLAIN / EXPLAIN ANALYZE must accept bind
+    // parameters over the Postgres extended query protocol.
+    let (mut guard, fe_pg_server) =
+        setup_pg_server(store_type, "test_postgres_explain_bind_parameter").await;
+    let addr = fe_pg_server.bind_addr().unwrap().to_string();
+
+    let (client, connection) = tokio_postgres::connect(&format!("postgres://{addr}/public"), NoTls)
+        .await
+        .unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+        tx.send(()).unwrap();
+    });
+
+    let _ = client
+        .simple_query(
+            "create table t (k varchar(36) not null, ts timestamp(3) not null, time index(ts))",
+        )
+        .await
+        .unwrap();
+    let _ = client
+        .simple_query("insert into t (k, ts) values ('a', 1), ('b', 2), ('c', 3)")
+        .await
+        .unwrap();
+
+    // Sanity check: the underlying SELECT with a bind parameter works.
+    let rows = client
+        .query("SELECT k FROM t WHERE k = $1", &[&"a"])
+        .await
+        .unwrap();
+    assert_eq!(1, rows.len());
+
+    // EXPLAIN with a bind parameter must succeed.
+    let rows = client
+        .query("EXPLAIN SELECT k FROM t WHERE k = $1", &[&"a"])
+        .await
+        .unwrap();
+    assert!(!rows.is_empty(), "EXPLAIN should produce at least one row");
+
+    // EXPLAIN ANALYZE with a bind parameter must also succeed.
+    let rows = client
+        .query("EXPLAIN ANALYZE SELECT k FROM t WHERE k = $1", &[&"a"])
+        .await
+        .unwrap();
+    assert!(
+        !rows.is_empty(),
+        "EXPLAIN ANALYZE should produce at least one row"
+    );
+
     drop(client);
     rx.await.unwrap();
 
@@ -1531,6 +1732,45 @@ pub async fn test_mysql_prepare_stmt_insert_timestamp(store_type: StorageType) {
     assert_eq!(x.to_string(), "2023-12-19 13:20:01.123 UTC");
 
     let _ = server.shutdown().await;
+    guard.remove_all().await;
+}
+
+pub async fn test_mysql_federated_prepare_stmt(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+
+    let (mut guard, fe_mysql_server) =
+        setup_mysql_server(store_type, "test_mysql_federated_prepare_stmt").await;
+    let addr = fe_mysql_server.bind_addr().unwrap().to_string();
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(&format!("mysql://{addr}/public"))
+        .await
+        .unwrap();
+
+    // sqlx::query uses binary prepared statement protocol (COM_STMT_PREPARE + COM_STMT_EXECUTE)
+    // "SELECT @@version_comment" is a federated query matched by federated::check
+    let rows = sqlx::query("SELECT @@version_comment")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let val: String = rows[0].get(0);
+    assert!(val.contains("GreptimeDB"));
+
+    // "SET NAMES utf8" is another federated pattern
+    sqlx::query("SET NAMES utf8").execute(&pool).await.unwrap();
+
+    // "SELECT @@tx_isolation" is a federated variable query
+    let rows = sqlx::query("SELECT @@tx_isolation")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let val: String = rows[0].get(0);
+    assert_eq!(val, "REPEATABLE-READ");
+
+    let _ = fe_mysql_server.shutdown().await;
     guard.remove_all().await;
 }
 

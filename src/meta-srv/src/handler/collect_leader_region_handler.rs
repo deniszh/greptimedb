@@ -40,7 +40,7 @@ impl HeartbeatHandler for CollectLeaderRegionHandler {
 
         let mut key_values = Vec::with_capacity(current_stat.region_stats.len());
         for stat in current_stat.region_stats.iter() {
-            if stat.role != RegionRole::Leader {
+            if !matches!(stat.role, RegionRole::Leader | RegionRole::StagingLeader) {
                 continue;
             }
 
@@ -89,6 +89,8 @@ mod tests {
             data_topic_latest_entry_id: 0,
             metadata_topic_latest_entry_id: 0,
             written_bytes: 0,
+            query_cpu_time: 0,
+            query_scanned_bytes: 0,
         }
     }
 

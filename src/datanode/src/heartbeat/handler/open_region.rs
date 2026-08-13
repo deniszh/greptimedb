@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_meta::instruction::{InstructionReply, OpenRegion, SimpleReply};
-use common_meta::wal_provider::prepare_wal_options;
+use common_meta::instruction::{InstructionError, InstructionReply, OpenRegion, SimpleReply};
+use common_meta::wal_provider::serialize_wal_options;
+use common_telemetry::info;
 use store_api::path_utils::table_dir;
 use store_api::region_request::{PathType, RegionOpenRequest};
 use store_api::storage::RegionId;
@@ -41,9 +42,20 @@ impl InstructionHandler for OpenRegionsHandler {
                     mut region_options,
                     region_wal_options,
                     skip_wal_replay,
+                    reason,
+                    requirements,
                 } = open_region;
                 let region_id = RegionId::new(region_ident.table_id, region_ident.region_number);
-                prepare_wal_options(&mut region_options, region_id, &region_wal_options);
+                info!(
+                    "Received open region instruction, region_id: {region_id}, reason: {reason:?}"
+                );
+                if let Err(err) =
+                    serialize_wal_options(&mut region_options, region_id, &region_wal_options)
+                {
+                    return Err(format!(
+                        "Failed to serialize WAL options for region {region_id}: {err:?}"
+                    ));
+                }
                 let request = RegionOpenRequest {
                     engine: region_ident.engine,
                     table_dir: table_dir(&region_storage_path, region_id.table_id()),
@@ -51,17 +63,27 @@ impl InstructionHandler for OpenRegionsHandler {
                     options: region_options,
                     skip_wal_replay,
                     checkpoint: None,
+                    requirements,
                 };
-                (region_id, request)
+                Ok((region_id, request))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>();
+        let requests = match requests {
+            Ok(requests) => requests,
+            Err(error) => {
+                return Some(InstructionReply::OpenRegions(SimpleReply {
+                    result: false,
+                    error: Some(InstructionError::legacy_internal_retryable(error)),
+                }));
+            }
+        };
 
         let result = ctx
             .region_server
             .handle_batch_open_requests(self.open_region_parallelism, requests, false)
             .await;
         let success = result.is_ok();
-        let error = result.as_ref().map_err(|e| format!("{e:?}")).err();
+        let error = result.as_ref().map_err(InstructionError::from_error).err();
 
         Some(InstructionReply::OpenRegions(SimpleReply {
             result: success,
@@ -85,7 +107,7 @@ mod tests {
     use mito2::engine::MITO_ENGINE_NAME;
     use mito2::test_util::{CreateRequestBuilder, TestEnv};
     use store_api::path_utils::table_dir;
-    use store_api::region_request::{RegionCloseRequest, RegionRequest};
+    use store_api::region_request::{RegionCloseRequest, RegionRequest, RegionRequirements};
     use store_api::storage::RegionId;
 
     use crate::heartbeat::handler::RegionHeartbeatResponseHandler;
@@ -98,17 +120,21 @@ mod tests {
     ) -> Instruction {
         let region_idents = region_ids
             .into_iter()
-            .map(|region_id| OpenRegion {
-                region_ident: RegionIdent {
-                    datanode_id: 0,
-                    table_id: region_id.table_id(),
-                    region_number: region_id.region_number(),
-                    engine: MITO_ENGINE_NAME.to_string(),
-                },
-                region_storage_path: storage_path.to_string(),
-                region_options: HashMap::new(),
-                region_wal_options: HashMap::new(),
-                skip_wal_replay: false,
+            .map(|region_id| {
+                OpenRegion::new(
+                    RegionIdent {
+                        datanode_id: 0,
+                        table_id: region_id.table_id(),
+                        region_number: region_id.region_number(),
+                        engine: MITO_ENGINE_NAME.to_string(),
+                    },
+                    storage_path,
+                    HashMap::new(),
+                    HashMap::new(),
+                    false,
+                    None,
+                    RegionRequirements::empty(),
+                )
             })
             .collect();
 
@@ -143,11 +169,17 @@ mod tests {
             .await
             .unwrap();
         region_server
-            .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+            .handle_request(
+                region_id,
+                RegionRequest::Close(RegionCloseRequest::default()),
+            )
             .await
             .unwrap();
         region_server
-            .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+            .handle_request(
+                region_id,
+                RegionRequest::Close(RegionCloseRequest::default()),
+            )
             .await
             .unwrap();
 

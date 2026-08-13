@@ -13,7 +13,6 @@ arrow.workspace = true
 arrow-schema.workspace = true
 async-recursion = "1.0"
 async-trait.workspace = true
-auth.workspace = true
 bytes.workspace = true
 cache.workspace = true
 catalog.workspace = true
@@ -21,6 +20,7 @@ chrono.workspace = true
 client.workspace = true
 common-base.workspace = true
 common-config.workspace = true
+common-datasource.workspace = true
 common-decimal.workspace = true
 common-error.workspace = true
 common-frontend.workspace = true
@@ -79,10 +79,13 @@ tokio.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
+arrow-flight.workspace = true
 catalog = { workspace = true, features = ["testing"] }
 common-catalog.workspace = true
+common-meta = { workspace = true, features = ["testing"] }
 pretty_assertions.workspace = true
 prost.workspace = true
 query.workspace = true
 session.workspace = true
 table.workspace = true
+tokio-stream = { workspace = true, features = ["net"] }

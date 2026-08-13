@@ -26,11 +26,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common_catalog::consts::MITO_ENGINE;
+use common_event_recorder::PersistentEventContext;
 use common_meta::datanode::{RegionManifestInfo, RegionStat};
 use common_meta::key::table_repart::TableRepartValue;
 use common_meta::key::table_route::PhysicalTableRouteValue;
 use common_meta::peer::Peer;
 use common_meta::rpc::router::{Region, RegionRoute};
+use common_procedure::ProcedureContext;
 use common_telemetry::debug;
 use ordered_float::OrderedFloat;
 use store_api::region_engine::RegionRole;
@@ -74,6 +76,7 @@ pub struct MockSchedulerCtx {
     pub candidates: Arc<Mutex<Option<HashMap<TableId, Vec<GcCandidate>>>>>,
     pub get_table_to_region_stats_calls: Arc<Mutex<usize>>,
     pub gc_regions_calls: Arc<Mutex<usize>>,
+    pub gc_event_contexts: Arc<Mutex<Vec<PersistentEventContext>>>,
     // Error injection fields for testing
     pub get_table_to_region_stats_error: Arc<Mutex<Option<crate::error::Error>>>,
     pub get_table_route_error: Arc<Mutex<Option<crate::error::Error>>>,
@@ -212,8 +215,13 @@ impl SchedulerCtx for MockSchedulerCtx {
         _full_file_listing: bool,
         _timeout: Duration,
         _region_routes_override: Region2Peers,
+        procedure_context: ProcedureContext,
     ) -> Result<GcReport> {
         *self.gc_regions_calls.lock().unwrap() += 1;
+        self.gc_event_contexts
+            .lock()
+            .unwrap()
+            .push(procedure_context.event_context.unwrap_or_default());
 
         // Check per-region error injection first (for any region)
         for &region_id in region_ids {
@@ -326,6 +334,29 @@ impl SchedulerCtx for MockSchedulerCtx {
         // Return the report with need_retry_regions populated - let the caller handle retry logic
         Ok(final_report)
     }
+
+    #[cfg(feature = "enterprise")]
+    async fn list_dropped_tables(&self) -> Result<Vec<common_meta::key::DroppedTableName>> {
+        Ok(vec![])
+    }
+
+    #[cfg(feature = "enterprise")]
+    async fn purge_dropped_table(&self, _table_id: TableId) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "enterprise")]
+    fn try_reserve_purge(
+        &self,
+        table_id: TableId,
+        max_in_flight: usize,
+    ) -> Option<crate::gc::ctx::PurgeReservation> {
+        crate::gc::ctx::PurgeReservation::try_new(
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
+            table_id,
+            max_in_flight,
+        )
+    }
 }
 
 pub struct TestEnv {
@@ -344,6 +375,7 @@ impl TestEnv {
 
         let scheduler = GcScheduler {
             ctx: ctx.clone(),
+            runtime_switch_manager: crate::gc::scheduler::new_test_runtime_switch_manager(),
             receiver: rx,
             config,
             region_gc_tracker: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -419,5 +451,7 @@ fn mock_region_stat(
         data_topic_latest_entry_id: 0,
         metadata_topic_latest_entry_id: 0,
         written_bytes: 0,
+        query_cpu_time: 0,
+        query_scanned_bytes: 0,
     }
 }

@@ -28,7 +28,9 @@ use common_telemetry::{debug, error, tracing, warn};
 use datafusion_common::ParamValues;
 use datafusion_expr::LogicalPlan;
 use datatypes::prelude::ConcreteDataType;
+use datatypes::schema::Schema;
 use itertools::Itertools;
+use mysql_common::Value as MysqlValue;
 use opensrv_mysql::{
     AsyncMysqlShim, Column, ErrorKind, InitWriter, ParamParser, ParamValue, QueryResultWriter,
     StatementMetaWriter, ValueInner,
@@ -50,9 +52,7 @@ use crate::error::{
     self, DataFrameSnafu, InferParameterTypesSnafu, InvalidPrepareStatementSnafu, Result,
 };
 use crate::metrics::METRIC_AUTH_FAILURE;
-use crate::mysql::helper::{
-    self, format_placeholder, replace_placeholders, transform_placeholders,
-};
+use crate::mysql::helper::{self, format_placeholder, transform_placeholders_with_count};
 use crate::mysql::writer;
 use crate::mysql::writer::{create_mysql_column, handle_err};
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
@@ -138,23 +138,6 @@ impl MysqlInstanceShim {
         }
     }
 
-    /// Execute the logical plan and return the output
-    async fn do_exec_plan(
-        &self,
-        query: &str,
-        stmt: Option<Statement>,
-        plan: LogicalPlan,
-        query_ctx: QueryContextRef,
-    ) -> Result<Output> {
-        if let Some(output) =
-            crate::mysql::federated::check(query, query_ctx.clone(), self.session.clone())
-        {
-            Ok(output)
-        } else {
-            self.query_handler.do_exec_plan(stmt, plan, query_ctx).await
-        }
-    }
-
     /// Describe the statement
     async fn do_describe(
         &self,
@@ -198,81 +181,81 @@ impl MysqlInstanceShim {
         query_ctx: QueryContextRef,
         stmt_key: String,
     ) -> Result<(Vec<Column>, Vec<Column>)> {
-        let (query, param_num) = replace_placeholders(raw_query);
+        if crate::mysql::federated::check(raw_query, query_ctx.clone(), self.session.clone())
+            .is_some()
+        {
+            self.save_plan(SqlPlan::Shortcut(raw_query.to_string()), stmt_key)
+                .inspect_err(|e| {
+                    error!(e; "Failed to save prepared statement");
+                })?;
+            return Ok((vec![], vec![]));
+        }
 
         let statement = validate_query(raw_query).await?;
 
         // We have to transform the placeholder, because DataFusion only parses placeholders
         // in the form of "$i", it can't process "?" right now.
-        let statement = transform_placeholders(statement);
+        let (statement, placeholder_count) = transform_placeholders_with_count(statement);
+        let param_num = placeholder_count + 1;
 
         let describe_result = self
             .do_describe(statement.clone(), query_ctx.clone())
             .await?;
-        let (plan, schema) = if let Some(DescribeResult {
-            logical_plan,
-            schema,
-        }) = describe_result
-        {
-            (Some(logical_plan), Some(schema))
-        } else {
-            (None, None)
-        };
+        let plan = describe_result.map(|DescribeResult { logical_plan }| logical_plan);
 
-        let params = if let Some(plan) = &plan {
+        let (params, can_cache_as_plan) = if let Some(plan) = &plan {
             let param_types = DfLogicalPlanner::get_inferred_parameter_types(plan)
                 .context(InferParameterTypesSnafu)?
                 .into_iter()
                 .map(|(k, v)| (k, v.map(|v| ConcreteDataType::from_arrow_type(&v))))
                 .collect();
-            prepared_params(&param_types)?
+
+            (
+                prepared_params(&param_types, param_num)?,
+                all_params_have_types(&param_types, param_num),
+            )
         } else {
-            dummy_params(param_num)?
+            (dummy_params(param_num)?, false)
         };
 
-        let columns = schema
-            .as_ref()
-            .map(|schema| {
-                schema
-                    .column_schemas()
-                    .iter()
-                    .map(|column_schema| {
-                        create_mysql_column(&column_schema.data_type, &column_schema.name)
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
+        let columns =
+            plan.as_ref()
+                .map(|plan| {
+                    let schema: Schema = plan.schema().clone().try_into().map_err(
+                        |e: datatypes::error::Error| {
+                            error::InternalSnafu {
+                                err_msg: e.to_string(),
+                            }
+                            .build()
+                        },
+                    )?;
+                    schema
+                        .column_schemas()
+                        .iter()
+                        .map(|column_schema| {
+                            create_mysql_column(&column_schema.data_type, &column_schema.name)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
 
-        // DataFusion may optimize the plan so that some parameters are not used.
-        if params.len() != param_num - 1 {
-            self.save_plan(
-                SqlPlan {
-                    query: query.clone(),
-                    statement: Some(statement),
-                    plan: None,
-                    schema: None,
-                },
-                stmt_key,
-            )
-            .map_err(|e| {
-                error!(e; "Failed to save prepared statement");
-                e
-            })?;
-        } else {
-            self.save_plan(
-                SqlPlan {
-                    query: query.clone(),
-                    statement: Some(statement),
-                    plan,
-                    schema,
-                },
-                stmt_key,
-            )
-            .map_err(|e| {
-                error!(e; "Failed to save prepared statement");
-                e
-            })?;
+        match plan {
+            Some(plan) if can_cache_as_plan => {
+                self.save_plan(SqlPlan::Plan(plan, statement), stmt_key)
+                    .inspect_err(|e| {
+                        error!(e; "Failed to save prepared statement");
+                    })?;
+            }
+            _ => {
+                self.save_plan(
+                    SqlPlan::Statement(statement, raw_query.to_string()),
+                    stmt_key,
+                )
+                .inspect_err(|e| {
+                    error!(e; "Failed to save prepared statement");
+                })?;
+            }
         }
 
         Ok((params, columns))
@@ -291,8 +274,8 @@ impl MysqlInstanceShim {
             Some(sql_plan) => sql_plan,
         };
 
-        let outputs = match sql_plan.plan {
-            Some(plan) => {
+        let outputs = match sql_plan {
+            SqlPlan::Plan(plan, stmt) => {
                 let param_types = DfLogicalPlanner::get_inferred_parameter_types(&plan)
                     .context(InferParameterTypesSnafu)?
                     .into_iter()
@@ -306,7 +289,7 @@ impl MysqlInstanceShim {
                     .fail();
                 }
 
-                let plan = match params {
+                let replaced_plan = match params {
                     Params::ProtocolParams(params) => {
                         replace_params_with_values(&plan, param_types, &params)
                     }
@@ -315,18 +298,26 @@ impl MysqlInstanceShim {
                     }
                 }?;
 
-                debug!("Mysql execute prepared plan: {}", plan.display_indent());
+                debug!(
+                    "Mysql execute prepared plan: {}",
+                    replaced_plan.display_indent()
+                );
                 vec![
-                    self.do_exec_plan(
-                        &sql_plan.query,
-                        sql_plan.statement.clone(),
-                        plan,
-                        query_ctx.clone(),
-                    )
-                    .await,
+                    self.query_handler
+                        .do_exec_plan(replaced_plan, Some(stmt), query_ctx.clone())
+                        .await,
                 ]
             }
-            None => {
+            SqlPlan::Shortcut(query) => {
+                if let Some(output) =
+                    crate::mysql::federated::check(&query, query_ctx.clone(), self.session.clone())
+                {
+                    vec![Ok(output)]
+                } else {
+                    self.do_query(&query, query_ctx.clone()).await
+                }
+            }
+            SqlPlan::Statement(stmt, query) => {
                 let param_strs = match params {
                     Params::ProtocolParams(params) => {
                         params.iter().map(convert_param_value_to_string).collect()
@@ -335,11 +326,14 @@ impl MysqlInstanceShim {
                 };
                 debug!(
                     "do_execute Replacing with Params: {:?}, Original Query: {}",
-                    param_strs, sql_plan.query
+                    param_strs, query
                 );
-                let query = replace_params(param_strs, sql_plan.query);
+                let query = replace_params(param_strs, stmt, query)?;
                 debug!("Mysql execute replaced query: {}", query);
                 self.do_query(&query, query_ctx.clone()).await
+            }
+            _ => {
+                return error::PrepareStatementNotFoundSnafu { name: stmt_key }.fail();
             }
         };
 
@@ -455,9 +449,17 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for MysqlInstanceShi
         let query_ctx = self.session.new_query_context();
         let stmt_id = self.prepared_stmts_counter.fetch_add(1, Ordering::Relaxed);
         let stmt_key = uuid::Uuid::from_u128(stmt_id as u128).to_string();
-        let (params, columns) = self
+        let (params, columns) = match self
             .do_prepare(raw_query, query_ctx.clone(), stmt_key)
-            .await?;
+            .await
+        {
+            Ok(x) => x,
+            Err(e) => {
+                let (kind, msg) = handle_err(e, query_ctx.clone());
+                w.error(kind, msg.as_bytes()).await?;
+                return Ok(());
+            }
+        };
         debug!("on_prepare: Params: {:?}, Columns: {:?}", params, columns);
         w.reply(stmt_id, &params, &columns).await?;
         crate::metrics::METRIC_MYSQL_PREPARED_COUNT
@@ -665,19 +667,133 @@ fn convert_param_value_to_string(param: &ParamValue) -> String {
         ValueInner::UInt(u) => u.to_string(),
         ValueInner::Double(u) => u.to_string(),
         ValueInner::NULL => "NULL".to_string(),
-        ValueInner::Bytes(b) => format!("'{}'", &String::from_utf8_lossy(b)),
+        // MySQL prepared fallback emits SQL text. Delegate bytes/string literal
+        // escaping to mysql_common. `false` means normal MySQL backslash escapes;
+        // if NO_BACKSLASH_ESCAPES is supported in this path later, wire the
+        // session SQL mode here.
+        ValueInner::Bytes(b) => MysqlValue::Bytes(b.to_vec()).as_sql(false),
         ValueInner::Date(_) => format!("'{}'", NaiveDate::from(param.value)),
         ValueInner::Datetime(_) => format!("'{}'", NaiveDateTime::from(param.value)),
         ValueInner::Time(_) => format_duration(Duration::from(param.value)),
     }
 }
 
-fn replace_params(params: Vec<String>, query: String) -> String {
-    let mut query = query;
-    for (index, param) in (1..).zip(params) {
-        query = query.replace(&format_placeholder(index), &param);
+fn replace_params(params: Vec<String>, stmt: Statement, mut query: String) -> Result<String> {
+    let spans = helper::placeholder_spans(stmt);
+    ensure!(
+        spans.len() == params.len(),
+        error::InternalSnafu {
+            err_msg: format!(
+                "Prepared statement expected {} parameters but got {}",
+                spans.len(),
+                params.len()
+            )
+        }
+    );
+
+    let mut replacements = Vec::with_capacity(spans.len());
+    for span in spans {
+        let start = location_to_byte_offset(&query, span.start_line, span.start_column)
+            .ok_or_else(|| {
+                error::InternalSnafu {
+                    err_msg: format!(
+                        "Invalid placeholder start span: line {}, column {}",
+                        span.start_line, span.start_column
+                    ),
+                }
+                .build()
+            })?;
+        let end =
+            location_to_byte_offset(&query, span.end_line, span.end_column).ok_or_else(|| {
+                error::InternalSnafu {
+                    err_msg: format!(
+                        "Invalid placeholder end span: line {}, column {}",
+                        span.end_line, span.end_column
+                    ),
+                }
+                .build()
+            })?;
+        let param = span
+            .index
+            .checked_sub(1)
+            .and_then(|idx| params.get(idx))
+            .ok_or_else(|| {
+                error::InternalSnafu {
+                    err_msg: format!("Missing prepared statement parameter {}", span.index),
+                }
+                .build()
+            })?;
+
+        ensure!(
+            start < end && end <= query.len(),
+            error::InternalSnafu {
+                err_msg: format!(
+                    "Invalid placeholder byte span: {}..{} for query length {}",
+                    start,
+                    end,
+                    query.len()
+                )
+            }
+        );
+        ensure!(
+            query.get(start..end) == Some("?"),
+            error::InternalSnafu {
+                err_msg: format!(
+                    "Prepared statement placeholder span maps to {:?} instead of '?'",
+                    query.get(start..end)
+                )
+            }
+        );
+
+        replacements.push((start, end, param.clone()));
     }
-    query
+
+    replacements.sort_unstable_by_key(|(start, _, _)| *start);
+    for windows in replacements.windows(2) {
+        ensure!(
+            windows[0].1 <= windows[1].0,
+            error::InternalSnafu {
+                err_msg: "Overlapping placeholder spans in prepared statement".to_string()
+            }
+        );
+    }
+
+    // All spans are computed against the original query. Apply replacements
+    // from right to left so changing one parameter's string length never shifts
+    // the byte offsets of placeholders that have not been replaced yet.
+    for (start, end, param) in replacements.into_iter().rev() {
+        query.replace_range(start..end, &param);
+    }
+
+    Ok(query)
+}
+
+fn location_to_byte_offset(query: &str, line: u64, column: u64) -> Option<usize> {
+    // sqlparser spans are 1-based line/column locations, and columns advance by
+    // Rust `char`s rather than bytes. Convert them to byte offsets before using
+    // `String::replace_range` on the original SQL text.
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    let mut current_line = 1;
+    let mut current_column = 1;
+    for (index, ch) in query.char_indices() {
+        if current_line == line && current_column == column {
+            return Some(index);
+        }
+
+        if ch == '\n' {
+            current_line += 1;
+            current_column = 1;
+        } else {
+            current_column += 1;
+        }
+    }
+
+    // The exclusive end location of a trailing placeholder points just past
+    // the last character, for example the end span of `SELECT ?`.
+    (current_line == line && current_column == column).then_some(query.len())
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -781,16 +897,298 @@ fn dummy_params(index: usize) -> Result<Vec<Column>> {
 }
 
 /// Parameters that the client must provide when executing the prepared statement.
-fn prepared_params(param_types: &HashMap<String, Option<ConcreteDataType>>) -> Result<Vec<Column>> {
-    let mut params = Vec::with_capacity(param_types.len());
+fn prepared_params(
+    param_types: &HashMap<String, Option<ConcreteDataType>>,
+    param_num: usize,
+) -> Result<Vec<Column>> {
+    let mut params = Vec::with_capacity(param_num - 1);
 
     // Placeholder index starts from 1
-    for index in 1..=param_types.len() {
-        if let Some(Some(t)) = param_types.get(&format_placeholder(index)) {
-            let column = create_mysql_column(t, "")?;
-            params.push(column);
-        }
+    for i in 1..param_num {
+        let column = if let Some(Some(t)) = param_types.get(&format_placeholder(i)) {
+            create_mysql_column(t, "")?
+        } else {
+            create_mysql_column(&ConcreteDataType::null_datatype(), "")?
+        };
+        params.push(column);
     }
 
     Ok(params)
+}
+
+fn all_params_have_types(
+    param_types: &HashMap<String, Option<ConcreteDataType>>,
+    param_num: usize,
+) -> bool {
+    param_types.len() == param_num - 1
+        && (1..param_num).all(|i| matches!(param_types.get(&format_placeholder(i)), Some(Some(_))))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use common_query::Output;
+    use datafusion_expr::LogicalPlan;
+    use query::parser::PromQuery;
+    use query::query_engine::DescribeResult;
+    use session::context::QueryContext;
+    use sql::statements::statement::Statement;
+
+    use super::*;
+    use crate::error::Result;
+    use crate::query_handler::sql::SqlQueryHandler;
+
+    struct DummyQueryHandler;
+
+    #[async_trait]
+    impl SqlQueryHandler for DummyQueryHandler {
+        async fn do_query(&self, _: &str, _: QueryContextRef) -> Vec<Result<Output>> {
+            unimplemented!()
+        }
+
+        async fn do_analyze_stream_query(&self, _: &str, _: QueryContextRef) -> Result<Output> {
+            unimplemented!()
+        }
+
+        async fn do_promql_query(&self, _: &PromQuery, _: QueryContextRef) -> Vec<Result<Output>> {
+            unimplemented!()
+        }
+
+        async fn do_exec_plan(
+            &self,
+            _: LogicalPlan,
+            _: Option<Statement>,
+            _: QueryContextRef,
+        ) -> Result<Output> {
+            unimplemented!()
+        }
+
+        async fn do_describe(
+            &self,
+            _: Statement,
+            _: QueryContextRef,
+        ) -> Result<Option<DescribeResult>> {
+            unimplemented!()
+        }
+
+        async fn is_valid_schema(&self, _: &str, _: &str) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn create_shim() -> MysqlInstanceShim {
+        MysqlInstanceShim::create(
+            Arc::new(DummyQueryHandler),
+            None,
+            "127.0.0.1:3306".parse().unwrap(),
+            1,
+            1024,
+        )
+    }
+
+    fn statement_with_transformed_placeholders(query: &str) -> Statement {
+        let mut statements =
+            ParserContext::create_with_dialect(query, &MySqlDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(statements.len(), 1);
+        transform_placeholders_with_count(statements.remove(0)).0
+    }
+
+    #[test]
+    fn test_prepared_params_keep_unknown_type_placeholders() {
+        let mut param_types = HashMap::new();
+        param_types.insert(format_placeholder(1), None);
+        param_types.insert(
+            format_placeholder(2),
+            Some(ConcreteDataType::int32_datatype()),
+        );
+
+        let params = prepared_params(&param_types, 3).unwrap();
+        assert_eq!(params.len(), 2);
+        assert!(!all_params_have_types(&param_types, 3));
+    }
+
+    #[test]
+    fn test_replace_params_by_placeholder_span() {
+        let query = "SELECT ?, ?".to_string();
+        let stmt = statement_with_transformed_placeholders(&query);
+        let params = vec!["'$2 should stay'".to_string(), "'value'".to_string()];
+
+        assert_eq!(
+            "SELECT '$2 should stay', 'value'",
+            replace_params(params, stmt, query).unwrap()
+        );
+
+        let query = "SELECT ?, ?, ?".to_string();
+        let stmt = statement_with_transformed_placeholders(&query);
+        let params = vec![
+            "'much longer than a placeholder'".to_string(),
+            "0".to_string(),
+            "'also much longer than a placeholder'".to_string(),
+        ];
+
+        assert_eq!(
+            "SELECT 'much longer than a placeholder', 0, 'also much longer than a placeholder'",
+            replace_params(params, stmt, query).unwrap()
+        );
+
+        let query = "SELECT '$1', \"$2\", `$3`, ?, ?".to_string();
+        let stmt = statement_with_transformed_placeholders(&query);
+        let params = vec!["'1'".to_string(), "'2'".to_string()];
+
+        assert_eq!(
+            "SELECT '$1', \"$2\", `$3`, '1', '2'",
+            replace_params(params, stmt, query).unwrap()
+        );
+
+        let query = "SELECT /* ? */ ? -- ?\n, ?".to_string();
+        let stmt = statement_with_transformed_placeholders(&query);
+        let params = vec!["'first'".to_string(), "'second'".to_string()];
+
+        assert_eq!(
+            "SELECT /* ? */ 'first' -- ?\n, 'second'",
+            replace_params(params, stmt, query).unwrap()
+        );
+
+        let query = "SELECT '中文', ?".to_string();
+        let stmt = statement_with_transformed_placeholders(&query);
+        let params = vec!["'value'".to_string()];
+
+        assert_eq!(
+            "SELECT '中文', 'value'",
+            replace_params(params, stmt, query).unwrap()
+        );
+
+        let query = "SELECT '中文',\n  ?".to_string();
+        let stmt = statement_with_transformed_placeholders(&query);
+        let params = vec!["'value'".to_string()];
+
+        assert_eq!(
+            "SELECT '中文',\n  'value'",
+            replace_params(params, stmt, query).unwrap()
+        );
+
+        let query = "SELECT 'x'\r\n, ?".to_string();
+        let stmt = statement_with_transformed_placeholders(&query);
+        let params = vec!["'crlf'".to_string()];
+
+        assert_eq!(
+            "SELECT 'x'\r\n, 'crlf'",
+            replace_params(params, stmt, query).unwrap()
+        );
+
+        let query = "SELECT\t?".to_string();
+        let stmt = statement_with_transformed_placeholders(&query);
+        let params = vec!["NULL".to_string()];
+
+        assert_eq!("SELECT\tNULL", replace_params(params, stmt, query).unwrap());
+
+        let query = "SELECT CAST(? AS INT64), ? + (SELECT ?)".to_string();
+        let stmt = statement_with_transformed_placeholders(&query);
+        let params = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+
+        assert_eq!(
+            "SELECT CAST(1 AS INT64), 2 + (SELECT 3)",
+            replace_params(params, stmt, query).unwrap()
+        );
+
+        let query = "SET time_zone = ?".to_string();
+        let stmt = statement_with_transformed_placeholders(&query);
+        let params = vec!["'UTC'".to_string()];
+
+        assert_eq!(
+            "SET time_zone = 'UTC'",
+            replace_params(params, stmt, query).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_federated_query() {
+        let mut shim = create_shim();
+        let query_ctx = QueryContext::arc();
+        let stmt_key = "test_federated".to_string();
+
+        let (params, columns) = shim
+            .do_prepare(
+                "SELECT @@version_comment",
+                query_ctx.clone(),
+                stmt_key.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert!(params.is_empty());
+        assert!(columns.is_empty());
+
+        let plan = shim.plan(&stmt_key).unwrap();
+        assert!(matches!(plan, SqlPlan::Shortcut(q) if q == "SELECT @@version_comment"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_federated_shortcut() {
+        let mut shim = create_shim();
+        let query_ctx = QueryContext::arc();
+        let stmt_key = "test_federated_exec".to_string();
+
+        shim.do_prepare(
+            "SELECT @@version_comment",
+            query_ctx.clone(),
+            stmt_key.clone(),
+        )
+        .await
+        .unwrap();
+
+        let outputs = shim
+            .do_execute(query_ctx.clone(), stmt_key, Params::CliParams(vec![]))
+            .await
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        let output = outputs.into_iter().next().unwrap().unwrap();
+        let pretty = output.data.pretty_print().await;
+        assert!(pretty.contains("GreptimeDB"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_non_federated_query_not_shortcut() {
+        let mut shim = create_shim();
+        let query_ctx = QueryContext::arc();
+        let stmt_key = "test_non_federated".to_string();
+
+        let result = shim
+            .do_prepare("SET NAMES utf8", query_ctx.clone(), stmt_key.clone())
+            .await;
+
+        assert!(result.is_ok());
+        let plan = shim.plan(&stmt_key).unwrap();
+        assert!(matches!(plan, SqlPlan::Shortcut(_)));
+    }
+
+    #[tokio::test]
+    async fn test_execute_set_shortcut() {
+        let mut shim = create_shim();
+        let query_ctx = QueryContext::arc();
+        let stmt_key = "test_set_shortcut".to_string();
+
+        shim.do_prepare("SET NAMES utf8", query_ctx.clone(), stmt_key.clone())
+            .await
+            .unwrap();
+
+        let outputs = shim
+            .do_execute(query_ctx.clone(), stmt_key, Params::CliParams(vec![]))
+            .await
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        let output = outputs.into_iter().next().unwrap().unwrap();
+        match output.data {
+            common_query::OutputData::RecordBatches(batches) => {
+                let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                assert_eq!(total_rows, 0);
+            }
+            other => panic!("Expected RecordBatches, got {:?}", other),
+        }
+    }
 }

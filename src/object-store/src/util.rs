@@ -14,19 +14,24 @@
 
 use std::fmt::Display;
 use std::path;
-use std::time::Duration;
 
 use common_error::root_source;
 use common_telemetry::{debug, error, info, warn};
+use opendal::ErrorKind;
 use opendal::layers::{
-    LoggingInterceptor, LoggingLayer, RetryInterceptor, RetryLayer, TracingLayer,
+    LoggingInterceptor, LoggingLayer, RetryEvent, RetryInterceptor, RetryLayer, TracingLayer,
 };
 use opendal::raw::{AccessorInfo, HttpClient, Operation};
-use opendal::{Error, ErrorKind};
+use opendal::services::FS_SCHEME;
 use snafu::ResultExt;
 
 use crate::config::HttpClientConfig;
 use crate::{ObjectStore, error};
+
+/// Returns true if the object store is not backed by local filesystem.
+pub fn is_object_storage(object_store: &ObjectStore) -> bool {
+    object_store.info().scheme() != FS_SCHEME
+}
 
 /// Join two paths and normalize the output dir.
 ///
@@ -131,7 +136,7 @@ pub fn normalize_path(path: &str) -> String {
 pub fn with_instrument_layers(object_store: ObjectStore, path_label: bool) -> ObjectStore {
     object_store
         .layer(LoggingLayer::new(DefaultLoggingInterceptor))
-        .layer(TracingLayer)
+        .layer(TracingLayer::new())
         .layer(crate::layers::build_prometheus_metrics_layer(path_label))
 }
 
@@ -239,14 +244,22 @@ pub struct PrintDetailedError;
 
 // PrintDetailedError is a retry interceptor that prints error in Debug format in retrying.
 impl RetryInterceptor for PrintDetailedError {
-    fn intercept(&self, err: &Error, dur: Duration) {
-        warn!("Retry after {}s, error: {:#?}", dur.as_secs_f64(), err);
+    fn intercept(&self, event: RetryEvent<'_>) {
+        warn!(
+            "Retry after {}s, error: {:#?}",
+            event.retry_after.as_secs_f64(),
+            event.err
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use opendal::services::Fs;
+
     use super::*;
+    use crate::ObjectStore;
+    use crate::util::is_object_storage;
 
     #[test]
     fn test_normalize_dir() {
@@ -285,5 +298,15 @@ mod tests {
         assert_eq!("abc/def", join_path(" abc", "/def "));
         assert_eq!("/abc", join_path("//", "/abc"));
         assert_eq!("abc/def", join_path("abc/", "//def"));
+    }
+
+    #[test]
+    fn test_fs_is_not_object_storage() {
+        let object_store = ObjectStore::new(Fs::default().root("/tmp"))
+            .unwrap()
+            .finish();
+
+        assert_eq!(FS_SCHEME, object_store.info().scheme());
+        assert!(!is_object_storage(&object_store));
     }
 }

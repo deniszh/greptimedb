@@ -24,7 +24,7 @@ pub mod prom_query_gateway;
 pub mod region_server;
 
 use std::any::Any;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use api::v1::health_check_server::{HealthCheck, HealthCheckServer};
@@ -50,6 +50,7 @@ use tonic::{Request, Response, Status};
 use tonic_reflection::server::v1::{ServerReflection, ServerReflectionServer};
 
 use crate::error::{AlreadyStartedSnafu, InternalSnafu, Result, StartGrpcSnafu, TcpBindSnafu};
+use crate::install_default_crypto_provider;
 use crate::metrics::MetricsMiddlewareLayer;
 use crate::otel_arrow::{HeaderInterceptor, OtelArrowServiceHandler};
 use crate::query_handler::OpenTelemetryProtocolHandlerRef;
@@ -94,14 +95,8 @@ impl GrpcOptions {
         if self.server_addr.is_empty() {
             match local_ip_address::local_ip() {
                 Ok(ip) => {
-                    let detected_addr = format!(
-                        "{}:{}",
-                        ip,
-                        self.bind_addr
-                            .split(':')
-                            .nth(1)
-                            .unwrap_or(DEFAULT_GRPC_ADDR_PORT)
-                    );
+                    let port = port_from_bind_addr(&self.bind_addr);
+                    let detected_addr = format_server_addr(ip, port);
                     info!("Using detected: {} as server address", detected_addr);
                     self.server_addr = detected_addr;
                 }
@@ -130,7 +125,18 @@ impl GrpcOptions {
     }
 }
 
-const DEFAULT_GRPC_ADDR_PORT: &str = "4001";
+const DEFAULT_GRPC_ADDR_PORT: u16 = 4001;
+
+fn port_from_bind_addr(bind_addr: &str) -> u16 {
+    bind_addr
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .unwrap_or(DEFAULT_GRPC_ADDR_PORT)
+}
+
+fn format_server_addr(ip: IpAddr, port: u16) -> String {
+    SocketAddr::new(ip, port).to_string()
+}
 
 const DEFAULT_INTERNAL_GRPC_ADDR_PORT: &str = "4010";
 
@@ -355,8 +361,17 @@ impl Server for GrpcServer {
             .layer(MetricsMiddlewareLayer)
             .into_inner();
 
-        let mut builder = tonic::transport::Server::builder().layer(metrics_layer);
+        let mut builder = tonic::transport::Server::builder()
+            .accept_http1(true)
+            .layer(metrics_layer)
+            .layer(tonic_web::GrpcWebLayer::new());
+
         if let Some(tls_config) = self.tls_config.clone() {
+            // tonic builds the underlying rustls server config here, which requires a
+            // process-level crypto provider to be installed first.
+            if let Err(err) = install_default_crypto_provider() {
+                warn!("Failed to install default rustls crypto provider: {err}");
+            }
             builder = builder.tls_config(tls_config).context(StartGrpcSnafu)?;
         }
 
@@ -403,5 +418,38 @@ impl Server for GrpcServer {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::{DEFAULT_GRPC_ADDR_PORT, format_server_addr, port_from_bind_addr};
+
+    #[test]
+    fn test_port_from_bind_addr() {
+        assert_eq!(3002, port_from_bind_addr("127.0.0.1:3002"));
+        assert_eq!(3002, port_from_bind_addr("[::]:3002"));
+        assert_eq!(
+            3002,
+            port_from_bind_addr("greptimedb-metasrv.default.svc.cluster.local:3002")
+        );
+        assert_eq!(
+            DEFAULT_GRPC_ADDR_PORT,
+            port_from_bind_addr("invalid-bind-addr")
+        );
+    }
+
+    #[test]
+    fn test_format_server_addr() {
+        assert_eq!(
+            "127.0.0.1:3002",
+            format_server_addr(IpAddr::V4(Ipv4Addr::LOCALHOST), 3002)
+        );
+        assert_eq!(
+            "[::1]:3002",
+            format_server_addr(IpAddr::V6(Ipv6Addr::LOCALHOST), 3002)
+        );
     }
 }

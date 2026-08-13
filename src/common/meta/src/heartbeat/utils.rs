@@ -14,7 +14,7 @@
 
 use api::v1::meta::heartbeat_request::NodeWorkloads;
 use api::v1::meta::mailbox_message::Payload;
-use api::v1::meta::{DatanodeWorkloads, MailboxMessage};
+use api::v1::meta::{DatanodeWorkloads, FlownodeWorkloads, FrontendWorkloads, MailboxMessage};
 use common_telemetry::tracing_context::TracingContext;
 use common_telemetry::warn;
 use common_time::util::current_time_millis;
@@ -90,6 +90,26 @@ pub fn get_datanode_workloads(node_workloads: Option<&NodeWorkloads>) -> Datanod
     }
 }
 
+/// Extracts frontend workloads from the provided optional `NodeWorkloads`.
+///
+/// Returns empty frontend workloads if the input is `None` or not a frontend payload.
+pub fn get_frontend_workloads(node_workloads: Option<&NodeWorkloads>) -> FrontendWorkloads {
+    match node_workloads {
+        Some(NodeWorkloads::Frontend(frontend_workloads)) => frontend_workloads.clone(),
+        _ => FrontendWorkloads { types: vec![] },
+    }
+}
+
+/// Extracts flownode workloads from the provided optional `NodeWorkloads`.
+///
+/// Returns empty flownode workloads if the input is `None` or not a flownode payload.
+pub fn get_flownode_workloads(node_workloads: Option<&NodeWorkloads>) -> FlownodeWorkloads {
+    match node_workloads {
+        Some(NodeWorkloads::Flownode(flownode_workloads)) => flownode_workloads.clone(),
+        _ => FlownodeWorkloads { types: vec![] },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +121,29 @@ mod tests {
         }));
         let workloads = get_datanode_workloads(node_workloads.as_ref());
         assert_eq!(workloads.types, vec![DatanodeWorkloadType::Hybrid.to_i32()]);
+    }
+
+    #[test]
+    fn test_get_flownode_workloads() {
+        let node_workloads = Some(NodeWorkloads::Flownode(FlownodeWorkloads {
+            types: vec![7],
+        }));
+        let workloads = get_flownode_workloads(node_workloads.as_ref());
+        assert_eq!(workloads.types, vec![7]);
+
+        let workloads = get_flownode_workloads(None);
+        assert!(workloads.types.is_empty());
+    }
+
+    #[test]
+    fn test_get_frontend_workloads() {
+        let node_workloads = Some(NodeWorkloads::Frontend(FrontendWorkloads {
+            types: vec![7],
+        }));
+        let workloads = get_frontend_workloads(node_workloads.as_ref());
+        assert_eq!(workloads.types, vec![7]);
+
+        let workloads = get_frontend_workloads(None);
+        assert!(workloads.types.is_empty());
     }
 }

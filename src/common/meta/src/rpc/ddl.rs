@@ -31,7 +31,8 @@ use api::v1::meta::{
     DdlTaskResponse as PbDdlTaskResponse, DropDatabaseTask as PbDropDatabaseTask,
     DropFlowTask as PbDropFlowTask, DropTableTask as PbDropTableTask,
     DropTableTasks as PbDropTableTasks, DropViewTask as PbDropViewTask, Partition, ProcedureId,
-    TruncateTableTask as PbTruncateTableTask,
+    PurgeDroppedTableTask as PbPurgeDroppedTableTask, TruncateTableTask as PbTruncateTableTask,
+    UndropTableTask as PbUndropTableTask,
 };
 use api::v1::{
     AlterDatabaseExpr, AlterTableExpr, CommentObjectType as PbCommentObjectType, CommentOnExpr,
@@ -41,7 +42,10 @@ use api::v1::{
 };
 use base64::Engine as _;
 use base64::engine::general_purpose;
+use common_base::protocol::Channel;
+use common_catalog::{format_full_flow_name, format_full_table_name};
 use common_error::ext::BoxedError;
+pub use common_event_recorder::TriggerReason;
 use common_time::{DatabaseTimeToLive, Timestamp};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -56,13 +60,33 @@ use crate::error::{
     self, ConvertTimeRangesSnafu, ExternalSnafu, InvalidSetDatabaseOptionSnafu,
     InvalidUnsetDatabaseOptionSnafu, Result,
 };
+use crate::flow_name::FlowName;
+use crate::instruction::CacheIdent;
 use crate::key::FlowId;
+use crate::key::flow::flow_name::FlowNameManager;
+use crate::key::table_name::{TableNameKey, TableNameManager};
+
+/// Reserved query-context extension key for the frontend peer address that submitted a DDL request.
+pub const ORIGIN_FRONTEND_ADDR_EXTENSION_KEY: &str = "__greptime_origin_frontend.addr";
+/// Reserved query-context extension key for the authenticated database creator.
+pub const CREATE_DATABASE_CREATOR_EXTENSION_KEY: &str = "__greptime_create_database.creator";
+/// Internal gRPC metadata key for the authenticated database creator.
+pub const CREATE_DATABASE_CREATOR_METADATA_KEY: &str =
+    "x-greptime-internal-create-database-creator-bin";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatorGrantIntent {
+    pub username: String,
+    pub created_at_ns: i64,
+}
 
 /// DDL tasks
 #[derive(Debug, Clone)]
 pub enum DdlTask {
     CreateTable(CreateTableTask),
     DropTable(DropTableTask),
+    UndropTable(UndropTableTask),
+    PurgeDroppedTable(PurgeDroppedTableTask),
     AlterTable(AlterTableTask),
     TruncateTable(TruncateTableTask),
     CreateLogicalTables(Vec<CreateTableTask>),
@@ -144,18 +168,30 @@ impl DdlTask {
         })
     }
 
+    /// Creates a [`DdlTask`] to undrop a table.
+    pub fn new_undrop_table(table_id: TableId) -> Self {
+        DdlTask::UndropTable(UndropTableTask { table_id })
+    }
+
+    /// Creates a [`DdlTask`] to purge a dropped table.
+    pub fn new_purge_dropped_table(table_id: TableId) -> Self {
+        DdlTask::PurgeDroppedTable(PurgeDroppedTableTask { table_id })
+    }
+
     /// Creates a [`DdlTask`] to create a database.
     pub fn new_create_database(
         catalog: String,
         schema: String,
         create_if_not_exists: bool,
         options: HashMap<String, String>,
+        creator: Option<CreatorGrantIntent>,
     ) -> Self {
         DdlTask::CreateDatabase(CreateDatabaseTask {
             catalog,
             schema,
             create_if_not_exists,
             options,
+            creator,
         })
     }
 
@@ -217,6 +253,12 @@ impl TryFrom<Task> for DdlTask {
                 Ok(DdlTask::CreateTable(create_table.try_into()?))
             }
             Task::DropTableTask(drop_table) => Ok(DdlTask::DropTable(drop_table.try_into()?)),
+            Task::UndropTableTask(undrop_table) => {
+                Ok(DdlTask::UndropTable(undrop_table.try_into()?))
+            }
+            Task::PurgeDroppedTableTask(purge_dropped_table) => {
+                Ok(DdlTask::PurgeDroppedTable(purge_dropped_table.try_into()?))
+            }
             Task::AlterTableTask(alter_table) => Ok(DdlTask::AlterTable(alter_table.try_into()?)),
             Task::TruncateTableTask(truncate_table) => {
                 Ok(DdlTask::TruncateTable(truncate_table.try_into()?))
@@ -292,7 +334,6 @@ impl TryFrom<Task> for DdlTask {
 
 #[derive(Clone)]
 pub struct SubmitDdlTaskRequest {
-    pub query_context: QueryContext,
     pub wait: bool,
     pub timeout: Duration,
     pub task: DdlTask,
@@ -300,9 +341,8 @@ pub struct SubmitDdlTaskRequest {
 
 impl SubmitDdlTaskRequest {
     /// The default constructor for [`SubmitDdlTaskRequest`].
-    pub fn new(query_context: QueryContext, task: DdlTask) -> Self {
+    pub fn new(task: DdlTask) -> Self {
         Self {
-            query_context,
             wait: Self::default_wait(),
             timeout: Self::default_timeout(),
             task,
@@ -320,13 +360,29 @@ impl SubmitDdlTaskRequest {
     }
 }
 
+fn ddl_timeout_secs(timeout: Duration) -> u32 {
+    timeout
+        .as_nanos()
+        .div_ceil(Duration::from_secs(1).as_nanos())
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
 impl TryFrom<SubmitDdlTaskRequest> for PbDdlTaskRequest {
     type Error = error::Error;
 
     fn try_from(request: SubmitDdlTaskRequest) -> Result<Self> {
-        let task = match request.task {
+        let SubmitDdlTaskRequest {
+            wait,
+            timeout,
+            task,
+        } = request;
+
+        let task = match task {
             DdlTask::CreateTable(task) => Task::CreateTableTask(task.try_into()?),
             DdlTask::DropTable(task) => Task::DropTableTask(task.into()),
+            DdlTask::UndropTable(task) => Task::UndropTableTask(task.into()),
+            DdlTask::PurgeDroppedTable(task) => Task::PurgeDroppedTableTask(task.into()),
             DdlTask::AlterTable(task) => Task::AlterTableTask(task.try_into()?),
             DdlTask::TruncateTable(task) => Task::TruncateTableTask(task.try_into()?),
             DdlTask::CreateLogicalTables(tasks) => {
@@ -369,10 +425,12 @@ impl TryFrom<SubmitDdlTaskRequest> for PbDdlTaskRequest {
 
         Ok(Self {
             header: None,
-            query_context: Some(request.query_context.into()),
-            timeout_secs: request.timeout.as_secs() as u32,
-            wait: request.wait,
+            query_context: None,
+            timeout_secs: ddl_timeout_secs(timeout),
+            wait,
             task: Some(task),
+            event_context: None,
+            actor: None,
         })
     }
 }
@@ -586,6 +644,62 @@ pub struct DropTableTask {
     pub table_id: TableId,
     #[serde(default)]
     pub drop_if_exists: bool,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+pub struct UndropTableTask {
+    pub table_id: TableId,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+pub struct PurgeDroppedTableTask {
+    pub table_id: TableId,
+}
+
+impl TryFrom<PbUndropTableTask> for UndropTableTask {
+    type Error = error::Error;
+
+    fn try_from(pb: PbUndropTableTask) -> Result<Self> {
+        Ok(Self {
+            table_id: pb
+                .table_id
+                .context(error::InvalidProtoMsgSnafu {
+                    err_msg: "expected table_id",
+                })?
+                .id,
+        })
+    }
+}
+
+impl From<UndropTableTask> for PbUndropTableTask {
+    fn from(task: UndropTableTask) -> Self {
+        Self {
+            table_id: Some(api::v1::TableId { id: task.table_id }),
+        }
+    }
+}
+
+impl TryFrom<PbPurgeDroppedTableTask> for PurgeDroppedTableTask {
+    type Error = error::Error;
+
+    fn try_from(pb: PbPurgeDroppedTableTask) -> Result<Self> {
+        Ok(Self {
+            table_id: pb
+                .table_id
+                .context(error::InvalidProtoMsgSnafu {
+                    err_msg: "expected table_id",
+                })?
+                .id,
+        })
+    }
+}
+
+impl From<PurgeDroppedTableTask> for PbPurgeDroppedTableTask {
+    fn from(task: PurgeDroppedTableTask) -> Self {
+        Self {
+            table_id: Some(api::v1::TableId { id: task.table_id }),
+        }
+    }
 }
 
 impl DropTableTask {
@@ -942,6 +1056,8 @@ pub struct CreateDatabaseTask {
     pub create_if_not_exists: bool,
     #[serde_as(deserialize_as = "DefaultOnNull")]
     pub options: HashMap<String, String>,
+    #[serde(default)]
+    pub creator: Option<CreatorGrantIntent>,
 }
 
 impl TryFrom<PbCreateDatabaseTask> for CreateDatabaseTask {
@@ -962,6 +1078,7 @@ impl TryFrom<PbCreateDatabaseTask> for CreateDatabaseTask {
             schema: schema_name,
             create_if_not_exists,
             options,
+            creator: None,
         })
     }
 }
@@ -975,6 +1092,7 @@ impl TryFrom<CreateDatabaseTask> for PbCreateDatabaseTask {
             schema,
             create_if_not_exists,
             options,
+            creator: _,
         }: CreateDatabaseTask,
     ) -> Result<Self> {
         Ok(PbCreateDatabaseTask {
@@ -1181,6 +1299,11 @@ pub struct CreateFlowTask {
     pub comment: String,
     pub sql: String,
     pub flow_options: HashMap<String, String>,
+    /// Typed schedule configuration resolved during `on_prepare`.
+    /// Not populated from proto; set by the procedure layer after
+    /// defaults are resolved.
+    #[serde(default)]
+    pub eval_schedule: Option<crate::key::flow::flow_info::FlowScheduleConfig>,
 }
 
 impl TryFrom<PbCreateFlowTask> for CreateFlowTask {
@@ -1219,6 +1342,7 @@ impl TryFrom<PbCreateFlowTask> for CreateFlowTask {
             comment,
             sql,
             flow_options,
+            eval_schedule: None,
         })
     }
 }
@@ -1237,6 +1361,7 @@ impl From<CreateFlowTask> for PbCreateFlowTask {
             comment,
             sql,
             flow_options,
+            ..
         }: CreateFlowTask,
     ) -> Self {
         PbCreateFlowTask {
@@ -1341,12 +1466,98 @@ pub enum CommentObjectType {
 }
 
 impl CommentOnTask {
-    pub fn table_ref(&self) -> TableReference<'_> {
-        TableReference {
-            catalog: &self.catalog_name,
-            schema: &self.schema_name,
-            table: &self.object_name,
+    pub fn table_id(&self) -> Option<TableId> {
+        match self.object_id.as_ref() {
+            Some(CommentObjectId::Table(table_id)) => Some(*table_id),
+            _ => None,
         }
+    }
+
+    pub fn flow_id(&self) -> Option<FlowId> {
+        match self.object_id.as_ref() {
+            Some(CommentObjectId::Flow(flow_id)) => Some(*flow_id),
+            _ => None,
+        }
+    }
+
+    fn set_table_id(&mut self, table_id: TableId) {
+        self.object_id = Some(CommentObjectId::Table(table_id));
+    }
+
+    fn set_flow_id(&mut self, flow_id: FlowId) {
+        self.object_id = Some(CommentObjectId::Flow(flow_id));
+    }
+
+    /// Returns the cache identifiers for the object being commented on.
+    pub fn cache_idents(&self) -> Vec<CacheIdent> {
+        match self.object_type {
+            CommentObjectType::Table | CommentObjectType::Column => {
+                let mut cache_idents = Vec::with_capacity(2);
+                if let Some(CommentObjectId::Table(table_id)) = self.object_id.as_ref() {
+                    cache_idents.push(CacheIdent::TableId(*table_id));
+                }
+                cache_idents.push(CacheIdent::TableName(TableName {
+                    catalog_name: self.catalog_name.clone(),
+                    schema_name: self.schema_name.clone(),
+                    table_name: self.object_name.clone(),
+                }));
+                cache_idents
+            }
+            CommentObjectType::Flow => {
+                let mut cache_idents = Vec::with_capacity(2);
+                if let Some(CommentObjectId::Flow(flow_id)) = self.object_id.as_ref() {
+                    cache_idents.push(CacheIdent::FlowId(*flow_id));
+                }
+                cache_idents.push(CacheIdent::FlowName(FlowName {
+                    catalog_name: self.catalog_name.clone(),
+                    flow_name: self.object_name.clone(),
+                }));
+                cache_idents
+            }
+        }
+    }
+
+    /// Enriches the `object_id` field of the `CommentOnTask`
+    /// by looking up the corresponding table or flow ID using the provided managers.
+    pub async fn enrich_object_id(
+        &mut self,
+        table_name_manager: &TableNameManager,
+        flow_name_manager: &FlowNameManager,
+    ) -> Result<()> {
+        match self.object_type {
+            CommentObjectType::Table | CommentObjectType::Column => {
+                let table_id = table_name_manager
+                    .get(TableNameKey::new(
+                        &self.catalog_name,
+                        &self.schema_name,
+                        &self.object_name,
+                    ))
+                    .await?
+                    .with_context(|| error::TableNotFoundSnafu {
+                        table_name: format_full_table_name(
+                            &self.catalog_name,
+                            &self.schema_name,
+                            &self.object_name,
+                        ),
+                    })?
+                    .table_id();
+
+                self.set_table_id(table_id);
+            }
+            CommentObjectType::Flow => {
+                let flow_id = flow_name_manager
+                    .get(&self.catalog_name, &self.object_name)
+                    .await?
+                    .with_context(|| error::FlowNotFoundSnafu {
+                        flow_name: format_full_flow_name(&self.catalog_name, &self.object_name),
+                    })?
+                    .flow_id();
+
+                self.set_flow_id(flow_id);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1464,6 +1675,12 @@ impl QueryContext {
     /// Get the channel
     pub fn channel(&self) -> u8 {
         self.channel
+    }
+
+    /// Returns the protocol derived from the typed query channel.
+    pub fn protocol(&self) -> Option<String> {
+        let channel = Channel::from(u32::from(self.channel));
+        (channel != Channel::Unknown).then(|| channel.as_ref().to_string())
     }
 
     pub fn snapshot_seqs(&self) -> &HashMap<u64, u64> {
@@ -1640,6 +1857,18 @@ mod tests {
     use super::{AlterTableTask, CreateTableTask, *};
 
     #[test]
+    fn test_ddl_timeout_secs() {
+        assert_eq!(ddl_timeout_secs(Duration::ZERO), 0);
+        assert_eq!(ddl_timeout_secs(Duration::from_nanos(1)), 1);
+        assert_eq!(ddl_timeout_secs(Duration::from_secs(1)), 1);
+        assert_eq!(ddl_timeout_secs(Duration::from_millis(1500)), 2);
+        assert_eq!(
+            ddl_timeout_secs(Duration::from_secs(u32::MAX as u64 + 1)),
+            u32::MAX
+        );
+    }
+
+    #[test]
     fn test_basic_ser_de_create_table_task() {
         let schema = SchemaBuilder::default().build().unwrap();
         let table_info = test_table_info(1025, "foo", "bar", "baz", Arc::new(schema));
@@ -1656,6 +1885,50 @@ mod tests {
         let task = AlterTableTask {
             alter_table: AlterTableExpr::default(),
         };
+
+        let output = serde_json::to_vec(&task).unwrap();
+
+        let de = serde_json::from_slice(&output).unwrap();
+        assert_eq!(task, de);
+    }
+
+    #[test]
+    fn test_undrop_table_task_pb_roundtrip() {
+        let expected = UndropTableTask { table_id: 1024 };
+        let request = SubmitDdlTaskRequest::new(DdlTask::UndropTable(expected.clone()));
+
+        let pb = PbDdlTaskRequest::try_from(request).unwrap();
+        let pb_task = pb.task.unwrap();
+        let de = DdlTask::try_from(pb_task).unwrap();
+
+        assert!(matches!(de, DdlTask::UndropTable(task) if task == expected));
+    }
+
+    #[test]
+    fn test_purge_dropped_table_task_pb_roundtrip() {
+        let expected = PurgeDroppedTableTask { table_id: 1024 };
+        let request = SubmitDdlTaskRequest::new(DdlTask::PurgeDroppedTable(expected.clone()));
+
+        let pb = PbDdlTaskRequest::try_from(request).unwrap();
+        let pb_task = pb.task.unwrap();
+        let de = DdlTask::try_from(pb_task).unwrap();
+
+        assert!(matches!(de, DdlTask::PurgeDroppedTable(task) if task == expected));
+    }
+
+    #[test]
+    fn test_undrop_table_task_json_roundtrip() {
+        let task = UndropTableTask { table_id: 1024 };
+
+        let output = serde_json::to_vec(&task).unwrap();
+
+        let de = serde_json::from_slice(&output).unwrap();
+        assert_eq!(task, de);
+    }
+
+    #[test]
+    fn test_purge_dropped_table_task_json_roundtrip() {
+        let task = PurgeDroppedTableTask { table_id: 1024 };
 
         let output = serde_json::to_vec(&task).unwrap();
 
@@ -1902,5 +2175,11 @@ mod tests {
         assert_eq!(pb_roundtrip.extensions, pb.extensions);
         assert_eq!(pb_roundtrip.channel, pb.channel);
         assert_eq!(pb_roundtrip.snapshot_seqs, pb.snapshot_seqs);
+    }
+
+    #[test]
+    fn test_trigger_reason_deserializes_unknown_value() {
+        let reason: TriggerReason = serde_json::from_str("\"future_reason\"").unwrap();
+        assert_eq!(TriggerReason::Unknown, reason);
     }
 }

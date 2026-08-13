@@ -15,11 +15,14 @@
 use std::time::Duration;
 
 use api::v1::meta::MailboxMessage;
-use common_meta::instruction::{FlushErrorStrategy, FlushRegions, Instruction, InstructionReply};
+use common_meta::instruction::{
+    FlushErrorStrategy, FlushRegions, Instruction, InstructionError, InstructionReply,
+};
 use common_meta::peer::Peer;
 use common_telemetry::tracing_context::TracingContext;
 use common_telemetry::{info, warn};
 use snafu::ResultExt;
+use store_api::region_request::RegionFlushReason;
 use store_api::storage::RegionId;
 use tokio::time::Instant;
 
@@ -32,11 +35,48 @@ pub(crate) enum ErrorStrategy {
     Retry,
 }
 
+#[derive(Debug, Default)]
+struct FlushRegionErrors {
+    retryable: Vec<String>,
+    non_retryable: Vec<String>,
+}
+
+impl FlushRegionErrors {
+    fn is_empty(&self) -> bool {
+        self.retryable.is_empty() && self.non_retryable.is_empty()
+    }
+
+    fn format_all(&self) -> String {
+        self.retryable
+            .iter()
+            .chain(self.non_retryable.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn format_non_retryable(&self) -> String {
+        self.non_retryable.join("; ")
+    }
+}
+
+pub(crate) fn instruction_to_error(error: &InstructionError, reason: String) -> Error {
+    if error.retry_hint.is_retryable() {
+        error::RetryLaterSnafu { reason }.build()
+    } else {
+        error::UnexpectedSnafu { violated: reason }.build()
+    }
+}
+
+pub(crate) fn instruction_error_result<T>(error: &InstructionError, reason: String) -> Result<T> {
+    Err(instruction_to_error(error, reason))
+}
+
 fn handle_flush_region_reply(
     reply: &InstructionReply,
     region_ids: &[RegionId],
     msg: &MailboxMessage,
-) -> Result<(bool, Option<String>)> {
+) -> Result<(bool, Option<FlushRegionErrors>)> {
     let result = match reply {
         InstructionReply::FlushRegions(flush_reply) => {
             if flush_reply.results.len() != region_ids.len() {
@@ -53,20 +93,21 @@ fn handle_flush_region_reply(
 
             match flush_reply.overall_success {
                 true => (true, None),
-                false => (
-                    false,
-                    Some(
-                        flush_reply
-                            .results
-                            .iter()
-                            .filter_map(|(region_id, result)| match result {
-                                Ok(_) => None,
-                                Err(e) => Some(format!("{}: {:?}", region_id, e)),
-                            })
-                            .collect::<Vec<String>>()
-                            .join("; "),
-                    ),
-                ),
+                false => {
+                    let mut errors = FlushRegionErrors::default();
+                    for (region_id, result) in &flush_reply.results {
+                        let Err(error) = result else {
+                            continue;
+                        };
+                        let message = format!("{}: {:?}", region_id, error);
+                        if error.retry_hint.is_retryable() {
+                            errors.retryable.push(message);
+                        } else {
+                            errors.non_retryable.push(message);
+                        }
+                    }
+                    (false, (!errors.is_empty()).then_some(errors))
+                }
             }
         }
         _ => {
@@ -99,11 +140,12 @@ pub(crate) async fn flush_region(
     datanode: &Peer,
     timeout: Duration,
     error_strategy: ErrorStrategy,
+    reason: Option<RegionFlushReason>,
 ) -> Result<()> {
-    let flush_instruction = Instruction::FlushRegions(FlushRegions::sync_batch(
-        region_ids.to_vec(),
-        FlushErrorStrategy::TryAll,
-    ));
+    let mut flush_regions =
+        FlushRegions::sync_batch(region_ids.to_vec(), FlushErrorStrategy::TryAll);
+    flush_regions.reason = reason;
+    let flush_instruction = Instruction::FlushRegions(flush_regions);
 
     let tracing_ctx = TracingContext::from_current_span();
     let msg = MailboxMessage::json_message(
@@ -160,16 +202,29 @@ pub(crate) async fn flush_region(
                     ErrorStrategy::Ignore => {
                         warn!(
                             "Failed to flush regions {:?}, the datanode({}) error is ignored: {}",
-                            region_ids, datanode, error
+                            region_ids,
+                            datanode,
+                            error.format_all()
                         );
                     }
                     ErrorStrategy::Retry => {
+                        if !error.non_retryable.is_empty() {
+                            return error::UnexpectedSnafu {
+                                violated: format!(
+                                    "Failed to flush regions {:?}, the datanode({}) reported non-retryable errors: {}",
+                                    region_ids,
+                                    datanode,
+                                    error.format_non_retryable(),
+                                ),
+                            }
+                            .fail();
+                        }
                         return error::RetryLaterSnafu {
                             reason: format!(
                                 "Failed to flush regions {:?}, the datanode({}) error is retried: {}",
                                 region_ids,
                                 datanode,
-                                error,
+                                error.format_all(),
                             ),
                         }
                         .fail()?;
@@ -190,6 +245,23 @@ pub(crate) async fn flush_region(
             operation: "Flush regions",
         }
         .fail(),
+        Err(error::Error::MailboxChannelClosed { .. }) => match error_strategy {
+            ErrorStrategy::Ignore => {
+                warn!(
+                    "Failed to flush regions({:?}), the datanode({}) is unreachable(MailboxChannelClosed). Skip flush operation.",
+                    region_ids, datanode
+                );
+                Ok(())
+            }
+            ErrorStrategy::Retry => error::RetryLaterSnafu {
+                reason: format!(
+                    "Mailbox closed when sending flush region to datanode {:?}, elapsed: {:?}",
+                    datanode,
+                    now.elapsed()
+                ),
+            }
+            .fail()?,
+        },
         Err(err) => Err(err),
     }
 }
@@ -288,6 +360,70 @@ pub mod mock {
                 metadata: Vec::new(),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common_meta::instruction::{FlushStrategy, Instruction};
+    use common_meta::kv_backend::memory::MemoryKvBackend;
+    use common_meta::sequence::SequenceBuilder;
+
+    use super::*;
+    use crate::procedure::test_util::{MailboxContext, new_flush_region_reply_for_region};
+
+    #[tokio::test]
+    async fn test_flush_region_payload_includes_reason() {
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let mailbox_sequence = SequenceBuilder::new("test_flush_region_reason", kv_backend).build();
+        let mut mailbox_ctx = MailboxContext::new(mailbox_sequence);
+
+        let datanode = Peer::new(1, "127.0.0.1:4001");
+        let region_id = RegionId::new(1024, 1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        mailbox_ctx
+            .insert_heartbeat_response_receiver(Channel::Datanode(datanode.id), tx)
+            .await;
+
+        let mailbox = mailbox_ctx.mailbox().clone();
+        let reply_mailbox = mailbox.clone();
+        let reply_task = tokio::spawn(async move {
+            let response = rx.recv().await.unwrap().unwrap();
+            let msg = response.mailbox_message.unwrap();
+            let instruction = HeartbeatMailbox::json_instruction(&msg).unwrap();
+            let Instruction::FlushRegions(flush_regions) = instruction else {
+                panic!("Expected FlushRegions instruction");
+            };
+
+            assert_eq!(flush_regions.region_ids, vec![region_id]);
+            assert_eq!(flush_regions.strategy, FlushStrategy::Sync);
+            assert_eq!(flush_regions.reason, Some(RegionFlushReason::Repartition));
+
+            reply_mailbox
+                .on_recv(
+                    msg.id,
+                    Ok(new_flush_region_reply_for_region(
+                        msg.id, region_id, true, None,
+                    )),
+                )
+                .await
+                .unwrap();
+        });
+
+        flush_region(
+            &mailbox,
+            "127.0.0.1:3002",
+            &[region_id],
+            &datanode,
+            Duration::from_secs(5),
+            ErrorStrategy::Retry,
+            Some(RegionFlushReason::Repartition),
+        )
+        .await
+        .unwrap();
+        reply_task.await.unwrap();
     }
 }
 
@@ -410,6 +546,9 @@ pub mod test_data {
             memory_region_keeper: Arc::new(MemoryRegionKeeper::new()),
             leader_region_registry: Arc::new(LeaderRegionRegistry::default()),
             region_failure_detector_controller: Arc::new(NoopRegionFailureDetectorControl),
+            soft_drop_enabled: false,
+            soft_drop_retention: None,
+            create_database_metadata_committer: None,
         }
     }
 }

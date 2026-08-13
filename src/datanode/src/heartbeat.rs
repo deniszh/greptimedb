@@ -21,7 +21,7 @@ use api::v1::meta::heartbeat_request::NodeWorkloads;
 use api::v1::meta::{DatanodeWorkloads, HeartbeatRequest, NodeInfo, Peer, RegionRole, RegionStat};
 use common_base::Plugins;
 use common_meta::cache_invalidator::CacheInvalidatorRef;
-use common_meta::datanode::REGION_STATISTIC_KEY;
+use common_meta::datanode::{EnvVars, REGION_STATISTIC_KEY};
 use common_meta::distributed_time_constants::BASE_HEARTBEAT_INTERVAL;
 use common_meta::heartbeat::handler::invalidate_table_cache::InvalidateCacheHandler;
 use common_meta::heartbeat::handler::parse_mailbox_message::ParseMailboxMessageHandler;
@@ -66,6 +66,7 @@ pub struct HeartbeatTask {
     resp_handler_executor: HeartbeatResponseHandlerExecutorRef,
     region_alive_keeper: Arc<RegionAliveKeeper>,
     resource_stat: ResourceStatRef,
+    env_vars: EnvVars,
 }
 
 impl Drop for HeartbeatTask {
@@ -114,11 +115,13 @@ impl HeartbeatTask {
             resp_handler_executor,
             region_alive_keeper,
             resource_stat,
+            env_vars: EnvVars::from_config(&opts.heartbeat_env_vars),
         })
     }
 
     pub async fn create_streams(
         meta_client: &MetaClient,
+        local_gc_enabled: bool,
         running: Arc<AtomicBool>,
         handler_executor: HeartbeatResponseHandlerExecutorRef,
         mailbox: MailboxRef,
@@ -127,6 +130,13 @@ impl HeartbeatTask {
     ) -> Result<(HeartbeatSender, HeartbeatConfig)> {
         let client_id = meta_client.id();
         let (tx, mut rx, config) = meta_client.heartbeat().await.context(MetaClientInitSnafu)?;
+        if config.gc_enabled != local_gc_enabled {
+            return error::GcConfigMismatchSnafu {
+                metasrv_gc_enabled: config.gc_enabled,
+                datanode_gc_enabled: local_gc_enabled,
+            }
+            .fail();
+        }
 
         let mut last_received_lease = Instant::now();
 
@@ -148,9 +158,9 @@ impl HeartbeatTask {
                     let mut follower_region_lease_count = 0;
                     for lease in &lease.regions {
                         match lease.role() {
-                            RegionRole::Leader | RegionRole::DowngradingLeader => {
-                                leader_region_lease_count += 1
-                            }
+                            RegionRole::Leader
+                            | RegionRole::StagingLeader
+                            | RegionRole::DowngradingLeader => leader_region_lease_count += 1,
                             RegionRole::Follower => follower_region_lease_count += 1,
                         }
                     }
@@ -218,9 +228,17 @@ impl HeartbeatTask {
         let mailbox = Arc::new(HeartbeatMailbox::new(outgoing_tx));
 
         let quit_signal = Arc::new(Notify::new());
+        let local_gc_enabled = self
+            .region_server
+            .mito_engine()
+            .context(RegionEngineNotFoundSnafu { name: "mito" })?
+            .mito_config()
+            .gc
+            .enable;
 
         let (mut tx, config) = Self::create_streams(
             &meta_client,
+            local_gc_enabled,
             running.clone(),
             handler_executor.clone(),
             mailbox.clone(),
@@ -258,6 +276,8 @@ impl HeartbeatTask {
             .mito_engine()
             .context(RegionEngineNotFoundSnafu { name: "mito" })?
             .gc_limiter();
+        let mut env_var_extensions = HashMap::new();
+        self.env_vars.into_extensions(&mut env_var_extensions);
 
         common_runtime::spawn_hb(async move {
             let sleep = tokio::time::sleep(Duration::from_millis(0));
@@ -300,7 +320,7 @@ impl HeartbeatTask {
                         if let Some(message) = message {
                             match outgoing_message_to_mailbox_message(message) {
                                 Ok(message) => {
-                                    let mut extensions = heartbeat_request.extensions.clone();
+                                    let mut extensions = env_var_extensions.clone();
                                     let gc_stat = gc_limiter.gc_stat();
                                     gc_stat.into_extensions(&mut extensions);
 
@@ -328,7 +348,7 @@ impl HeartbeatTask {
                         let now = Instant::now();
                         let duration_since_epoch = (now - epoch).as_millis() as u64;
 
-                        let mut extensions = heartbeat_request.extensions.clone();
+                        let mut extensions = env_var_extensions.clone();
                         let gc_stat = gc_limiter.gc_stat();
                         gc_stat.into_extensions(&mut extensions);
 
@@ -364,6 +384,7 @@ impl HeartbeatTask {
                         error!(e; "Failed to send heartbeat to metasrv");
                         match Self::create_streams(
                             &meta_client,
+                            local_gc_enabled,
                             running.clone(),
                             handler_executor.clone(),
                             mailbox.clone(),
@@ -414,12 +435,10 @@ impl HeartbeatTask {
                 if let Some(serialized) = region_stat.serialize_to_vec() {
                     extensions.insert(REGION_STATISTIC_KEY.to_string(), serialized);
                 }
-
                 RegionStat {
                     region_id: stat.region_id.as_u64(),
                     engine: stat.engine,
                     role: RegionRole::from(stat.role).into(),
-                    // TODO(weny): w/rcus
                     rcus: 0,
                     wcus: 0,
                     approximate_bytes: region_stat.estimated_disk_size() as i64,

@@ -14,26 +14,29 @@
 
 use std::collections::HashMap;
 use std::fmt::{self, Display};
+use std::time::Duration;
 
-use api::helper::{ColumnDataTypeWrapper, from_pb_time_ranges};
+use api::helper::{ColumnDataTypeWrapper, from_pb_time_ranges, from_pb_time_unit};
 use api::v1::add_column_location::LocationType;
 use api::v1::column_def::{
     as_fulltext_option_analyzer, as_fulltext_option_backend, as_skipping_index_type,
 };
 use api::v1::region::bulk_insert_request::Body;
 use api::v1::region::{
-    AlterRequest, AlterRequests, BuildIndexRequest, BulkInsertRequest, CloseRequest,
-    CompactRequest, CreateRequest, CreateRequests, DeleteRequests, DropRequest, DropRequests,
-    FlushRequest, InsertRequests, OpenRequest, TruncateRequest, alter_request, compact_request,
-    region_request, truncate_request,
+    AlterRequest, AlterRequests, BuildIndexRequest, BulkInsertRequest,
+    CleanUpRequest as PbCleanUpRequest, CloseRequest, CompactRequest, CreateRequest,
+    CreateRequests, DeleteRequests, DropRequest, DropRequests, FlushRequest, InsertRequests,
+    OpenRequest, TruncateRequest, alter_request, compact_request, region_request, truncate_request,
 };
 use api::v1::{
     self, Analyzer, ArrowIpc, FulltextBackend as PbFulltextBackend, Option as PbOption, Rows,
     SemanticType, SkippingIndexType as PbSkippingIndexType, WriteHint,
 };
 pub use common_base::AffectedRows;
+use common_base::readable_size::ReadableSize;
 use common_grpc::flight::FlightDecoder;
 use common_recordbatch::DfRecordBatch;
+use common_time::range::TimestampRange;
 use common_time::{TimeToLive, Timestamp};
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{FulltextOptions, SkippingIndexOptions};
@@ -52,8 +55,9 @@ use crate::metadata::{
 use crate::metric_engine_consts::PHYSICAL_TABLE_METADATA_KEY;
 use crate::metrics;
 use crate::mito_engine_options::{
-    APPEND_MODE_KEY, SST_FORMAT_KEY, TTL_KEY, TWCS_MAX_OUTPUT_FILE_SIZE, TWCS_TIME_WINDOW,
-    TWCS_TRIGGER_FILE_NUM,
+    APPEND_MODE_KEY, AUTO_FLUSH_INTERVAL_KEY, MAX_ROW_GROUP_ROW_COUNT,
+    MAX_ROW_GROUP_ROW_COUNT_LIMIT, SKIP_WAL_KEY, SST_FORMAT_KEY, TTL_KEY,
+    TWCS_MAX_OUTPUT_FILE_SIZE, TWCS_TIME_WINDOW, TWCS_TRIGGER_FILE_NUM, WRITE_BUFFER_SIZE_KEY,
 };
 use crate::path_utils::table_dir;
 use crate::storage::{ColumnId, RegionId, ScanRequest};
@@ -144,6 +148,7 @@ pub enum RegionRequest {
     Create(RegionCreateRequest),
     Drop(RegionDropRequest),
     Open(RegionOpenRequest),
+    CleanUp(RegionCleanUpRequest),
     Close(RegionCloseRequest),
     Alter(RegionAlterRequest),
     Flush(RegionFlushRequest),
@@ -166,6 +171,7 @@ impl RegionRequest {
             region_request::Body::Create(create) => make_region_create(create),
             region_request::Body::Drop(drop) => make_region_drop(drop),
             region_request::Body::Open(open) => make_region_open(open),
+            region_request::Body::CleanUp(clean_up) => make_region_clean_up(clean_up),
             region_request::Body::Close(close) => make_region_close(close),
             region_request::Body::Alter(alter) => make_region_alter(alter),
             region_request::Body::Flush(flush) => make_region_flush(flush),
@@ -182,6 +188,10 @@ impl RegionRequest {
             .fail(),
             region_request::Body::ListMetadata(_) => UnexpectedSnafu {
                 reason: "ListMetadata request should be handled separately by RegionServer",
+            }
+            .fail(),
+            region_request::Body::RemoteDynFilter(_) => UnexpectedSnafu {
+                reason: "RemoteDynFilter request should be handled separately by RegionServer",
             }
             .fail(),
             region_request::Body::ApplyStagingManifest(apply) => {
@@ -257,6 +267,10 @@ fn parse_region_create(create: CreateRequest) -> Result<(RegionId, RegionCreateR
             table_dir,
             path_type: PathType::Bare,
             partition_expr_json,
+            requirements: create
+                .requirements
+                .map(RegionRequirements::from)
+                .unwrap_or_default(),
         },
     ))
 }
@@ -311,6 +325,21 @@ fn make_region_open(open: OpenRequest) -> Result<Vec<(RegionId, RegionRequest)>>
             options: open.options,
             skip_wal_replay: false,
             checkpoint: None,
+            requirements: Default::default(),
+        }),
+    )])
+}
+
+fn make_region_clean_up(clean_up: PbCleanUpRequest) -> Result<Vec<(RegionId, RegionRequest)>> {
+    let region_id = RegionId::from(clean_up.region_id);
+    let table_dir = table_dir(&clean_up.path, region_id.table_id());
+    Ok(vec![(
+        region_id,
+        RegionRequest::CleanUp(RegionCleanUpRequest {
+            engine: clean_up.engine,
+            table_dir,
+            path_type: PathType::Bare,
+            options: clean_up.options,
         }),
     )])
 }
@@ -319,7 +348,9 @@ fn make_region_close(close: CloseRequest) -> Result<Vec<(RegionId, RegionRequest
     let region_id = close.region_id.into();
     Ok(vec![(
         region_id,
-        RegionRequest::Close(RegionCloseRequest {}),
+        RegionRequest::Close(RegionCloseRequest {
+            flush_on_close: close.flush_on_close,
+        }),
     )])
 }
 
@@ -346,9 +377,7 @@ fn make_region_flush(flush: FlushRequest) -> Result<Vec<(RegionId, RegionRequest
     let region_id = flush.region_id.into();
     Ok(vec![(
         region_id,
-        RegionRequest::Flush(RegionFlushRequest {
-            row_group_size: None,
-        }),
+        RegionRequest::Flush(RegionFlushRequest::default()),
     )])
 }
 
@@ -363,11 +392,41 @@ fn make_region_compact(compact: CompactRequest) -> Result<Vec<(RegionId, RegionR
     } else {
         Some(compact.parallelism)
     };
+    let time_range = compact
+        .time_range
+        .map(|range| {
+            let time_unit = v1::TimeUnit::try_from(range.time_unit).map_err(|_| {
+                InvalidRegionRequestSnafu {
+                    region_id,
+                    err: format!("invalid compaction time unit: {}", range.time_unit),
+                }
+                .build()
+            })?;
+            let time_unit = from_pb_time_unit(time_unit);
+            let start = Timestamp::new(range.start, time_unit);
+            let end = Timestamp::new(range.end, time_unit);
+            ensure!(
+                start < end,
+                InvalidRegionRequestSnafu {
+                    region_id,
+                    err: format!(
+                        "compaction start time must be earlier than end time: {} >= {}",
+                        range.start, range.end
+                    ),
+                }
+            );
+            TimestampRange::new(start, end).with_context(|| InvalidRegionRequestSnafu {
+                region_id,
+                err: "invalid compaction time range".to_string(),
+            })
+        })
+        .transpose()?;
     Ok(vec![(
         region_id,
         RegionRequest::Compact(RegionCompactRequest {
             options,
             parallelism,
+            time_range,
         }),
     )])
 }
@@ -399,6 +458,10 @@ fn make_region_truncate(truncate: TruncateRequest) -> Result<Vec<(RegionId, Regi
                 RegionRequest::Truncate(RegionTruncateRequest::ByTimeRanges { time_ranges }),
             )])
         }
+        Some(truncate_request::Kind::Unflushed(_)) => Ok(vec![(
+            region_id,
+            RegionRequest::Truncate(RegionTruncateRequest::Unflushed),
+        )]),
     }
 }
 
@@ -406,6 +469,7 @@ fn make_region_truncate(truncate: TruncateRequest) -> Result<Vec<(RegionId, Regi
 fn make_region_bulk_inserts(request: BulkInsertRequest) -> Result<Vec<(RegionId, RegionRequest)>> {
     let region_id = request.region_id.into();
     let partition_expr_version = request.partition_expr_version.map(|v| v.value);
+    let aligned_schema_version = request.aligned_schema_version.map(|v| v.schema_version);
     let Some(Body::ArrowIpc(request)) = request.body else {
         return Ok(vec![]);
     };
@@ -426,6 +490,7 @@ fn make_region_bulk_inserts(request: BulkInsertRequest) -> Result<Vec<(RegionId,
             payload,
             raw_data: request,
             partition_expr_version,
+            aligned_schema_version,
         }),
     )])
 }
@@ -495,6 +560,8 @@ pub struct RegionCreateRequest {
     /// Partition expression JSON from table metadata. Set to empty string for a region without partition.
     /// `Option` to keep compatibility with old clients.
     pub partition_expr_json: Option<String>,
+    /// Requirements for creating the region.
+    pub requirements: RegionRequirements,
 }
 
 impl RegionCreateRequest {
@@ -564,6 +631,44 @@ pub struct RegionDropRequest {
     pub partial_drop: bool,
 }
 
+/// Requirements for a region request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RegionRequirements {
+    /// Whether the region data must be backed by object storage.
+    pub object_storage: bool,
+}
+
+impl RegionRequirements {
+    /// Returns empty requirements.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Returns requirements for object storage.
+    pub fn object_storage() -> Self {
+        Self {
+            object_storage: true,
+        }
+    }
+}
+
+impl From<api::v1::region::RegionRequirements> for RegionRequirements {
+    fn from(value: api::v1::region::RegionRequirements) -> Self {
+        Self {
+            object_storage: value.object_storage,
+        }
+    }
+}
+
+impl From<RegionRequirements> for api::v1::region::RegionRequirements {
+    fn from(value: RegionRequirements) -> Self {
+        Self {
+            object_storage: value.object_storage,
+        }
+    }
+}
+
 /// Open region request.
 #[derive(Debug, Clone)]
 pub struct RegionOpenRequest {
@@ -579,6 +684,8 @@ pub struct RegionOpenRequest {
     pub skip_wal_replay: bool,
     /// Replay checkpoint.
     pub checkpoint: Option<ReplayCheckpoint>,
+    /// Requirements for opening the region.
+    pub requirements: RegionRequirements,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -594,9 +701,32 @@ impl RegionOpenRequest {
     }
 }
 
+/// Offline region cleanup request.
+#[derive(Debug, Clone)]
+pub struct RegionCleanUpRequest {
+    /// Region engine name
+    pub engine: String,
+    /// Directory for table's data home. Usually is composed by catalog and table id
+    pub table_dir: String,
+    /// Path type for generating paths
+    pub path_type: PathType,
+    /// Options of the cleaned region.
+    pub options: HashMap<String, String>,
+}
+
+impl RegionCleanUpRequest {
+    /// Returns true when the region belongs to the metric engine's physical table.
+    pub fn is_physical_table(&self) -> bool {
+        self.options.contains_key(PHYSICAL_TABLE_METADATA_KEY)
+    }
+}
+
 /// Close region request.
-#[derive(Debug)]
-pub struct RegionCloseRequest {}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RegionCloseRequest {
+    /// Whether to flush the region before closing it.
+    pub flush_on_close: bool,
+}
 
 /// Alter metadata of a region.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1310,8 +1440,13 @@ impl From<v1::ModifyColumnType> for ModifyColumnType {
     }
 }
 
+/// Region option changes used by ALTER requests.
+///
+/// This type currently derives serde for request persistence. Keep future changes
+/// backward compatible with previously serialized variants.
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub enum SetRegionOption {
+    WriteBufferSize(Option<ReadableSize>),
     Ttl(Option<TimeToLive>),
     // Modifying TwscOptions with values as (option name, new value).
     Twsc(String, String),
@@ -1319,6 +1454,12 @@ pub enum SetRegionOption {
     Format(String),
     // Modifying the append mode.
     AppendMode(bool),
+    // Modifying the per-region auto flush interval override.
+    AutoFlushInterval(Option<Duration>),
+    // Modifying the max number of rows in a parquet row group.
+    MaxRowGroupRowCount(Option<usize>),
+    // Stops writing new WAL entries. This operation is irreversible.
+    SkipWal,
 }
 
 impl TryFrom<&PbOption> for SetRegionOption {
@@ -1327,6 +1468,12 @@ impl TryFrom<&PbOption> for SetRegionOption {
     fn try_from(value: &PbOption) -> std::result::Result<Self, Self::Error> {
         let PbOption { key, value } = value;
         match key.as_str() {
+            WRITE_BUFFER_SIZE_KEY => {
+                let size = value
+                    .parse::<ReadableSize>()
+                    .map_err(|_| InvalidSetRegionOptionRequestSnafu { key, value }.build())?;
+                Ok(Self::WriteBufferSize(Some(size)))
+            }
             TTL_KEY => {
                 let ttl = TimeToLive::from_humantime_or_str(value)
                     .map_err(|_| InvalidSetRegionOptionRequestSnafu { key, value }.build())?;
@@ -1343,6 +1490,34 @@ impl TryFrom<&PbOption> for SetRegionOption {
                     .map_err(|_| InvalidSetRegionOptionRequestSnafu { key, value }.build())?;
                 Ok(Self::AppendMode(append_mode))
             }
+            AUTO_FLUSH_INTERVAL_KEY => {
+                if value.is_empty() {
+                    // SET 'auto_flush_interval' = NULL comes through as an empty
+                    // string; treat it as clearing the override (fall back to
+                    // the global default), same as Ttl.
+                    return Ok(Self::AutoFlushInterval(None));
+                }
+                let interval = humantime::parse_duration(value)
+                    .map_err(|_| InvalidSetRegionOptionRequestSnafu { key, value }.build())?;
+                if interval <= Duration::ZERO {
+                    return InvalidSetRegionOptionRequestSnafu { key, value }.fail();
+                }
+                Ok(Self::AutoFlushInterval(Some(interval)))
+            }
+            MAX_ROW_GROUP_ROW_COUNT => {
+                if value.is_empty() {
+                    return Ok(Self::MaxRowGroupRowCount(None));
+                }
+                let row_count = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|row_count| {
+                        *row_count > 0 && *row_count <= MAX_ROW_GROUP_ROW_COUNT_LIMIT
+                    })
+                    .ok_or_else(|| InvalidSetRegionOptionRequestSnafu { key, value }.build())?;
+                Ok(Self::MaxRowGroupRowCount(Some(row_count)))
+            }
+            SKIP_WAL_KEY if value == "true" => Ok(Self::SkipWal),
             _ => InvalidSetRegionOptionRequestSnafu { key, value }.fail(),
         }
     }
@@ -1361,6 +1536,8 @@ impl From<&UnsetRegionOption> for SetRegionOption {
                 SetRegionOption::Twsc(unset_option.to_string(), String::new())
             }
             UnsetRegionOption::Ttl => SetRegionOption::Ttl(Default::default()),
+            UnsetRegionOption::MaxRowGroupRowCount => SetRegionOption::MaxRowGroupRowCount(None),
+            UnsetRegionOption::WriteBufferSize => SetRegionOption::WriteBufferSize(None),
         }
     }
 }
@@ -1371,9 +1548,11 @@ impl TryFrom<&str> for UnsetRegionOption {
     fn try_from(key: &str) -> Result<Self> {
         match key.to_ascii_lowercase().as_str() {
             TTL_KEY => Ok(Self::Ttl),
+            WRITE_BUFFER_SIZE_KEY => Ok(Self::WriteBufferSize),
             TWCS_TRIGGER_FILE_NUM => Ok(Self::TwcsTriggerFileNum),
             TWCS_MAX_OUTPUT_FILE_SIZE => Ok(Self::TwcsMaxOutputFileSize),
             TWCS_TIME_WINDOW => Ok(Self::TwcsTimeWindow),
+            MAX_ROW_GROUP_ROW_COUNT => Ok(Self::MaxRowGroupRowCount),
             _ => InvalidUnsetRegionOptionRequestSnafu { key }.fail(),
         }
     }
@@ -1385,15 +1564,19 @@ pub enum UnsetRegionOption {
     TwcsMaxOutputFileSize,
     TwcsTimeWindow,
     Ttl,
+    MaxRowGroupRowCount,
+    WriteBufferSize,
 }
 
 impl UnsetRegionOption {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Ttl => TTL_KEY,
+            Self::WriteBufferSize => WRITE_BUFFER_SIZE_KEY,
             Self::TwcsTriggerFileNum => TWCS_TRIGGER_FILE_NUM,
             Self::TwcsMaxOutputFileSize => TWCS_MAX_OUTPUT_FILE_SIZE,
             Self::TwcsTimeWindow => TWCS_TIME_WINDOW,
+            Self::MaxRowGroupRowCount => MAX_ROW_GROUP_ROW_COUNT,
         }
     }
 }
@@ -1404,15 +1587,31 @@ impl Display for UnsetRegionOption {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegionFlushReason {
+    /// Flush triggered before region migration.
+    RegionMigration,
+    /// Flush triggered by repartition procedure.
+    Repartition,
+    /// Flush triggered by remote WAL pruning.
+    RemoteWalPrune,
+    /// Flush region before closing region.
+    Closing,
+    /// Flush region before downgrading region.
+    Downgrading,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RegionFlushRequest {
     pub row_group_size: Option<usize>,
+    pub reason: Option<RegionFlushReason>,
 }
 
 #[derive(Debug)]
 pub struct RegionCompactRequest {
     pub options: compact_request::Options,
     pub parallelism: Option<u32>,
+    pub time_range: Option<TimestampRange>,
 }
 
 impl Default for RegionCompactRequest {
@@ -1421,6 +1620,7 @@ impl Default for RegionCompactRequest {
             // Default to regular compaction.
             options: compact_request::Options::Regular(Default::default()),
             parallelism: None,
+            time_range: None,
         }
     }
 }
@@ -1433,6 +1633,16 @@ pub struct RegionBuildIndexRequest {}
 pub enum RegionTruncateRequest {
     /// Truncate all data in the region.
     All,
+    /// Discard all unflushed data while preserving persisted SST files.
+    ///
+    /// This destroys the region's in-memory data irreversibly. Persisted SST files and
+    /// the writable state are preserved, and the WAL is obsoleted up to the discard point
+    /// so a restart won't replay the discarded data.
+    ///
+    /// An error may be returned after the data has already been discarded, because the
+    /// WAL is obsoleted last. Retrying is safe: a request against a region with nothing
+    /// left to discard only re-attempts the WAL obsoletion.
+    Unflushed,
     ByTimeRanges {
         /// Time ranges to truncate. Both bound are inclusive.
         /// only files that are fully contained in the time range will be truncated.
@@ -1468,6 +1678,7 @@ pub struct RegionBulkInsertsRequest {
     pub payload: DfRecordBatch,
     pub raw_data: ArrowIpc,
     pub partition_expr_version: Option<u64>,
+    pub aligned_schema_version: Option<u64>,
 }
 
 impl RegionBulkInsertsRequest {
@@ -1549,6 +1760,7 @@ impl fmt::Display for RegionRequest {
             RegionRequest::Create(_) => write!(f, "Create"),
             RegionRequest::Drop(_) => write!(f, "Drop"),
             RegionRequest::Open(_) => write!(f, "Open"),
+            RegionRequest::CleanUp(_) => write!(f, "CleanUp"),
             RegionRequest::Close(_) => write!(f, "Close"),
             RegionRequest::Alter(_) => write!(f, "Alter"),
             RegionRequest::Flush(_) => write!(f, "Flush"),
@@ -1568,11 +1780,75 @@ mod tests {
 
     use api::v1::region::RegionColumnDef;
     use api::v1::{ColumnDataType, ColumnDef};
+    use common_time::range::TimestampRange;
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::{ColumnSchema, FulltextAnalyzer, FulltextBackend};
 
     use super::*;
     use crate::metadata::RegionMetadataBuilder;
+
+    #[test]
+    fn test_make_region_compact_with_time_range() {
+        let requests = make_region_compact(CompactRequest {
+            region_id: 42,
+            time_range: Some(api::v1::region::CompactionTimeRange {
+                start: 1_000,
+                end: 2_000,
+                time_unit: api::v1::TimeUnit::Microsecond as i32,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let RegionRequest::Compact(request) = &requests[0].1 else {
+            unreachable!();
+        };
+        assert_eq!(
+            Some(
+                TimestampRange::new(
+                    Timestamp::new_microsecond(1_000),
+                    Timestamp::new_microsecond(2_000),
+                )
+                .unwrap()
+            ),
+            request.time_range
+        );
+    }
+
+    #[test]
+    fn test_make_region_truncate_unflushed() {
+        let region_id = RegionId::new(42, 3);
+        let requests =
+            RegionRequest::try_from_request_body(region_request::Body::Truncate(TruncateRequest {
+                region_id: region_id.as_u64(),
+                kind: Some(truncate_request::Kind::Unflushed(
+                    api::v1::region::Unflushed {},
+                )),
+            }))
+            .unwrap();
+
+        assert_eq!(region_id, requests[0].0);
+        assert!(matches!(
+            requests[0].1,
+            RegionRequest::Truncate(RegionTruncateRequest::Unflushed)
+        ));
+    }
+
+    #[test]
+    fn test_make_region_truncate_requires_kind() {
+        let error =
+            RegionRequest::try_from_request_body(region_request::Body::Truncate(TruncateRequest {
+                region_id: RegionId::new(42, 3).as_u64(),
+                kind: None,
+            }))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing kind in TruncateRequest")
+        );
+    }
 
     #[test]
     fn test_from_proto_location() {
@@ -1609,6 +1885,104 @@ mod tests {
             location: None,
         })
         .unwrap_err();
+    }
+
+    #[test]
+    fn test_set_region_option_auto_flush_interval_try_from() {
+        use std::time::Duration;
+
+        // Valid duration
+        let pb = PbOption {
+            key: "auto_flush_interval".to_string(),
+            value: "5m".to_string(),
+        };
+        let opt = SetRegionOption::try_from(&pb).unwrap();
+        assert_eq!(
+            opt,
+            SetRegionOption::AutoFlushInterval(Some(Duration::from_secs(300)))
+        );
+
+        // Empty value clears the override (mirrors Ttl's behaviour for `SET key = NULL`).
+        let pb = PbOption {
+            key: "auto_flush_interval".to_string(),
+            value: String::new(),
+        };
+        let opt = SetRegionOption::try_from(&pb).unwrap();
+        assert_eq!(opt, SetRegionOption::AutoFlushInterval(None));
+
+        // Zero is rejected up front (engine invariant).
+        let pb = PbOption {
+            key: "auto_flush_interval".to_string(),
+            value: "0s".to_string(),
+        };
+        assert!(SetRegionOption::try_from(&pb).is_err());
+
+        // Garbage value is rejected.
+        let pb = PbOption {
+            key: "auto_flush_interval".to_string(),
+            value: "not_a_duration".to_string(),
+        };
+        assert!(SetRegionOption::try_from(&pb).is_err());
+    }
+
+    #[test]
+    fn test_set_region_option_skip_wal_try_from() {
+        let pb = PbOption {
+            key: SKIP_WAL_KEY.to_string(),
+            value: "true".to_string(),
+        };
+        assert_eq!(
+            SetRegionOption::SkipWal,
+            SetRegionOption::try_from(&pb).unwrap()
+        );
+
+        for value in ["false", "", "invalid"] {
+            let pb = PbOption {
+                key: SKIP_WAL_KEY.to_string(),
+                value: value.to_string(),
+            };
+            assert!(SetRegionOption::try_from(&pb).is_err());
+        }
+
+        assert!(UnsetRegionOption::try_from(SKIP_WAL_KEY).is_err());
+    }
+
+    #[test]
+    fn test_set_region_option_max_row_group_row_count_try_from() {
+        let pb = PbOption {
+            key: MAX_ROW_GROUP_ROW_COUNT.to_string(),
+            value: "512".to_string(),
+        };
+        assert_eq!(
+            SetRegionOption::MaxRowGroupRowCount(Some(512)),
+            SetRegionOption::try_from(&pb).unwrap()
+        );
+
+        let pb = PbOption {
+            key: MAX_ROW_GROUP_ROW_COUNT.to_string(),
+            value: String::new(),
+        };
+        assert_eq!(
+            SetRegionOption::MaxRowGroupRowCount(None),
+            SetRegionOption::try_from(&pb).unwrap()
+        );
+
+        for value in [
+            "0".to_string(),
+            (MAX_ROW_GROUP_ROW_COUNT_LIMIT + 1).to_string(),
+            "invalid".to_string(),
+        ] {
+            let pb = PbOption {
+                key: MAX_ROW_GROUP_ROW_COUNT.to_string(),
+                value,
+            };
+            assert!(SetRegionOption::try_from(&pb).is_err());
+        }
+
+        assert_eq!(
+            UnsetRegionOption::MaxRowGroupRowCount,
+            UnsetRegionOption::try_from(MAX_ROW_GROUP_ROW_COUNT).unwrap()
+        );
     }
 
     #[test]
@@ -1664,6 +2038,41 @@ mod tests {
                     }]
                 },
             }
+        );
+    }
+
+    #[test]
+    fn test_write_buffer_size_region_options() {
+        let option = PbOption {
+            key: WRITE_BUFFER_SIZE_KEY.to_string(),
+            value: "128MiB".to_string(),
+        };
+        assert_eq!(
+            SetRegionOption::WriteBufferSize(Some(ReadableSize::mb(128))),
+            SetRegionOption::try_from(&option).unwrap()
+        );
+
+        let option = PbOption {
+            key: WRITE_BUFFER_SIZE_KEY.to_string(),
+            value: "invalid".to_string(),
+        };
+        SetRegionOption::try_from(&option).unwrap_err();
+
+        // Clearing the option uses UNSET. Empty SET values, including SQL NULL,
+        // remain invalid because the SQL layer does not distinguish NULL from ''.
+        let option = PbOption {
+            key: WRITE_BUFFER_SIZE_KEY.to_string(),
+            value: String::new(),
+        };
+        SetRegionOption::try_from(&option).unwrap_err();
+
+        assert_eq!(
+            UnsetRegionOption::WriteBufferSize,
+            UnsetRegionOption::try_from(WRITE_BUFFER_SIZE_KEY).unwrap()
+        );
+        assert_eq!(
+            SetRegionOption::WriteBufferSize(None),
+            SetRegionOption::from(&UnsetRegionOption::WriteBufferSize)
         );
     }
 
@@ -2020,9 +2429,78 @@ mod tests {
             table_dir: "path".to_string(),
             path_type: PathType::Bare,
             partition_expr_json: Some("".to_string()),
+            requirements: Default::default(),
         };
 
         assert!(create.validate().is_err());
+    }
+
+    #[test]
+    fn test_parse_create_region_requirements_defaults_to_empty() {
+        let create = CreateRequest {
+            region_id: RegionId::new(42, 0).as_u64(),
+            engine: "mito".to_string(),
+            column_defs: vec![],
+            primary_key: vec![],
+            path: "test".to_string(),
+            options: HashMap::new(),
+            partition: None,
+            requirements: None,
+        };
+
+        let requests =
+            RegionRequest::try_from_request_body(region_request::Body::Create(create)).unwrap();
+        let RegionRequest::Create(request) = &requests[0].1 else {
+            unreachable!()
+        };
+
+        assert_eq!(request.requirements, RegionRequirements::empty());
+    }
+
+    #[test]
+    fn test_parse_create_region_requirements_from_proto() {
+        let create = CreateRequest {
+            region_id: RegionId::new(42, 0).as_u64(),
+            engine: "mito".to_string(),
+            column_defs: vec![],
+            primary_key: vec![],
+            path: "test".to_string(),
+            options: HashMap::new(),
+            partition: None,
+            requirements: Some(api::v1::region::RegionRequirements {
+                object_storage: true,
+            }),
+        };
+
+        let requests =
+            RegionRequest::try_from_request_body(region_request::Body::Create(create)).unwrap();
+        let RegionRequest::Create(request) = &requests[0].1 else {
+            unreachable!()
+        };
+
+        assert_eq!(request.requirements, RegionRequirements::object_storage());
+    }
+
+    #[test]
+    fn test_parse_region_cleanup_from_proto() {
+        let clean_up = api::v1::region::CleanUpRequest {
+            region_id: RegionId::new(42, 3).as_u64(),
+            engine: "mito".to_string(),
+            path: "test".to_string(),
+            options: HashMap::from([("k".to_string(), "v".to_string())]),
+        };
+
+        let requests =
+            RegionRequest::try_from_request_body(region_request::Body::CleanUp(clean_up)).unwrap();
+        let RegionRequest::CleanUp(request) = &requests[0].1 else {
+            unreachable!()
+        };
+
+        assert_eq!(requests[0].0, RegionId::new(42, 3));
+        assert_eq!(request.engine, "mito");
+        assert_eq!(request.table_dir, "data/test/42/");
+        assert_eq!(request.path_type, PathType::Bare);
+        assert_eq!(request.options.get("k"), Some(&"v".to_string()));
     }
 
     #[test]

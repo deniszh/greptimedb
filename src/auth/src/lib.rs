@@ -22,13 +22,23 @@ mod user_provider;
 pub mod tests;
 
 pub use common::{
-    HashedPassword, Identity, Password, auth_mysql, static_user_provider_from_option,
-    user_provider_from_option, userinfo_by_name,
+    DEFAULT_PBKDF2_SHA256_ITERATIONS, DEFAULT_PBKDF2_SHA256_SALT_LEN, HashedPassword, Identity,
+    MAX_PBKDF2_SHA256_ITERATIONS, MAX_PBKDF2_SHA256_SALT_LEN, PBKDF2_SHA256_HASH_LEN,
+    PG_SCRAM_SHA256_KEY_LEN, Password, PgScramSha256Verifier, auth_mysql,
+    format_mysql_native_password_verifier, format_pbkdf2_sha256_password_verifier,
+    format_pg_scram_sha256_password_verifier, mysql_native_password_hash,
+    static_user_provider_from_option, user_provider_from_option, userinfo_by_name,
 };
-pub use permission::{DefaultPermissionChecker, PermissionChecker, PermissionReq, PermissionResp};
+pub use permission::{
+    ALL_ACTIONS, AccessMode, DASHBOARD_DELETE, DASHBOARD_QUERY, DASHBOARD_SAVE,
+    DefaultPermissionChecker, INFLUXDB_WRITE, JAEGER_QUERY, LOG_QUERY, LOG_WRITE, OPENTSDB_WRITE,
+    OTLP_WRITE, PIPELINE_DELETE, PIPELINE_INSERT, PIPELINE_QUERY, PROM_STORE_READ,
+    PROM_STORE_WRITE, PROMQL_QUERY, PermissionAction, PermissionChecker, PermissionReq,
+    PermissionResp, PermissionTableTarget, PermissionTableTargets, SEMANTIC_GRAPH_QUERY,
+};
 pub use user_info::UserInfo;
-pub use user_provider::UserProvider;
 pub use user_provider::static_user_provider::StaticUserProvider;
+pub use user_provider::{PgAuthInfo, UserProvider};
 
 /// pub type alias
 pub type UserInfoRef = std::sync::Arc<dyn UserInfo>;

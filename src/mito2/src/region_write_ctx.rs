@@ -199,10 +199,24 @@ impl RegionWriteCtx {
         &self.version
     }
 
+    /// Returns the version control of the region.
+    #[cfg(test)]
+    pub(crate) fn version_control(&self) -> &VersionControlRef {
+        &self.version_control
+    }
+
+    /// Returns whether writes in this context should skip WAL.
+    pub(crate) fn skip_wal(&self) -> bool {
+        self.provider == Provider::Noop || self.version.options.skip_wal
+    }
+
     /// Sets error and marks all write operations are failed.
     pub(crate) fn set_error(&mut self, err: Arc<Error>) {
-        // Set error for all notifiers
+        // Set error for all notifiers.
         for notify in &mut self.notifiers {
+            notify.err = Some(err.clone());
+        }
+        for notify in &mut self.bulk_notifiers {
             notify.err = Some(err.clone());
         }
 
@@ -210,9 +224,20 @@ impl RegionWriteCtx {
         self.failed = true;
     }
 
+    /// Returns whether the write operation is already marked as failed.
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed
+    }
+
     /// Updates next entry id.
     pub(crate) fn set_next_entry_id(&mut self, next_entry_id: EntryId) {
         self.next_entry_id = next_entry_id
+    }
+
+    /// Returns the next entry id to write.
+    #[cfg(test)]
+    pub(crate) fn next_entry_id(&self) -> EntryId {
+        self.next_entry_id
     }
 
     /// Consumes mutations and writes them into mutable memtable.
@@ -267,10 +292,6 @@ impl RegionWriteCtx {
             let bytes = new_memory_usage.saturating_sub(prev_memory_usage.unwrap_or_default());
             written_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         }
-        // Updates region sequence and entry id. Since we stores last sequence and entry id in region, we need
-        // to decrease `next_sequence` and `next_entry_id` by 1.
-        self.version_control
-            .set_sequence_and_entry_id(self.next_sequence - 1, self.next_entry_id - 1);
     }
 
     pub(crate) fn push_bulk(
@@ -305,6 +326,8 @@ impl RegionWriteCtx {
         if self.failed || self.bulk_parts.is_empty() {
             return;
         }
+        #[cfg(test)]
+        test_hooks::pause_before_bulk_install(self.region_id).await;
         let _timer = metrics::REGION_WORKER_HANDLE_WRITE_ELAPSED
             .with_label_values(&["write_bulk"])
             .start_timer();
@@ -350,7 +373,218 @@ impl RegionWriteCtx {
             let bytes = new_memory_usage.saturating_sub(prev_memory_usage.unwrap_or_default());
             written_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         }
+    }
+
+    /// Publishes the sequences and entry id assigned by this context to the
+    /// region's committed watermark.
+    ///
+    /// Must be called after both [`write_memtable`](Self::write_memtable) and
+    /// [`write_bulk`](Self::write_bulk) have completed, so the committed
+    /// sequence never covers rows that are not yet physically installed in the
+    /// memtable (bulk part sequences are assigned in [`push_bulk`](Self::push_bulk)
+    /// before installation). Since we store the last sequence and entry id in
+    /// the region, we decrease `next_sequence` and `next_entry_id` by 1.
+    ///
+    /// If the write operation failed (e.g. the WAL entry could not be built),
+    /// no rows were installed and nothing must be published: advancing the
+    /// committed watermark here would make it cover rows that were never
+    /// written.
+    pub(crate) fn publish_sequence_and_entry_id(&self) {
+        if self.failed {
+            return;
+        }
         self.version_control
             .set_sequence_and_entry_id(self.next_sequence - 1, self.next_entry_id - 1);
+    }
+}
+
+/// Test-only hooks to make write ordering races deterministic.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use store_api::storage::RegionId;
+    use tokio::sync::watch;
+
+    /// Channels of an armed bulk-install barrier.
+    ///
+    /// `reached` signals that a bulk write paused between ordinary-memtable
+    /// handling and bulk installation; `release` unblocks it. Dropping the
+    /// senders (by disarming the barrier) also unblocks paused writes because
+    /// their `wait_for` fails on a closed channel.
+    struct ActiveBarrier {
+        id: u64,
+        /// Only bulk writes for this region pause at the barrier; writes for
+        /// other regions pass through untouched, so concurrently running tests
+        /// can never satisfy (or be blocked by) each other's barrier.
+        target_region_id: RegionId,
+        reached: watch::Sender<bool>,
+        release: watch::Sender<bool>,
+    }
+
+    /// The currently armed barrier, if any. Wrapped in a `Mutex` so a test can
+    /// arm a fresh barrier after a previous one was released (or dropped), and
+    /// so a barrier can never leak past the test that owns it.
+    static ACTIVE_BARRIER: Mutex<Option<ActiveBarrier>> = Mutex::new(None);
+    static NEXT_BARRIER_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn lock_active_barrier() -> std::sync::MutexGuard<'static, Option<ActiveBarrier>> {
+        // Never let a poisoned mutex (e.g. a panic in another test while
+        // holding the lock) hang or break unrelated tests.
+        ACTIVE_BARRIER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// RAII guard for the bulk-install barrier.
+    ///
+    /// The guard owns the armed barrier. Releasing it — or dropping the guard,
+    /// e.g. when a test panics — unblocks any write paused at the barrier and
+    /// disarms it, so a paused write can never hang and later tests can arm a
+    /// fresh barrier.
+    pub(crate) struct BulkInstallBarrier {
+        id: u64,
+        reached_rx: watch::Receiver<bool>,
+        release_tx: watch::Sender<bool>,
+        released: bool,
+    }
+
+    impl BulkInstallBarrier {
+        /// Waits until a bulk write paused at the barrier.
+        pub(crate) async fn wait_until_reached(&mut self) {
+            if !*self.reached_rx.borrow() {
+                let _ = self.reached_rx.wait_for(|reached| *reached).await;
+            }
+        }
+
+        /// Unblocks the paused write and disarms the barrier.
+        pub(crate) fn release(&mut self) {
+            if self.released {
+                return;
+            }
+            self.released = true;
+            // Flip the release value so writes paused on this barrier proceed.
+            let _ = self.release_tx.send(true);
+            disarm_barrier(self.id);
+        }
+    }
+
+    impl Drop for BulkInstallBarrier {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    /// Arms the bulk-install barrier for `target_region_id` and returns a
+    /// guard that owns it.
+    ///
+    /// Any previously armed barrier is replaced: its senders are dropped, which
+    /// unblocks writes that were paused on it instead of letting them hang.
+    pub(crate) fn arm_bulk_install_barrier(target_region_id: RegionId) -> BulkInstallBarrier {
+        let (reached_tx, reached_rx) = watch::channel(false);
+        let (release_tx, _release_rx) = watch::channel(false);
+        let id = NEXT_BARRIER_ID.fetch_add(1, Ordering::Relaxed);
+        let mut active = lock_active_barrier();
+        *active = Some(ActiveBarrier {
+            id,
+            target_region_id,
+            reached: reached_tx,
+            release: release_tx.clone(),
+        });
+        BulkInstallBarrier {
+            id,
+            reached_rx,
+            release_tx,
+            released: false,
+        }
+    }
+
+    /// Removes the barrier with `id` from the statics if it is still active.
+    fn disarm_barrier(id: u64) {
+        let mut active = lock_active_barrier();
+        if active.as_ref().is_some_and(|barrier| barrier.id == id) {
+            *active = None;
+        }
+    }
+
+    /// Pauses a bulk write for `region_id` before installing its parts until
+    /// the test releases the barrier (or it is disarmed). Bulk writes for
+    /// other regions return immediately.
+    pub(crate) async fn pause_before_bulk_install(region_id: RegionId) {
+        let (reached_tx, release_rx) = {
+            let active = lock_active_barrier();
+            match active.as_ref() {
+                Some(barrier) if barrier.target_region_id == region_id => {
+                    (barrier.reached.clone(), barrier.release.subscribe())
+                }
+                _ => return,
+            }
+        };
+        // Signal that a bulk write reached the pause point.
+        let _ = reached_tx.send(true);
+        let mut release_rx = release_rx;
+        if !*release_rx.borrow() {
+            // The sender is dropped when the barrier is disarmed, which makes
+            // `wait_for` return an error instead of hanging forever.
+            let _ = release_rx.wait_for(|released| *released).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common_recordbatch::DfRecordBatch;
+    use datatypes::arrow::array::{ArrayRef, TimestampMillisecondArray};
+    use datatypes::arrow::datatypes::{DataType, Field, Schema};
+    use store_api::logstore::provider::Provider;
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::error::UnexpectedSnafu;
+    use crate::memtable::bulk::part::BulkPart;
+    use crate::test_util::version_util::VersionControlBuilder;
+
+    #[test]
+    fn test_set_error_marks_bulk_notifiers_failed() {
+        let builder = VersionControlBuilder::new();
+        let region_id = builder.region_id();
+        let version_control = Arc::new(builder.build());
+        let mut ctx =
+            RegionWriteCtx::new(region_id, &version_control, Provider::noop_provider(), None);
+        let (tx, rx) = oneshot::channel();
+
+        assert!(ctx.push_bulk(OptionOutputTx::from(tx), new_bulk_part(), None));
+        ctx.set_error(Arc::new(
+            UnexpectedSnafu {
+                reason: "wal failed".to_string(),
+            }
+            .build(),
+        ));
+        drop(ctx);
+
+        let result = rx.blocking_recv().unwrap();
+        assert!(result.is_err(), "bulk notifier should report WAL error");
+    }
+
+    fn new_bulk_part() -> BulkPart {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(datatypes::arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        )]));
+        let arrays = vec![Arc::new(TimestampMillisecondArray::from(vec![1, 2])) as ArrayRef];
+        let batch = DfRecordBatch::try_new(schema, arrays).unwrap();
+
+        BulkPart {
+            batch,
+            max_timestamp: 2,
+            min_timestamp: 1,
+            sequence: 0,
+            timestamp_index: 0,
+            raw_data: None,
+        }
     }
 }

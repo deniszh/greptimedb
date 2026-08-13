@@ -17,6 +17,9 @@
 //! This module provides a unified interface for reading and writing snapshot data
 //! to various storage backends (S3, OSS, GCS, Azure Blob, local filesystem).
 
+use std::collections::BTreeSet;
+use std::path::Component;
+
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use object_store::services::{Azblob, Fs, Gcs, Oss, S3};
@@ -75,7 +78,10 @@ impl StorageScheme {
 }
 
 /// Extracts bucket/container and root path from a URI.
-fn extract_remote_location(uri: &str) -> Result<RemoteLocation> {
+fn extract_remote_location_with_root_policy(
+    uri: &str,
+    allow_empty_root: bool,
+) -> Result<RemoteLocation> {
     let url = Url::parse(uri).context(UrlParseSnafu)?;
     let bucket_or_container = url.host_str().unwrap_or("").to_string();
     if bucket_or_container.is_empty() {
@@ -87,7 +93,7 @@ fn extract_remote_location(uri: &str) -> Result<RemoteLocation> {
     }
 
     let root = url.path().trim_start_matches('/').to_string();
-    if root.is_empty() {
+    if root.is_empty() && !allow_empty_root {
         return InvalidUriSnafu {
             uri,
             reason: "snapshot URI must include a non-empty path after the bucket/container",
@@ -124,6 +130,92 @@ pub fn validate_uri(uri: &str) -> Result<StorageScheme> {
     }
 
     StorageScheme::from_uri(uri)
+}
+
+/// Validates a URI for snapshot-scoped destructive operations.
+///
+/// Unlike read-only parent scans, destructive commands must target a concrete
+/// snapshot directory instead of a bucket/container root or filesystem root.
+/// Remote storage buckets/containers already provide namespace isolation, so a
+/// non-empty object prefix is enough; local filesystem paths require at least
+/// two non-root path segments to avoid deleting broad system directories.
+pub fn validate_snapshot_uri(uri: &str) -> Result<StorageScheme> {
+    let scheme = validate_uri(uri)?;
+    reject_query_or_fragment(uri)?;
+    match scheme {
+        StorageScheme::File => validate_file_snapshot_uri(uri)?,
+        StorageScheme::S3 | StorageScheme::Oss | StorageScheme::Gcs | StorageScheme::Azblob => {
+            extract_remote_location_with_root_policy(uri, false)?;
+        }
+    }
+    Ok(scheme)
+}
+
+fn reject_query_or_fragment(uri: &str) -> Result<()> {
+    let url = Url::parse(uri).context(UrlParseSnafu)?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return InvalidUriSnafu {
+            uri,
+            reason: "snapshot URI must not include query or fragment",
+        }
+        .fail();
+    }
+
+    Ok(())
+}
+
+fn validate_file_snapshot_uri(uri: &str) -> Result<()> {
+    if has_explicit_dot_segment(uri) {
+        return InvalidUriSnafu {
+            uri,
+            reason: "file snapshot URI must not contain '.' or '..' path segments",
+        }
+        .fail();
+    }
+
+    let path = extract_file_path_from_uri(uri)?;
+    let mut normal_component_count = 0;
+
+    // This is only a path-shape guard for destructive operations. It does not
+    // resolve symlinks. Drive prefixes and root separators also do not count
+    // toward depth; delete still relies on the manifest check and explicit
+    // confirmation before removing the rooted storage prefix.
+    for component in std::path::Path::new(&path).components() {
+        match component {
+            Component::Normal(_) => normal_component_count += 1,
+            Component::CurDir | Component::ParentDir => {
+                return InvalidUriSnafu {
+                    uri,
+                    reason: "file snapshot URI must not contain '.' or '..' path segments",
+                }
+                .fail();
+            }
+            Component::Prefix(_) | Component::RootDir => {}
+        }
+    }
+
+    if normal_component_count < 2 {
+        return InvalidUriSnafu {
+            uri,
+            reason: "file snapshot URI must point to a directory at least two levels deep",
+        }
+        .fail();
+    }
+
+    Ok(())
+}
+
+fn has_explicit_dot_segment(uri: &str) -> bool {
+    // Defense in depth: catch dot segments at the raw URI level before
+    // `Url::to_file_path()` can normalize them away. The `Path::components()`
+    // check below still runs because URL decoding can reintroduce them.
+    let without_fragment = uri.split_once('#').map_or(uri, |(path, _)| path);
+    let path = without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(path, _)| path);
+
+    path.split('/')
+        .any(|segment| segment == "." || segment == "..")
 }
 
 fn schema_index_path() -> String {
@@ -268,13 +360,21 @@ impl OpenDalStorage {
     }
 
     fn from_s3_uri(uri: &str, storage: &ObjectStoreConfig) -> Result<Self> {
+        Self::from_s3_uri_with_root_policy(uri, storage, false)
+    }
+
+    fn from_s3_uri_with_root_policy(
+        uri: &str,
+        storage: &ObjectStoreConfig,
+        allow_empty_root: bool,
+    ) -> Result<Self> {
         Self::ensure_backend_enabled(
             uri,
             storage.enable_s3,
             "s3:// requires --s3 and related options",
         )?;
 
-        let location = extract_remote_location(uri)?;
+        let location = extract_remote_location_with_root_policy(uri, allow_empty_root)?;
         let mut config = storage.s3.clone();
         config.s3_bucket = location.bucket_or_container;
         config.s3_root = location.root;
@@ -291,13 +391,21 @@ impl OpenDalStorage {
     }
 
     fn from_oss_uri(uri: &str, storage: &ObjectStoreConfig) -> Result<Self> {
+        Self::from_oss_uri_with_root_policy(uri, storage, false)
+    }
+
+    fn from_oss_uri_with_root_policy(
+        uri: &str,
+        storage: &ObjectStoreConfig,
+        allow_empty_root: bool,
+    ) -> Result<Self> {
         Self::ensure_backend_enabled(
             uri,
             storage.enable_oss,
             "oss:// requires --oss and related options",
         )?;
 
-        let location = extract_remote_location(uri)?;
+        let location = extract_remote_location_with_root_policy(uri, allow_empty_root)?;
         let mut config = storage.oss.clone();
         config.oss_bucket = location.bucket_or_container;
         config.oss_root = location.root;
@@ -314,17 +422,30 @@ impl OpenDalStorage {
     }
 
     fn from_gcs_uri(uri: &str, storage: &ObjectStoreConfig) -> Result<Self> {
+        Self::from_gcs_uri_with_root_policy(uri, storage, false)
+    }
+
+    fn from_gcs_uri_with_root_policy(
+        uri: &str,
+        storage: &ObjectStoreConfig,
+        allow_empty_root: bool,
+    ) -> Result<Self> {
         Self::ensure_backend_enabled(
             uri,
             storage.enable_gcs,
             "gs:// or gcs:// requires --gcs and related options",
         )?;
 
-        let location = extract_remote_location(uri)?;
+        let location = extract_remote_location_with_root_policy(uri, allow_empty_root)?;
         let mut config = storage.gcs.clone();
         config.gcs_bucket = location.bucket_or_container;
         config.gcs_root = location.root;
-        Self::validate_remote_config(uri, "gcs", config.validate())?;
+        // GCS validate() rejects empty root, unlike S3/OSS/Azblob.
+        if allow_empty_root && config.gcs_root.is_empty() {
+            Self::validate_gcs_parent_config(uri, &config)?;
+        } else {
+            Self::validate_remote_config(uri, "gcs", config.validate())?;
+        }
 
         let conn: GcsConnection = config.into();
         let object_store = ObjectStore::new(Gcs::from(&conn))
@@ -336,14 +457,43 @@ impl OpenDalStorage {
         ))
     }
 
+    fn validate_gcs_parent_config(
+        uri: &str,
+        config: &crate::common::PrefixedGcsConnection,
+    ) -> Result<()> {
+        if config.gcs_bucket.is_empty() {
+            return InvalidUriSnafu {
+                uri,
+                reason: "invalid gcs config: GCS bucket must be set when --gcs is enabled.",
+            }
+            .fail();
+        }
+        if config.gcs_scope.is_empty() {
+            return InvalidUriSnafu {
+                uri,
+                reason: "invalid gcs config: GCS scope must be set when --gcs is enabled.",
+            }
+            .fail();
+        }
+        Ok(())
+    }
+
     fn from_azblob_uri(uri: &str, storage: &ObjectStoreConfig) -> Result<Self> {
+        Self::from_azblob_uri_with_root_policy(uri, storage, false)
+    }
+
+    fn from_azblob_uri_with_root_policy(
+        uri: &str,
+        storage: &ObjectStoreConfig,
+        allow_empty_root: bool,
+    ) -> Result<Self> {
         Self::ensure_backend_enabled(
             uri,
             storage.enable_azblob,
             "azblob:// requires --azblob and related options",
         )?;
 
-        let location = extract_remote_location(uri)?;
+        let location = extract_remote_location_with_root_policy(uri, allow_empty_root)?;
         let mut config = storage.azblob.clone();
         config.azblob_container = location.bucket_or_container;
         config.azblob_root = location.root;
@@ -370,6 +520,21 @@ impl OpenDalStorage {
         }
     }
 
+    /// Creates storage rooted at a snapshot parent URI.
+    ///
+    /// Parent-oriented commands such as `export-v2 list` may scan bucket/container
+    /// roots. Snapshot-oriented commands must keep using `from_uri`, which rejects
+    /// empty remote roots to avoid unsafe snapshot operations at bucket scope.
+    pub fn from_parent_uri(uri: &str, storage: &ObjectStoreConfig) -> Result<Self> {
+        match StorageScheme::from_uri(uri)? {
+            StorageScheme::File => Self::from_file_uri_with_config(uri, storage),
+            StorageScheme::S3 => Self::from_s3_uri_with_root_policy(uri, storage, true),
+            StorageScheme::Oss => Self::from_oss_uri_with_root_policy(uri, storage, true),
+            StorageScheme::Gcs => Self::from_gcs_uri_with_root_policy(uri, storage, true),
+            StorageScheme::Azblob => Self::from_azblob_uri_with_root_policy(uri, storage, true),
+        }
+    }
+
     /// Reads a file as bytes.
     async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
         let data = self
@@ -380,6 +545,17 @@ impl OpenDalStorage {
                 operation: format!("read {}", path),
             })?;
         Ok(data.to_vec())
+    }
+
+    /// Reads a file as bytes if it exists.
+    pub(crate) async fn read_file_if_exists(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        match self.object_store.read(path).await {
+            Ok(data) => Ok(Some(data.to_vec())),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context(StorageOperationSnafu {
+                operation: format!("read {}", path),
+            }),
+        }
     }
 
     /// Writes bytes to a file.
@@ -394,14 +570,73 @@ impl OpenDalStorage {
     }
 
     /// Checks if a file exists using stat.
-    async fn file_exists(&self, path: &str) -> Result<bool> {
+    pub(crate) async fn file_exists(&self, path: &str) -> Result<bool> {
         match self.object_store.stat(path).await {
-            Ok(_) => Ok(true),
+            Ok(metadata) => Ok(!metadata.is_dir()),
             Err(e) if e.kind() == object_store::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e).context(StorageOperationSnafu {
                 operation: format!("check exists {}", path),
             }),
         }
+    }
+
+    /// Iterates files recursively under a relative prefix without materializing
+    /// the full listing first.
+    pub(crate) async fn for_each_file_recursive<F>(&self, prefix: &str, mut f: F) -> Result<()>
+    where
+        F: FnMut(String) -> Result<()>,
+    {
+        let mut lister = match self.object_store.lister_with(prefix).recursive(true).await {
+            Ok(lister) => lister,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).context(StorageOperationSnafu {
+                    operation: format!("list {}", prefix),
+                });
+            }
+        };
+
+        while let Some(entry) = lister.try_next().await.context(StorageOperationSnafu {
+            operation: format!("list {}", prefix),
+        })? {
+            if entry.metadata().is_dir() {
+                continue;
+            }
+            f(entry.path().to_string())?;
+        }
+
+        Ok(())
+    }
+
+    /// Lists direct child directory names under the storage root.
+    pub(crate) async fn list_direct_child_dirs(&self) -> Result<Vec<String>> {
+        let mut lister = match self.object_store.lister_with("/").recursive(false).await {
+            Ok(lister) => lister,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).context(StorageOperationSnafu {
+                    operation: "list /",
+                });
+            }
+        };
+
+        let mut dirs = BTreeSet::new();
+        while let Some(entry) = lister.try_next().await.context(StorageOperationSnafu {
+            operation: "list /",
+        })? {
+            let path = entry.path().trim_matches('/');
+            if path.is_empty() {
+                continue;
+            }
+
+            if entry.metadata().is_dir()
+                && let Some(name) = path.split('/').next()
+            {
+                dirs.insert(name.to_string());
+            }
+        }
+
+        Ok(dirs.into_iter().collect())
     }
 
     #[cfg(test)]
@@ -462,31 +697,19 @@ impl SnapshotStorage for OpenDalStorage {
     }
 
     async fn list_files_recursive(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut lister = match self.object_store.lister_with(prefix).recursive(true).await {
-            Ok(lister) => lister,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(error).context(StorageOperationSnafu {
-                    operation: format!("list {}", prefix),
-                });
-            }
-        };
-
         let mut files = Vec::new();
-        while let Some(entry) = lister.try_next().await.context(StorageOperationSnafu {
-            operation: format!("list {}", prefix),
-        })? {
-            if entry.metadata().is_dir() {
-                continue;
-            }
-            files.push(entry.path().to_string());
-        }
+        self.for_each_file_recursive(prefix, |path| {
+            files.push(path);
+            Ok(())
+        })
+        .await?;
         Ok(files)
     }
 
     async fn delete_snapshot(&self) -> Result<()> {
         self.object_store
-            .remove_all("/")
+            .delete_with("/")
+            .recursive(true)
             .await
             .context(StorageOperationSnafu {
                 operation: "delete snapshot",
@@ -556,11 +779,72 @@ mod tests {
 
     #[test]
     fn test_extract_remote_location_requires_non_empty_root() {
-        assert!(extract_remote_location("s3://bucket").is_err());
-        assert!(extract_remote_location("s3://bucket/").is_err());
-        assert!(extract_remote_location("oss://bucket").is_err());
-        assert!(extract_remote_location("gs://bucket").is_err());
-        assert!(extract_remote_location("azblob://container").is_err());
+        assert!(extract_remote_location_with_root_policy("s3://bucket", false).is_err());
+        assert!(extract_remote_location_with_root_policy("s3://bucket/", false).is_err());
+        assert!(extract_remote_location_with_root_policy("oss://bucket", false).is_err());
+        assert!(extract_remote_location_with_root_policy("gs://bucket", false).is_err());
+        assert!(extract_remote_location_with_root_policy("azblob://container", false).is_err());
+    }
+
+    #[test]
+    fn test_extract_remote_location_allows_empty_root_when_permitted() {
+        let location = extract_remote_location_with_root_policy("s3://bucket", true).unwrap();
+        assert_eq!(location.bucket_or_container, "bucket");
+        assert_eq!(location.root, "");
+
+        let location =
+            extract_remote_location_with_root_policy("azblob://container/", true).unwrap();
+        assert_eq!(location.bucket_or_container, "container");
+        assert_eq!(location.root, "");
+    }
+
+    #[test]
+    fn test_parent_storage_allows_s3_bucket_root() {
+        let mut storage = ObjectStoreConfig {
+            enable_s3: true,
+            ..Default::default()
+        };
+        storage.s3.s3_region = Some("us-east-1".to_string());
+
+        assert!(OpenDalStorage::from_uri("s3://bucket", &storage).is_err());
+        assert!(OpenDalStorage::from_parent_uri("s3://bucket", &storage).is_ok());
+    }
+
+    #[test]
+    fn test_validate_snapshot_uri_rejects_dangerous_roots() {
+        assert!(validate_snapshot_uri("s3://bucket").is_err());
+        assert!(validate_snapshot_uri("s3://bucket/").is_err());
+        assert!(validate_snapshot_uri("oss://bucket").is_err());
+        assert!(validate_snapshot_uri("gs://bucket").is_err());
+        assert!(validate_snapshot_uri("azblob://container").is_err());
+        assert!(validate_snapshot_uri("s3://bucket/snapshot?version=1").is_err());
+        assert!(validate_snapshot_uri("file:///tmp/backup#fragment").is_err());
+        assert!(validate_snapshot_uri("file:///").is_err());
+        assert!(validate_snapshot_uri("file:///tmp").is_err());
+        assert!(validate_snapshot_uri("file:///tmp/backup/.").is_err());
+        assert!(validate_snapshot_uri("file:///tmp/backup/..").is_err());
+    }
+
+    #[test]
+    fn test_validate_snapshot_uri_accepts_snapshot_paths() {
+        assert_eq!(
+            validate_snapshot_uri("s3://bucket/snapshots/prod").unwrap(),
+            StorageScheme::S3
+        );
+
+        let dir = tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let uri = Url::from_directory_path(snapshot).unwrap().to_string();
+        assert_eq!(validate_snapshot_uri(&uri).unwrap(), StorageScheme::File);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_snapshot_uri_windows_drive_prefix_depth() {
+        assert!(validate_snapshot_uri("file:///C:/").is_err());
+        assert!(validate_snapshot_uri("file:///C:/Users").is_err());
+        assert!(validate_snapshot_uri("file:///C:/Users/snapshot").is_ok());
     }
 
     #[cfg(not(windows))]

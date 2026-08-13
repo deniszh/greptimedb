@@ -18,19 +18,24 @@ use std::ops::Div;
 use api::v1::meta::MailboxMessage;
 use common_meta::RegionIdent;
 use common_meta::distributed_time_constants::default_distributed_time_constants;
-use common_meta::instruction::{Instruction, InstructionReply, OpenRegion, SimpleReply};
+use common_meta::instruction::{
+    Instruction, InstructionReply, OpenRegion, OpenRegionReason, SimpleReply,
+};
 use common_meta::key::datanode_table::RegionInfo;
 use common_procedure::{Context as ProcedureContext, Status};
 use common_telemetry::info;
 use common_telemetry::tracing_context::TracingContext;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
+use store_api::region_engine::RegionRole;
+use store_api::region_request::RegionRequirements;
 use tokio::time::Instant;
 
 use crate::error::{self, Result};
 use crate::handler::HeartbeatMailbox;
 use crate::procedure::region_migration::flush_leader_region::PreFlushRegion;
-use crate::procedure::region_migration::{Context, State};
+use crate::procedure::region_migration::{Context, RegionMigrationTriggerReason, State};
+use crate::procedure::utils::instruction_error_result;
 use crate::service::mailbox::Channel;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,9 +47,12 @@ impl State for OpenCandidateRegion {
     async fn next(
         &mut self,
         ctx: &mut Context,
-        _procedure_ctx: &ProcedureContext,
+        procedure_ctx: &ProcedureContext,
     ) -> Result<(Box<dyn State>, Status)> {
-        let instruction = self.build_open_region_instruction(ctx).await?;
+        let trigger_reason = ctx.trigger_reason(procedure_ctx.event_context.as_ref());
+        let instruction = self
+            .build_open_region_instruction(ctx, trigger_reason)
+            .await?;
         let now = Instant::now();
         self.open_candidate_region(ctx, instruction).await?;
         ctx.update_open_candidate_region_elapsed(now);
@@ -62,10 +70,18 @@ impl OpenCandidateRegion {
     ///
     /// Abort(non-retry):
     /// - Datanode Table is not found.
-    async fn build_open_region_instruction(&self, ctx: &mut Context) -> Result<Instruction> {
+    async fn build_open_region_instruction(
+        &self,
+        ctx: &mut Context,
+        trigger_reason: RegionMigrationTriggerReason,
+    ) -> Result<Instruction> {
         let region_ids = ctx.persistent_ctx.region_ids.clone();
         let from_peer_id = ctx.persistent_ctx.from_peer.id;
         let to_peer_id = ctx.persistent_ctx.to_peer.id;
+        let reason = match trigger_reason {
+            RegionMigrationTriggerReason::Failover => OpenRegionReason::RegionFailover,
+            _ => OpenRegionReason::RegionMigration,
+        };
         let datanode_table_values = ctx.get_from_peer_datanode_table_values().await?;
         let mut open_regions = Vec::with_capacity(region_ids.len());
 
@@ -96,6 +112,8 @@ impl OpenCandidateRegion {
                 region_options,
                 region_wal_options,
                 true,
+                Some(reason),
+                RegionRequirements::object_storage(),
             ));
         }
 
@@ -129,7 +147,7 @@ impl OpenCandidateRegion {
                 // Registers the opening region.
                 let guard = ctx
                     .opening_region_keeper
-                    .register(candidate.id, *region_id)
+                    .register_with_role(candidate.id, *region_id, RegionRole::Follower)
                     .context(error::RegionOperatingRaceSnafu {
                         peer_id: candidate.id,
                         region_id: *region_id,
@@ -182,10 +200,19 @@ impl OpenCandidateRegion {
 
                 if result {
                     Ok(())
-                } else {
-                    error::RetryLaterSnafu {
-                        reason: format!(
+                } else if let Some(error) = error {
+                    instruction_error_result(
+                        &error,
+                        format!(
                             "Region {region_ids:?} is not opened by datanode {:?}, error: {error:?}, elapsed: {:?}",
+                            candidate,
+                            now.elapsed()
+                        ),
+                    )
+                } else {
+                    error::UnexpectedSnafu {
+                        violated: format!(
+                            "Region {region_ids:?} is not opened by datanode {:?}, but error is absent, elapsed: {:?}",
                             candidate,
                             now.elapsed()
                         ),
@@ -212,7 +239,10 @@ mod tests {
     use std::collections::HashMap;
 
     use common_catalog::consts::MITO2_ENGINE;
+    use common_error::ext::RetryHint;
+    use common_error::status_code::StatusCode;
     use common_meta::DatanodeId;
+    use common_meta::instruction::InstructionError;
     use common_meta::key::table_route::TableRouteValue;
     use common_meta::key::test_utils::new_test_table_info;
     use common_meta::peer::Peer;
@@ -224,7 +254,8 @@ mod tests {
     use crate::procedure::region_migration::test_util::{self, TestingEnv, new_procedure_context};
     use crate::procedure::region_migration::{ContextFactory, PersistentContext};
     use crate::procedure::test_util::{
-        new_close_region_reply, new_open_region_reply, send_mock_reply,
+        new_close_region_reply, new_open_region_reply, new_open_region_reply_with_error,
+        send_mock_reply,
     };
 
     fn new_persistent_context() -> PersistentContext {
@@ -232,18 +263,20 @@ mod tests {
     }
 
     fn new_mock_open_instruction(datanode_id: DatanodeId, region_id: RegionId) -> Instruction {
-        Instruction::OpenRegions(vec![OpenRegion {
-            region_ident: RegionIdent {
+        Instruction::OpenRegions(vec![OpenRegion::new(
+            RegionIdent {
                 datanode_id,
                 table_id: region_id.table_id(),
                 region_number: region_id.region_number(),
                 engine: MITO2_ENGINE.to_string(),
             },
-            region_storage_path: "/bar/foo/region/".to_string(),
-            region_options: Default::default(),
-            region_wal_options: Default::default(),
-            skip_wal_replay: true,
-        }])
+            "/bar/foo/region/",
+            Default::default(),
+            Default::default(),
+            true,
+            Some(OpenRegionReason::RegionMigration),
+            RegionRequirements::object_storage(),
+        )])
     }
 
     #[tokio::test]
@@ -254,12 +287,68 @@ mod tests {
         let mut ctx = env.context_factory().new_context(persistent_context);
 
         let err = state
-            .build_open_region_instruction(&mut ctx)
+            .build_open_region_instruction(&mut ctx, RegionMigrationTriggerReason::Unknown)
             .await
             .unwrap_err();
 
         assert_matches!(err, Error::DatanodeTableNotFound { .. });
         assert!(!err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn test_build_open_region_instruction_reason() {
+        let state = OpenCandidateRegion;
+        let persistent_context = new_persistent_context();
+        let from_peer_id = persistent_context.from_peer.id;
+        let region_id = persistent_context.region_ids[0];
+        let env = TestingEnv::new();
+
+        let table_info = new_test_table_info(1024);
+        let region_routes = vec![RegionRoute {
+            region: Region::new_test(region_id),
+            leader_peer: Some(Peer::empty(from_peer_id)),
+            ..Default::default()
+        }];
+        env.table_metadata_manager()
+            .create_table_metadata(
+                table_info,
+                TableRouteValue::physical(region_routes),
+                HashMap::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut ctx = env
+            .context_factory()
+            .new_context(persistent_context.clone());
+        let instruction = state
+            .build_open_region_instruction(&mut ctx, RegionMigrationTriggerReason::Unknown)
+            .await
+            .unwrap();
+        let open_regions = instruction.into_open_regions().unwrap();
+        assert_eq!(
+            Some(OpenRegionReason::RegionMigration),
+            open_regions[0].reason
+        );
+        assert_eq!(
+            RegionRequirements::object_storage(),
+            open_regions[0].requirements
+        );
+
+        let mut ctx = env.context_factory().new_context(persistent_context);
+        let instruction = state
+            .build_open_region_instruction(&mut ctx, RegionMigrationTriggerReason::Failover)
+            .await
+            .unwrap();
+        let open_regions = instruction.into_open_regions().unwrap();
+        assert_eq!(
+            Some(OpenRegionReason::RegionFailover),
+            open_regions[0].reason
+        );
+        assert_eq!(
+            RegionRequirements::object_storage(),
+            open_regions[0].requirements
+        );
     }
 
     #[tokio::test]
@@ -296,7 +385,7 @@ mod tests {
         let mut ctx = env.context_factory().new_context(persistent_context);
         let opening_region_keeper = env.opening_region_keeper();
         let _guard = opening_region_keeper
-            .register(to_peer_id, region_id)
+            .register_with_role(to_peer_id, region_id, RegionRole::Follower)
             .unwrap();
 
         let open_instruction = new_mock_open_instruction(to_peer_id, region_id);
@@ -414,6 +503,79 @@ mod tests {
         assert_matches!(err, Error::RetryLater { .. });
         assert!(err.is_retryable());
         assert!(format!("{err:?}").contains("test mocked"));
+    }
+
+    #[tokio::test]
+    async fn test_open_candidate_region_non_retryable_instruction_error() {
+        let state = OpenCandidateRegion;
+        let persistent_context = new_persistent_context();
+        let region_id = persistent_context.region_ids[0];
+        let to_peer_id = persistent_context.to_peer.id;
+        let mut env = TestingEnv::new();
+
+        let mut ctx = env.context_factory().new_context(persistent_context);
+        let mailbox_ctx = env.mailbox_context();
+        let mailbox = mailbox_ctx.mailbox().clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+        mailbox_ctx
+            .insert_heartbeat_response_receiver(Channel::Datanode(to_peer_id), tx)
+            .await;
+
+        send_mock_reply(mailbox, rx, |id| {
+            Ok(new_open_region_reply_with_error(
+                id,
+                false,
+                Some(InstructionError {
+                    code: StatusCode::Internal,
+                    message: "non retryable mocked".to_string(),
+                    retry_hint: RetryHint::NonRetryable,
+                }),
+            ))
+        });
+
+        let open_instruction = new_mock_open_instruction(to_peer_id, region_id);
+        let err = state
+            .open_candidate_region(&mut ctx, open_instruction)
+            .await
+            .unwrap_err();
+
+        assert_matches!(err, Error::Unexpected { .. });
+        assert!(!err.is_retryable());
+        assert!(format!("{err:?}").contains("non retryable mocked"));
+    }
+
+    #[tokio::test]
+    async fn test_open_candidate_region_false_without_error_is_unexpected() {
+        let state = OpenCandidateRegion;
+        let persistent_context = new_persistent_context();
+        let region_id = persistent_context.region_ids[0];
+        let to_peer_id = persistent_context.to_peer.id;
+        let mut env = TestingEnv::new();
+
+        let mut ctx = env.context_factory().new_context(persistent_context);
+        let mailbox_ctx = env.mailbox_context();
+        let mailbox = mailbox_ctx.mailbox().clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+        mailbox_ctx
+            .insert_heartbeat_response_receiver(Channel::Datanode(to_peer_id), tx)
+            .await;
+
+        send_mock_reply(mailbox, rx, |id| {
+            Ok(new_open_region_reply_with_error(id, false, None))
+        });
+
+        let open_instruction = new_mock_open_instruction(to_peer_id, region_id);
+        let err = state
+            .open_candidate_region(&mut ctx, open_instruction)
+            .await
+            .unwrap_err();
+
+        assert_matches!(err, Error::Unexpected { .. });
+        assert!(!err.is_retryable());
     }
 
     #[tokio::test]

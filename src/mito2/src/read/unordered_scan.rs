@@ -62,6 +62,9 @@ impl UnorderedScan {
         let mut properties = ScannerProperties::default()
             .with_append_mode(input.append_mode)
             .with_total_rows(input.total_rows());
+        if let Some(counters) = input.query_stat_counters.clone() {
+            properties.set_query_stat_counters(counters);
+        }
         let stream_ctx = Arc::new(StreamContext::unordered_scan_ctx(input));
         properties.partitions = vec![stream_ctx.partition_ranges()];
 
@@ -119,6 +122,8 @@ impl UnorderedScan {
         try_stream! {
             // Gets range meta.
             let range_meta = &stream_ctx.ranges[part_range_id];
+            let part_range = range_meta.new_partition_range(part_range_id);
+            let pre_filter_mode = stream_ctx.range_pre_filter_mode(&part_range);
             for index in &range_meta.row_group_indices {
                 if stream_ctx.is_mem_range_index(*index) {
                     let stream = scan_flat_mem_ranges(
@@ -131,6 +136,12 @@ impl UnorderedScan {
                         yield record_batch?;
                     }
                 } else if stream_ctx.is_file_range_index(*index) {
+                    // Common manifest-level fast-skip shared by UnorderedScan and SeqScan.
+                    if partition_pruner
+                        .try_skip_manifest_pruned_file_range(*index, &part_metrics)
+                    {
+                        continue;
+                    }
                     let stream = scan_flat_file_ranges(
                         stream_ctx.clone(),
                         part_metrics.clone(),
@@ -146,6 +157,7 @@ impl UnorderedScan {
                         &stream_ctx,
                         *index,
                         &part_metrics,
+                        pre_filter_mode,
                     ).await?;
                     for await record_batch in stream {
                         yield record_batch?;
@@ -350,6 +362,14 @@ impl RegionScanner for UnorderedScan {
 
     fn set_logical_region(&mut self, logical_region: bool) {
         self.properties.set_logical_region(logical_region);
+    }
+
+    fn set_query_load_region_id(&mut self, region_id: store_api::storage::RegionId) {
+        self.properties.set_query_load_region_id(region_id);
+    }
+
+    fn snapshot_sequence(&self) -> Option<u64> {
+        self.stream_ctx.input.snapshot_sequence
     }
 }
 

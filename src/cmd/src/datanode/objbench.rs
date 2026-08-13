@@ -67,7 +67,7 @@ pub struct ObjbenchCommand {
     pub pprof_file: Option<PathBuf>,
 }
 
-pub(super) fn parse_config(
+pub(crate) fn parse_config(
     config_path: &PathBuf,
 ) -> error::Result<(
     StorageConfig,
@@ -190,6 +190,7 @@ impl ObjbenchCommand {
             sequence: None,
             partition_expr: None,
             num_series: 0,
+            ..Default::default()
         };
         let src_handle = FileHandle::new(file_meta, new_noop_file_purger());
 
@@ -243,10 +244,12 @@ impl ObjbenchCommand {
             ..Default::default()
         };
 
+        let source =
+            FlatSource::new_stream(region_meta.schema.arrow_schema().clone(), reader_stream);
         let write_req = SstWriteRequest {
             op_type: OperationType::Flush,
             metadata: region_meta,
-            source: FlatSource::Stream(reader_stream),
+            source,
             cache_manager,
             storage: None,
             max_sequence: None,
@@ -482,7 +485,7 @@ fn parse_file_dir_components(path: &str) -> error::Result<FileDirComponents> {
     })
 }
 
-fn extract_region_metadata(
+pub(crate) fn extract_region_metadata(
     file_path: &str,
     meta: &parquet::file::metadata::ParquetMetaData,
 ) -> error::Result<RegionMetadataRef> {
@@ -512,7 +515,7 @@ fn extract_region_metadata(
     Ok(Arc::new(region))
 }
 
-pub(super) async fn build_object_store(sc: &StorageConfig) -> error::Result<ObjectStore> {
+pub(crate) async fn build_object_store(sc: &StorageConfig) -> error::Result<ObjectStore> {
     store::new_object_store(sc.store.clone(), &sc.data_home)
         .await
         .map_err(|e| {
@@ -585,6 +588,8 @@ async fn build_cache_manager(
             .vector_cache_size(config.vector_cache_size.as_bytes())
             .page_cache_size(config.page_cache_size.as_bytes())
             .selector_result_cache_size(config.selector_result_cache_size.as_bytes())
+            .range_result_cache_size(config.range_result_cache_size.as_bytes())
+            .prefilter_result_cache_size(config.prefilter_result_cache_size.as_bytes())
             .index_metadata_size(config.index.metadata_cache_size.as_bytes())
             .index_content_size(config.index.content_cache_size.as_bytes())
             .index_content_page_size(config.index.content_cache_page_size.as_bytes())

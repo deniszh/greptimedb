@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use common_base::hash::partition_expr_version;
+use common_recordbatch::adapter::RegionQueryStatCounters;
 use common_telemetry::{error, info, warn};
 use crossbeam_utils::atomic::AtomicCell;
 use partition::expr::PartitionExpr;
@@ -34,9 +35,11 @@ use store_api::ManifestVersion;
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::logstore::provider::Provider;
 use store_api::metadata::RegionMetadataRef;
+use store_api::metrics::{REGION_QUERY_CPU_TIME, REGION_QUERY_SCANNED_BYTES};
 use store_api::region_engine::{
     RegionManifestInfo, RegionRole, RegionStatistic, SettableRegionRoleState,
 };
+use store_api::region_info::RegionInfoEntry;
 use store_api::region_request::{PathType, StagingPartitionDirective};
 use store_api::sst_entry::ManifestSstEntry;
 use store_api::storage::{FileId, RegionId, SequenceNumber};
@@ -44,9 +47,10 @@ use tokio::sync::RwLockWriteGuard;
 pub use utils::*;
 
 use crate::access_layer::AccessLayerRef;
+use crate::engine::region_hook::{PendingManifestHook, RegionHookRef};
 use crate::error::{
-    InvalidPartitionExprSnafu, RegionNotFoundSnafu, RegionStateSnafu, RegionTruncatedSnafu, Result,
-    UnexpectedSnafu, UpdateManifestSnafu,
+    FlushableRegionStateSnafu, InvalidPartitionExprSnafu, RegionNotFoundSnafu, RegionStateSnafu,
+    RegionTruncatedSnafu, Result, UnexpectedSnafu, UpdateManifestSnafu,
 };
 use crate::manifest::action::{
     RegionChange, RegionManifest, RegionMetaAction, RegionMetaActionList,
@@ -111,6 +115,22 @@ impl RegionRoleState {
             RegionRoleState::Follower => None,
         }
     }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            RegionRoleState::Follower => "Follower",
+            RegionRoleState::Leader(RegionLeaderState::Writable) => "Leader(Writable)",
+            RegionRoleState::Leader(RegionLeaderState::Staging) => "Leader(Staging)",
+            RegionRoleState::Leader(RegionLeaderState::EnteringStaging) => {
+                "Leader(EnteringStaging)"
+            }
+            RegionRoleState::Leader(RegionLeaderState::Altering) => "Leader(Altering)",
+            RegionRoleState::Leader(RegionLeaderState::Dropping) => "Leader(Dropping)",
+            RegionRoleState::Leader(RegionLeaderState::Truncating) => "Leader(Truncating)",
+            RegionRoleState::Leader(RegionLeaderState::Editing) => "Leader(Editing)",
+            RegionRoleState::Leader(RegionLeaderState::Downgrading) => "Leader(Downgrading)",
+        }
+    }
 }
 
 /// Metadata and runtime status of a region.
@@ -140,8 +160,8 @@ pub struct MitoRegion {
     pub(crate) provider: Provider,
     /// Last flush time in millis.
     last_flush_millis: AtomicI64,
-    /// Last compaction time in millis.
-    last_compaction_millis: AtomicI64,
+    /// Last schedule compaction time in millis.
+    last_schedule_compaction_millis: AtomicI64,
     /// Provider to get current time.
     time_provider: TimeProviderRef,
     /// The topic's latest entry id since the region's last flushing.
@@ -154,15 +174,38 @@ pub struct MitoRegion {
     /// There are no WAL entries in range [flushed_entry_id, topic_latest_entry_id] for current region,
     /// which means these WAL entries maybe able to be pruned up to `topic_latest_entry_id`.
     pub(crate) topic_latest_entry_id: AtomicU64,
-    /// The total bytes written to the region.
-    pub(crate) written_bytes: Arc<AtomicU64>,
-    /// Partition info of the region in staging mode.
-    ///
-    /// During the staging mode, the region metadata in [`VersionControlRef`] is not updated,
-    /// so we need to store the partition info separately.
-    pub(crate) staging_partition_info: Mutex<Option<StagingPartitionInfo>>,
+    /// Region stats.
+    pub(crate) region_stats: RegionStats,
     /// manifest stats
     stats: ManifestStats,
+}
+
+/// Runtime statistics of a region.
+#[derive(Debug)]
+pub(crate) struct RegionStats {
+    /// The total bytes written to the region.
+    pub(crate) written_bytes: Arc<AtomicU64>,
+    /// The total query CPU time of the region in nanoseconds.
+    pub(crate) query_cpu_time: Arc<AtomicU64>,
+    /// The total scanned bytes of the region.
+    pub(crate) query_scanned_bytes: Arc<AtomicU64>,
+}
+
+impl RegionStats {
+    pub(crate) fn new() -> Self {
+        Self {
+            written_bytes: Arc::new(AtomicU64::new(0)),
+            query_cpu_time: Arc::new(AtomicU64::new(0)),
+            query_scanned_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) fn query_stat_counters(&self) -> RegionQueryStatCounters {
+        RegionQueryStatCounters {
+            query_cpu_time: self.query_cpu_time.clone(),
+            query_scanned_bytes: self.query_scanned_bytes.clone(),
+        }
+    }
 }
 
 pub type MitoRegionRef = Arc<MitoRegion>;
@@ -195,6 +238,13 @@ impl StagingPartitionInfo {
 }
 
 impl MitoRegion {
+    fn remove_region_metrics(&self) {
+        let region_id = self.region_id.as_u64().to_string();
+        let labels = &[region_id.as_str()];
+        let _ = REGION_QUERY_CPU_TIME.remove_label_values(labels);
+        let _ = REGION_QUERY_SCANNED_BYTES.remove_label_values(labels);
+    }
+
     /// Stop background managers for this region.
     pub(crate) async fn stop(&self) {
         self.manifest_ctx
@@ -228,6 +278,11 @@ impl MitoRegion {
         version_data.version
     }
 
+    /// Returns whether writes to this region should skip WAL.
+    pub(crate) fn skip_wal(&self) -> bool {
+        self.provider == Provider::Noop || self.version().options.skip_wal
+    }
+
     /// Returns last flush timestamp in millis.
     pub(crate) fn last_flush_millis(&self) -> i64 {
         self.last_flush_millis.load(Ordering::Relaxed)
@@ -239,15 +294,16 @@ impl MitoRegion {
         self.last_flush_millis.store(now, Ordering::Relaxed);
     }
 
-    /// Returns last compaction timestamp in millis.
-    pub(crate) fn last_compaction_millis(&self) -> i64 {
-        self.last_compaction_millis.load(Ordering::Relaxed)
+    /// Returns last schedule compaction timestamp in millis.
+    pub(crate) fn last_schedule_compaction_millis(&self) -> i64 {
+        self.last_schedule_compaction_millis.load(Ordering::Relaxed)
     }
 
-    /// Update compaction time to current time.
-    pub(crate) fn update_compaction_millis(&self) {
+    /// Update schedule compaction time to current time.
+    pub(crate) fn update_schedule_compaction_millis(&self) {
         let now = self.time_provider.current_time_millis();
-        self.last_compaction_millis.store(now, Ordering::Relaxed);
+        self.last_schedule_compaction_millis
+            .store(now, Ordering::Relaxed);
     }
 
     /// Returns the table dir.
@@ -318,6 +374,15 @@ impl MitoRegion {
         self.version_control.committed_sequence()
     }
 
+    /// Returns the latest sequence that has already been persisted into SSTs.
+    ///
+    /// Incremental memtable-only reads must use a cursor greater than or equal to
+    /// this boundary; older cursors are stale because the corresponding updates may
+    /// already have been flushed out of memtables.
+    pub fn flushed_sequence(&self) -> SequenceNumber {
+        self.version_control.current().version.flushed_sequence
+    }
+
     /// Returns whether the region is readonly.
     pub fn is_follower(&self) -> bool {
         self.manifest_ctx.state.load() == RegionRoleState::Follower
@@ -331,6 +396,17 @@ impl MitoRegion {
     /// Sets the region role state.
     pub(crate) fn set_role(&self, next_role: RegionRole) {
         self.manifest_ctx.set_role(next_role, self.region_id);
+    }
+
+    pub(crate) fn region_role(&self) -> RegionRole {
+        match self.state() {
+            RegionRoleState::Follower => RegionRole::Follower,
+            RegionRoleState::Leader(RegionLeaderState::Staging) => RegionRole::StagingLeader,
+            RegionRoleState::Leader(RegionLeaderState::Downgrading) => {
+                RegionRole::DowngradingLeader
+            }
+            RegionRoleState::Leader(_) => RegionRole::Leader,
+        }
     }
 
     /// Sets the altering state.
@@ -393,9 +469,8 @@ impl MitoRegion {
     /// You should call this method in the worker loop.
     /// Transitions from Staging to Writable state.
     pub fn exit_staging(&self) -> Result<()> {
-        *self.staging_partition_info.lock().unwrap() = None;
-        self.compare_exchange_state(
-            RegionLeaderState::Staging,
+        self.manifest_ctx.exit_staging(
+            self.region_id,
             RegionRoleState::Leader(RegionLeaderState::Writable),
         )
     }
@@ -409,7 +484,7 @@ impl MitoRegion {
             self.manifest_ctx.manifest_manager.write().await;
         let current_state = self.state();
 
-        match state {
+        let hook_payload: Option<PendingManifestHook> = match state {
             SettableRegionRoleState::Leader => {
                 // Exit staging mode and return to normal writable leader
                 // Only allowed from staging state
@@ -417,11 +492,12 @@ impl MitoRegion {
                     RegionRoleState::Leader(RegionLeaderState::Staging) => {
                         info!("Exiting staging mode for region {}", self.region_id);
                         // Use the success exit path that merges all staged manifests
-                        self.exit_staging_on_success(&mut manager).await?;
+                        self.exit_staging_on_success(&mut manager).await?
                     }
                     RegionRoleState::Leader(RegionLeaderState::Writable) => {
                         // Already in desired state - no-op
                         info!("Region {} already in normal leader mode", self.region_id);
+                        None
                     }
                     _ => {
                         // Only staging -> leader transition is allowed
@@ -456,6 +532,7 @@ impl MitoRegion {
                         .build());
                     }
                 }
+                None
             }
 
             SettableRegionRoleState::Follower => {
@@ -478,6 +555,7 @@ impl MitoRegion {
                         info!("Region {} already in follower mode", self.region_id);
                     }
                 }
+                None
             }
 
             SettableRegionRoleState::DowngradingLeader => {
@@ -506,10 +584,12 @@ impl MitoRegion {
                         );
                     }
                 }
+                None
             }
-        }
+        };
 
         // Hack(zhongzc): If we have just become leader (writable), persist any backfilled metadata.
+        let mut backfill_hook_payload: Option<PendingManifestHook> = None;
         if self.state() == RegionRoleState::Leader(RegionLeaderState::Writable) {
             // Persist backfilled metadata if manifest is missing fields (e.g., partition_expr)
             let manifest_meta = &manager.manifest().metadata;
@@ -521,16 +601,19 @@ impl MitoRegion {
                     sst_format: current_version.options.sst_format.unwrap_or_default(),
                     append_mode: None,
                 });
-                let result = manager
-                    .update(RegionMetaActionList::with_action(action), false)
-                    .await;
-
-                match result {
-                    Ok(version) => {
+                let action_list = RegionMetaActionList::with_action(action);
+                match self
+                    .manifest_ctx
+                    .update_locked(&mut manager, action_list, false)
+                    .await
+                {
+                    Ok(pending) => {
                         info!(
                             "Successfully persisted backfilled metadata for region {}, version: {}",
-                            self.region_id, version
+                            self.region_id,
+                            pending.version()
                         );
+                        backfill_hook_payload = Some(pending);
                     }
                     Err(e) => {
                         warn!(e; "Failed to persist backfilled metadata for region {}", self.region_id);
@@ -540,6 +623,19 @@ impl MitoRegion {
         }
 
         drop(manager);
+
+        // Merge both payloads so consumers see the complete set of actions in
+        // one notification. The lock is released, so it's safe to fire.
+        let merged = match (hook_payload, backfill_hook_payload) {
+            (Some(staging), Some(backfill)) => Some(staging.merge(backfill)),
+            (Some(payload), None) => Some(payload),
+            (None, Some(payload)) => Some(payload),
+            (None, None) => None,
+        };
+
+        if let Some(pending) = merged {
+            pending.fire().await;
+        }
 
         Ok(())
     }
@@ -570,19 +666,24 @@ impl MitoRegion {
         let memtables = &version.memtables;
         let memtable_usage = (memtables.mutable_usage() + memtables.immutables_usage()) as u64;
 
-        let sst_usage = version.ssts.sst_usage();
-        let index_usage = version.ssts.index_usage();
+        let sst_usage = version.ssts.owned_sst_usage(self.region_id);
+        let index_usage = version.ssts.owned_index_usage(self.region_id);
         let flushed_entry_id = version.flushed_entry_id;
 
         let wal_usage = self.estimated_wal_usage(memtable_usage);
         let manifest_usage = self.stats.total_manifest_size();
-        let num_rows = version.ssts.num_rows() + version.memtables.num_rows();
-        let num_files = version.ssts.num_files();
+        let num_rows = version.ssts.owned_num_rows(self.region_id) + version.memtables.num_rows();
+        let num_files = version.ssts.owned_num_files(self.region_id);
         let manifest_version = self.stats.manifest_version();
         let file_removed_cnt = self.stats.file_removed_cnt();
 
         let topic_latest_entry_id = self.topic_latest_entry_id.load(Ordering::Relaxed);
-        let written_bytes = self.written_bytes.load(Ordering::Relaxed);
+        let written_bytes = self.region_stats.written_bytes.load(Ordering::Relaxed);
+        let query_cpu_time = self.region_stats.query_cpu_time.load(Ordering::Relaxed);
+        let query_scanned_bytes = self
+            .region_stats
+            .query_scanned_bytes
+            .load(Ordering::Relaxed);
 
         RegionStatistic {
             num_rows,
@@ -600,6 +701,8 @@ impl MitoRegion {
             data_topic_latest_entry_id: topic_latest_entry_id,
             metadata_topic_latest_entry_id: topic_latest_entry_id,
             written_bytes,
+            query_cpu_time,
+            query_scanned_bytes,
         }
     }
 
@@ -632,6 +735,41 @@ impl MitoRegion {
 
     pub fn access_layer(&self) -> AccessLayerRef {
         self.access_layer.clone()
+    }
+
+    /// Returns the region info entry of the region.
+    pub(crate) fn region_info_entry(&self, node_id: Option<u64>) -> RegionInfoEntry {
+        let region_id = self.region_id;
+        let version = self.version();
+        let state = self.state();
+        let role = self.region_role();
+        let region_options = serde_json::to_string(&version.options)
+            .unwrap_or_else(|err| serde_json::json!({ "error": err.to_string() }).to_string());
+        let sst_format = match version.options.sst_format.unwrap_or_default() {
+            crate::sst::FormatType::PrimaryKey => "primary_key",
+            crate::sst::FormatType::Flat => "flat",
+        }
+        .to_string();
+
+        RegionInfoEntry {
+            region_id,
+            table_id: region_id.table_id(),
+            region_number: region_id.region_number(),
+            region_group: region_id.region_group(),
+            region_sequence: region_id.region_sequence(),
+            state: state.as_str().to_string(),
+            role: role.to_string(),
+            writable: self.is_writable(),
+            committed_sequence: self.find_committed_sequence(),
+            flushed_sequence: Some(self.flushed_sequence()).filter(|sequence| *sequence > 0),
+            manifest_version: self.stats.manifest_version(),
+            compaction_time_window: version
+                .compaction_time_window
+                .map(|duration| humantime::format_duration(duration).to_string()),
+            region_options,
+            sst_format,
+            node_id,
+        }
     }
 
     /// Returns the SST entries of the region.
@@ -699,6 +837,8 @@ impl MitoRegion {
                     origin_region_id,
                     node_id: None,
                     visible,
+                    primary_key_min: meta.primary_key_min.clone(),
+                    primary_key_max: meta.primary_key_max.clone(),
                 }
             })
             .collect()
@@ -714,11 +854,57 @@ impl MitoRegion {
             .collect::<Vec<_>>()
     }
 
+    /// Returns all live SST file metas and the current manifest version from
+    /// the region manifest, merging both the normal and staging manifests.
+    ///
+    /// While the region is in staging mode (e.g. during region copy/migration),
+    /// the authoritative live file set lives in the staging manifest, so this
+    /// method merges both — matching the semantics of [`manifest_sst_entries`].
+    ///
+    /// The returned manifest version is the staging version when a staging
+    /// manifest is present, otherwise the normal manifest version.
+    pub async fn all_manifest_files(&self) -> (Vec<FileMeta>, ManifestVersion) {
+        let manifest = self.manifest_ctx.manifest().await;
+        let staging = self
+            .manifest_ctx
+            .staging_manifest()
+            .await
+            .map(|m| (m.files.clone(), m.manifest_version));
+
+        let version = staging
+            .as_ref()
+            .map(|(_, v)| *v)
+            .unwrap_or(manifest.manifest_version);
+
+        let files = match staging {
+            Some((staging_files, _)) => {
+                let merged = manifest
+                    .files
+                    .clone()
+                    .into_iter()
+                    .chain(staging_files)
+                    .collect::<std::collections::HashMap<_, _>>();
+                merged.into_values().collect()
+            }
+            None => manifest.files.values().cloned().collect(),
+        };
+
+        (files, version)
+    }
+
     /// Exit staging mode successfully by merging all staged manifests and making them visible.
+    /// Merges staged manifest actions into the live manifest and exits staging mode.
+    ///
+    /// The caller must hold the manifest write lock and pass it via `manager`.
+    /// Returns `Ok(Some(pending))` when staging manifests were merged, or
+    /// `Ok(None)` when there were no staged manifests to merge.
+    ///
+    /// **Important:** [`fire`](PendingManifestHook::fire) the receipt only after
+    /// dropping the lock — the hook may read the manifest and deadlock otherwise.
     pub(crate) async fn exit_staging_on_success(
         &self,
         manager: &mut RwLockWriteGuard<'_, RegionManifestManager>,
-    ) -> Result<()> {
+    ) -> Result<Option<PendingManifestHook>> {
         let current_state = self.manifest_ctx.current_state();
         ensure!(
             current_state == RegionRoleState::Leader(RegionLeaderState::Staging),
@@ -739,7 +925,7 @@ impl MitoRegion {
                 );
                 // Even if no manifests to merge, we still need to exit staging mode
                 self.exit_staging()?;
-                return Ok(());
+                return Ok(None);
             }
         };
         let expect_change = merged_actions.actions.iter().any(|a| a.is_change());
@@ -782,9 +968,13 @@ impl MitoRegion {
             );
         }
 
-        // Submit merged actions using the manifest manager's update method
-        // Pass the `false` so it saves to normal directory, not staging
-        let new_version = manager.update(merged_actions, false).await?;
+        // Submit merged actions using the manifest manager's update method.
+        // Pass `false` so it saves to normal directory, not staging.
+        let pending = self
+            .manifest_ctx
+            .update_locked(manager, merged_actions, false)
+            .await?;
+        let new_version = pending.version();
         info!(
             "Successfully submitted merged staged manifests for region {}, new version: {}",
             self.region_id, new_version
@@ -808,7 +998,8 @@ impl MitoRegion {
         }
         self.exit_staging()?;
 
-        Ok(())
+        // Return the hook payload; the caller invokes the hook after dropping the lock.
+        Ok(Some(pending))
     }
 
     /// Returns the partition expression string for this region.
@@ -819,7 +1010,7 @@ impl MitoRegion {
     pub fn maybe_staging_partition_expr_str(&self) -> Option<String> {
         let is_staging = self.is_staging();
         if is_staging {
-            let staging_partition_info = self.staging_partition_info.lock().unwrap();
+            let staging_partition_info = self.manifest_ctx.staging_partition_info();
             if staging_partition_info.is_none() {
                 warn!(
                     "Staging partition expr is none for region {} in staging state",
@@ -837,8 +1028,8 @@ impl MitoRegion {
 
     pub fn expected_partition_expr_version(&self) -> u64 {
         if self.is_staging() {
-            let staging_partition_info = self.staging_partition_info.lock().unwrap();
-            staging_partition_info
+            self.manifest_ctx
+                .staging_partition_info()
                 .as_ref()
                 .map(|info| info.partition_rule_version)
                 .unwrap_or_default()
@@ -852,8 +1043,8 @@ impl MitoRegion {
         if !self.is_staging() {
             return false;
         }
-        let staging_partition_info = self.staging_partition_info.lock().unwrap();
-        staging_partition_info
+        self.manifest_ctx
+            .staging_partition_info()
             .as_ref()
             .map(|info| {
                 matches!(
@@ -865,22 +1056,125 @@ impl MitoRegion {
     }
 }
 
+impl Drop for MitoRegion {
+    fn drop(&mut self) {
+        self.remove_region_metrics();
+    }
+}
+
+/// Result of publishing rebuilt index metadata to the manifest.
+#[derive(Debug)]
+pub(crate) enum IndexPublication {
+    /// The index metadata was committed.
+    Committed {
+        manifest_version: ManifestVersion,
+        file_meta: FileMeta,
+    },
+    /// The build no longer matches the current manifest.
+    Stale(IndexPublicationStale),
+}
+
+/// Why an index publication became stale.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IndexPublicationStale {
+    /// The source SST or region incarnation is no longer publishable.
+    SourceChanged,
+    /// The SST still matches, but the schema generation changed.
+    SchemaChanged,
+}
+
+/// Manifest state an index build is based on.
+///
+/// Both fields must still match when the rebuilt index is published. The file
+/// metadata identifies the exact SST generation, while the schema version
+/// identifies the exact index definition used by the builder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IndexBuildSource {
+    pub(crate) file_meta: FileMeta,
+    pub(crate) schema_version: u64,
+}
+
+impl IndexBuildSource {
+    pub(crate) fn new(file_meta: FileMeta, schema_version: u64) -> Self {
+        Self {
+            file_meta,
+            schema_version,
+        }
+    }
+}
+
 /// Context to update the region manifest.
 #[derive(Debug)]
 pub(crate) struct ManifestContext {
-    /// Manager to maintain manifest for this region.
+    /// Manager to maintain manifest for this region. Logical writes go through
+    /// [`update_locked`](Self::update_locked) (or an [`update_manifest`](Self::update_manifest)
+    /// variant) so they produce a [`PendingManifestHook`].
     pub(crate) manifest_manager: tokio::sync::RwLock<RegionManifestManager>,
     /// The state of the region. The region checks the state before updating
     /// manifest.
     state: AtomicCell<RegionRoleState>,
+    /// Partition info of the region in staging mode.
+    ///
+    /// During the staging mode, the region metadata in [`VersionControlRef`] is not updated,
+    /// so we need to store the partition info separately.
+    staging_partition_info: Mutex<Option<StagingPartitionInfo>>,
+    /// Optional region hook for observing manifest mutations.
+    hook: Option<RegionHookRef>,
 }
 
 impl ManifestContext {
-    pub(crate) fn new(manager: RegionManifestManager, state: RegionRoleState) -> Self {
+    pub(crate) fn new(
+        manager: RegionManifestManager,
+        state: RegionRoleState,
+        hook: Option<RegionHookRef>,
+    ) -> Self {
         ManifestContext {
             manifest_manager: tokio::sync::RwLock::new(manager),
             state: AtomicCell::new(state),
+            staging_partition_info: Mutex::new(None),
+            hook,
         }
+    }
+
+    /// Returns the region hook if one is registered.
+    pub(crate) fn hook(&self) -> Option<RegionHookRef> {
+        self.hook.clone()
+    }
+
+    pub(crate) fn staging_partition_info(&self) -> Option<StagingPartitionInfo> {
+        self.staging_partition_info.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_staging_partition_info(&self, staging_partition_info: StagingPartitionInfo) {
+        let mut current = self.staging_partition_info.lock().unwrap();
+        debug_assert!(current.is_none());
+        *current = Some(staging_partition_info);
+    }
+
+    fn clear_staging_partition_info(&self) {
+        *self.staging_partition_info.lock().unwrap() = None;
+    }
+
+    pub(crate) fn exit_staging(
+        &self,
+        region_id: RegionId,
+        next_state: RegionRoleState,
+    ) -> Result<()> {
+        self.state
+            .compare_exchange(
+                RegionRoleState::Leader(RegionLeaderState::Staging),
+                next_state,
+            )
+            .map_err(|actual| {
+                RegionStateSnafu {
+                    region_id,
+                    state: actual,
+                    expect: RegionRoleState::Leader(RegionLeaderState::Staging),
+                }
+                .build()
+            })?;
+        self.clear_staging_partition_info();
+        Ok(())
     }
 
     pub(crate) async fn manifest_version(&self) -> ManifestVersion {
@@ -922,43 +1216,221 @@ impl ManifestContext {
         action_list: RegionMetaActionList,
         is_staging: bool,
     ) -> Result<ManifestVersion> {
+        self.update_manifest_with_state_check(action_list, is_staging, |current_state, region_id| {
+            // If expect_state is not downgrading, the current state must be either `expect_state` or downgrading.
+            //
+            // A downgrading leader rejects user writes but still allows
+            // flushing the memtable and updating the manifest.
+            if expect_state != RegionLeaderState::Downgrading {
+                if current_state == RegionRoleState::Leader(RegionLeaderState::Downgrading) {
+                    info!(
+                        "Region {} is in downgrading leader state, updating manifest. Expect state is {:?}",
+                        region_id, expect_state
+                    );
+                }
+                ensure!(
+                    current_state == RegionRoleState::Leader(expect_state)
+                        || current_state == RegionRoleState::Leader(RegionLeaderState::Downgrading),
+                    UpdateManifestSnafu {
+                        region_id,
+                        state: current_state,
+                    }
+                );
+            } else {
+                ensure!(
+                    current_state == RegionRoleState::Leader(expect_state),
+                    RegionStateSnafu {
+                        region_id,
+                        state: current_state,
+                        expect: RegionRoleState::Leader(expect_state),
+                    }
+                );
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// Updates the manifest for compaction.
+    ///
+    /// Compaction may finish while a direct external region edit is in the transient
+    /// `Editing` state. Direct external edits can remove files both when followers
+    /// apply sync-region metadata and when a writable leader performs a direct edit
+    /// such as `edit_region()`. Allowing compaction to publish in `Editing` is still
+    /// safe because publication happens under the manifest write lock and compaction
+    /// rechecks that its input files are still valid before committing.
+    ///
+    /// This intentionally writes to the normal manifest path (`is_staging = false`).
+    /// Entering staging cancels or waits for active compactions before switching the
+    /// region to `Staging`, so a compaction that started before staging still finishes
+    /// against the normal manifest. Even if a manual compaction is requested while the
+    /// region is already staging, compaction only sees SSTs in the normal visible
+    /// region version; SSTs from staging manifests are not applied to region version
+    /// control until staging exits successfully.
+    pub(crate) async fn update_manifest_for_compaction(
+        &self,
+        action_list: RegionMetaActionList,
+    ) -> Result<ManifestVersion> {
+        self.update_manifest_with_state_check(action_list, false, |current_state, region_id| {
+            ensure!(
+                matches!(
+                    current_state,
+                    RegionRoleState::Leader(RegionLeaderState::Writable)
+                        | RegionRoleState::Leader(RegionLeaderState::Editing)
+                        | RegionRoleState::Leader(RegionLeaderState::Downgrading)
+                ),
+                UpdateManifestSnafu {
+                    region_id,
+                    state: current_state,
+                }
+            );
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// Conditionally publishes rebuilt index metadata for `source`.
+    ///
+    /// The source SST and schema-generation checks share the manifest write lock
+    /// with the update, so a concurrent compaction, schema change, or another
+    /// index build cannot commit between them.
+    pub(crate) async fn update_manifest_for_index(
+        &self,
+        source: &IndexBuildSource,
+        updated: FileMeta,
+    ) -> Result<IndexPublication> {
+        let manager = self.manifest_manager.write().await;
+        let manifest = manager.manifest();
+        let current_state = self.state.load();
+        if !matches!(
+            current_state,
+            RegionRoleState::Leader(RegionLeaderState::Writable)
+                | RegionRoleState::Leader(RegionLeaderState::Downgrading)
+        ) || manager.is_stopped()
+        {
+            return Ok(IndexPublication::Stale(
+                IndexPublicationStale::SourceChanged,
+            ));
+        }
+
+        if manifest.files.get(&source.file_meta.file_id) != Some(&source.file_meta) {
+            return Ok(IndexPublication::Stale(
+                IndexPublicationStale::SourceChanged,
+            ));
+        }
+
+        if manifest.metadata.schema_version != source.schema_version {
+            return Ok(IndexPublication::Stale(
+                IndexPublicationStale::SchemaChanged,
+            ));
+        }
+
+        // Only index metadata is allowed to change in this publication.
+        let mut committed = source.file_meta.clone();
+        committed.available_indexes = updated.available_indexes;
+        committed.indexes = updated.indexes;
+        committed.index_file_size = updated.index_file_size;
+        committed.index_version = updated.index_version;
+
+        let edit = crate::manifest::action::RegionEdit {
+            files_to_add: vec![committed.clone()],
+            files_to_remove: Vec::new(),
+            timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
+            flushed_sequence: None,
+            flushed_entry_id: None,
+            committed_sequence: None,
+            compaction_time_window: None,
+        };
+        let action_list = RegionMetaActionList::with_action(RegionMetaAction::Edit(edit));
+        let manifest_version = self.update_and_fire(manager, action_list, false).await?;
+
+        Ok(IndexPublication::Committed {
+            manifest_version,
+            file_meta: committed,
+        })
+    }
+
+    /// Performs a manifest write under a caller-held write lock and returns a
+    /// [`PendingManifestHook`] to [`fire`](PendingManifestHook::fire) after
+    /// dropping the lock. This is the sole caller of
+    /// [`RegionManifestManager::update`], so it is the funnel through which all
+    /// logical manifest writes notify the hook.
+    ///
+    /// Does not validate state or edit applicability — the caller must do so
+    /// while still holding the lock (see `update_manifest_with_state_check`
+    /// and `MitoRegion::exit_staging_on_success`).
+    pub(crate) async fn update_locked(
+        &self,
+        manager: &mut RegionManifestManager,
+        action_list: RegionMetaActionList,
+        is_staging: bool,
+    ) -> Result<PendingManifestHook> {
+        let region_id = manager.manifest().metadata.region_id;
+        // Clone before `action_list` is moved into `update` so the hook still
+        // sees what was written.
+        let action_list_for_hook = self.hook.as_ref().map(|_| action_list.clone());
+        let version = manager
+            .update(action_list, is_staging)
+            .await
+            .inspect_err(|e| error!(e; "Failed to update manifest, region_id: {}", region_id))?;
+
+        Ok(PendingManifestHook::new(
+            region_id,
+            action_list_for_hook,
+            version,
+            self.hook.clone(),
+            is_staging,
+        ))
+    }
+
+    /// Updates the manifest using a caller-held write lock, releases the lock,
+    /// and then fires the manifest hook.
+    ///
+    /// Callers must perform state and applicability checks before calling this
+    /// method so the checks and update remain in the same lock critical section.
+    async fn update_and_fire(
+        &self,
+        mut manager: RwLockWriteGuard<'_, RegionManifestManager>,
+        action_list: RegionMetaActionList,
+        is_staging: bool,
+    ) -> Result<ManifestVersion> {
+        let region_id = manager.manifest().metadata.region_id;
+        let pending = self
+            .update_locked(&mut manager, action_list, is_staging)
+            .await?;
+        let version = pending.version();
+
+        // Hook implementations may read the manifest or send region requests
+        // that acquire this lock.
+        drop(manager);
+
+        if self.state.load() == RegionRoleState::Follower {
+            warn!(
+                "Region {} becomes follower while updating manifest which may cause inconsistency, manifest version: {version}",
+                region_id
+            );
+        }
+
+        pending.fire().await;
+        Ok(version)
+    }
+
+    async fn update_manifest_with_state_check(
+        &self,
+        action_list: RegionMetaActionList,
+        is_staging: bool,
+        check_state: impl FnOnce(RegionRoleState, RegionId) -> Result<()>,
+    ) -> Result<ManifestVersion> {
         // Acquires the write lock of the manifest manager.
-        let mut manager = self.manifest_manager.write().await;
+        let manager = self.manifest_manager.write().await;
         // Gets current manifest.
         let manifest = manager.manifest();
         // Checks state inside the lock. This is to ensure that we won't update the manifest
         // after `set_readonly_gracefully()` is called.
         let current_state = self.state.load();
-
-        // If expect_state is not downgrading, the current state must be either `expect_state` or downgrading.
-        //
-        // A downgrading leader rejects user writes but still allows
-        // flushing the memtable and updating the manifest.
-        if expect_state != RegionLeaderState::Downgrading {
-            if current_state == RegionRoleState::Leader(RegionLeaderState::Downgrading) {
-                info!(
-                    "Region {} is in downgrading leader state, updating manifest. state is {:?}",
-                    manifest.metadata.region_id, expect_state
-                );
-            }
-            ensure!(
-                current_state == RegionRoleState::Leader(expect_state)
-                    || current_state == RegionRoleState::Leader(RegionLeaderState::Downgrading),
-                UpdateManifestSnafu {
-                    region_id: manifest.metadata.region_id,
-                    state: current_state,
-                }
-            );
-        } else {
-            ensure!(
-                current_state == RegionRoleState::Leader(expect_state),
-                RegionStateSnafu {
-                    region_id: manifest.metadata.region_id,
-                    state: current_state,
-                    expect: RegionRoleState::Leader(expect_state),
-                }
-            );
-        }
+        check_state(current_state, manifest.metadata.region_id)?;
 
         for action in &action_list.actions {
             // Checks whether the edit is still applicable.
@@ -1010,45 +1482,56 @@ impl ManifestContext {
             }
         }
 
-        // Now we can update the manifest.
-        let version = manager.update(action_list, is_staging).await.inspect_err(
-            |e| error!(e; "Failed to update manifest, region_id: {}", manifest.metadata.region_id),
-        )?;
-
-        if self.state.load() == RegionRoleState::Follower {
-            warn!(
-                "Region {} becomes follower while updating manifest which may cause inconsistency, manifest version: {version}",
-                manifest.metadata.region_id
-            );
-        }
-
-        Ok(version)
+        self.update_and_fire(manager, action_list, is_staging).await
     }
 
     /// Sets the [`RegionRole`].
     ///
     /// ```text
-    ///     +------------------------------------------+
-    ///     |                      +-----------------+ |
-    ///     |                      |                 | |
-    /// +---+------+       +-------+-----+        +--v-v---+
-    /// | Follower |       | Downgrading |        | Leader |
-    /// +---^-^----+       +-----+-^-----+        +--+-+---+
-    ///     | |                  | |                 | |
-    ///     | +------------------+ +-----------------+ |
-    ///     +------------------------------------------+
-    ///
-    /// Transition:
-    /// - Follower -> Leader
-    /// - Downgrading Leader -> Leader
-    /// - Leader -> Follower
-    /// - Downgrading Leader -> Follower
-    /// - Leader -> Downgrading Leader
+    ///                  +---------------------+
+    ///                  |   Staging Leader    |
+    ///                  +----------+----------+
+    ///                             |
+    ///                             v
+    ///     +----------+     +------+-------+     +-------------+
+    ///     | Follower | <-> |    Leader    | <-> | Downgrading |
+    ///     +-----+----+     +------+-------+     +------+------+
+    ///           ^                 ^                    |
+    ///           +-----------------+--------------------+
     ///
     /// ```
+    ///
+    /// # State Transitions
+    ///
+    /// From `Follower`:
+    /// - `Follower -> Leader`
+    ///
+    /// From `Leader`:
+    /// - `Leader -> Follower`
+    /// - `Leader -> Downgrading Leader`
+    ///
+    /// From `Staging Leader`:
+    /// - `Staging Leader -> Leader`
+    /// - `Staging Leader -> Follower`
+    /// - `Staging Leader -> Downgrading Leader`
+    ///
+    /// From `Downgrading Leader`:
+    /// - `Downgrading Leader -> Leader`
+    /// - `Downgrading Leader -> Follower`
     pub(crate) fn set_role(&self, next_role: RegionRole, region_id: RegionId) {
         match next_role {
             RegionRole::Follower => {
+                if self
+                    .exit_staging(region_id, RegionRoleState::Follower)
+                    .is_ok()
+                {
+                    info!(
+                        "Convert region {} to follower, previous role state: {:?}",
+                        region_id,
+                        RegionRoleState::Leader(RegionLeaderState::Staging)
+                    );
+                    return;
+                }
                 match self.state.fetch_update(|state| {
                     if !matches!(state, RegionRoleState::Follower) {
                         Some(RegionRoleState::Follower)
@@ -1071,6 +1554,20 @@ impl ManifestContext {
                 }
             }
             RegionRole::Leader => {
+                if self
+                    .exit_staging(
+                        region_id,
+                        RegionRoleState::Leader(RegionLeaderState::Writable),
+                    )
+                    .is_ok()
+                {
+                    info!(
+                        "Convert region {} to leader, previous role state: {:?}",
+                        region_id,
+                        RegionRoleState::Leader(RegionLeaderState::Staging)
+                    );
+                    return;
+                }
                 match self.state.fetch_update(|state| {
                     if matches!(
                         state,
@@ -1096,7 +1593,27 @@ impl ManifestContext {
                     }
                 }
             }
+            RegionRole::StagingLeader => {
+                info!(
+                    "Ignore direct conversion of region {} to staging leader; staging requires the dedicated workflow",
+                    region_id
+                );
+            }
             RegionRole::DowngradingLeader => {
+                if self
+                    .exit_staging(
+                        region_id,
+                        RegionRoleState::Leader(RegionLeaderState::Downgrading),
+                    )
+                    .is_ok()
+                {
+                    info!(
+                        "Convert region {} to downgrading region, previous role state: {:?}",
+                        region_id,
+                        RegionRoleState::Leader(RegionLeaderState::Staging)
+                    );
+                    return;
+                }
                 match self.state.compare_exchange(
                     RegionRoleState::Leader(RegionLeaderState::Writable),
                     RegionRoleState::Leader(RegionLeaderState::Downgrading),
@@ -1268,35 +1785,19 @@ impl RegionMap {
 
     /// Gets flushable region by region id.
     ///
-    /// Returns error if the region does not exist.
-    /// Returns None if the region exists but not operatable.
-    fn flushable_region(&self, region_id: RegionId) -> Result<Option<MitoRegionRef>> {
+    /// Returns error if the region does not exist or not flushable.
+    pub(crate) fn flushable_region(&self, region_id: RegionId) -> Result<MitoRegionRef> {
         let region = self
             .get_region(region_id)
             .context(RegionNotFoundSnafu { region_id })?;
-        if region.is_flushable() {
-            Ok(Some(region))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Gets flushable region by region id.
-    ///
-    /// Calls the callback if the region does not exist.
-    /// Returns None if the region exists but not operatable.
-    pub(crate) fn flushable_region_or<F: OnFailure>(
-        &self,
-        region_id: RegionId,
-        cb: &mut F,
-    ) -> Option<MitoRegionRef> {
-        match self.flushable_region(region_id) {
-            Ok(region) => region,
-            Err(e) => {
-                cb.on_failure(e);
-                None
+        ensure!(
+            region.is_flushable(),
+            FlushableRegionStateSnafu {
+                region_id,
+                state: region.state(),
             }
-        }
+        );
+        Ok(region)
     }
 
     /// Remove region by id.
@@ -1438,8 +1939,7 @@ pub fn parse_partition_expr(partition_expr_str: Option<&str>) -> Result<Option<P
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicU64;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use common_datasource::compression::CompressionType;
     use common_test_util::temp_dir::create_temp_dir;
@@ -1449,7 +1949,7 @@ mod tests {
     use store_api::logstore::provider::Provider;
     use store_api::region_engine::RegionRole;
     use store_api::region_request::PathType;
-    use store_api::storage::RegionId;
+    use store_api::storage::{FileId, RegionId};
 
     use crate::access_layer::AccessLayer;
     use crate::error::Error;
@@ -1458,7 +1958,8 @@ mod tests {
     };
     use crate::manifest::manager::{RegionManifestManager, RegionManifestOptions};
     use crate::region::{
-        ManifestContext, ManifestStats, MitoRegion, RegionLeaderState, RegionRoleState,
+        IndexBuildSource, IndexPublication, IndexPublicationStale, ManifestContext, ManifestStats,
+        MitoRegion, RegionLeaderState, RegionRoleState, RegionStats,
     };
     use crate::sst::FormatType;
     use crate::sst::index::intermediate::IntermediateManager;
@@ -1470,6 +1971,23 @@ mod tests {
     #[test]
     fn test_region_state_lock_free() {
         assert!(AtomicCell::<RegionRoleState>::is_lock_free());
+    }
+
+    #[test]
+    fn test_region_role_state_as_str() {
+        assert_eq!("Follower", RegionRoleState::Follower.as_str());
+        assert_eq!(
+            "Leader(Writable)",
+            RegionRoleState::Leader(RegionLeaderState::Writable).as_str()
+        );
+        assert_eq!(
+            "Leader(Staging)",
+            RegionRoleState::Leader(RegionLeaderState::Staging).as_str()
+        );
+        assert_eq!(
+            "Leader(Downgrading)",
+            RegionRoleState::Leader(RegionLeaderState::Downgrading).as_str()
+        );
     }
 
     async fn build_test_region(env: &SchedulerEnv) -> MitoRegion {
@@ -1497,6 +2015,7 @@ mod tests {
         let manifest_ctx = Arc::new(ManifestContext::new(
             manager,
             RegionRoleState::Leader(RegionLeaderState::Writable),
+            None,
         ));
 
         MitoRegion {
@@ -1507,12 +2026,11 @@ mod tests {
             file_purger: crate::test_util::new_noop_file_purger(),
             provider: Provider::noop_provider(),
             last_flush_millis: Default::default(),
-            last_compaction_millis: Default::default(),
+            last_schedule_compaction_millis: Default::default(),
             time_provider: Arc::new(StdTimeProvider),
             topic_latest_entry_id: Default::default(),
-            written_bytes: Arc::new(AtomicU64::new(0)),
+            region_stats: RegionStats::new(),
             stats: ManifestStats::default(),
-            staging_partition_info: Mutex::new(None),
         }
     }
 
@@ -1526,6 +2044,188 @@ mod tests {
             flushed_sequence: None,
             committed_sequence: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_compaction_update_manifest_allows_editing_state() {
+        let env = SchedulerEnv::new().await;
+        let region = build_test_region(&env).await;
+        region.set_editing(RegionLeaderState::Writable).unwrap();
+
+        let file_id = FileId::random();
+        let action_list = RegionMetaActionList::with_action(RegionMetaAction::Edit(RegionEdit {
+            files_to_add: vec![crate::sst::file::FileMeta {
+                region_id: region.region_id,
+                file_id,
+                level: 1,
+                ..Default::default()
+            }],
+            files_to_remove: Vec::new(),
+            timestamp_ms: None,
+            compaction_time_window: None,
+            flushed_entry_id: None,
+            flushed_sequence: None,
+            committed_sequence: None,
+        }));
+
+        region
+            .manifest_ctx
+            .update_manifest_for_compaction(action_list)
+            .await
+            .unwrap();
+
+        assert!(
+            region
+                .manifest_ctx
+                .manifest()
+                .await
+                .files
+                .contains_key(&file_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_publication_rejects_older_source_generation() {
+        let env = SchedulerEnv::new().await;
+        let region = build_test_region(&env).await;
+        let source = crate::sst::file::FileMeta {
+            region_id: region.region_id,
+            file_id: FileId::random(),
+            level: 1,
+            file_size: 1024,
+            ..Default::default()
+        };
+        region
+            .manifest_ctx
+            .update_manifest(
+                RegionLeaderState::Writable,
+                RegionMetaActionList::with_action(RegionMetaAction::Edit(RegionEdit {
+                    files_to_add: vec![source.clone()],
+                    ..empty_edit()
+                })),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut first_update = source.clone();
+        first_update.index_version = 1;
+        first_update.index_file_size = 128;
+        let schema_version = region.version().metadata.schema_version;
+        let initial_source = IndexBuildSource::new(source.clone(), schema_version);
+        let first_committed = match region
+            .manifest_ctx
+            .update_manifest_for_index(&initial_source, first_update)
+            .await
+            .unwrap()
+        {
+            IndexPublication::Committed { file_meta, .. } => file_meta,
+            IndexPublication::Stale(_) => panic!("first index publication should commit"),
+        };
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let delayed_manifest_ctx = region.manifest_ctx.clone();
+        let delayed_source = IndexBuildSource::new(first_committed.clone(), schema_version);
+        let delayed_publication = tokio::spawn(async move {
+            let mut delayed_update = delayed_source.file_meta.clone();
+            delayed_update.index_version = 2;
+            delayed_update.index_file_size = 128;
+            ready_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            delayed_manifest_ctx
+                .update_manifest_for_index(&delayed_source, delayed_update)
+                .await
+        });
+        ready_rx.await.unwrap();
+
+        let mut newer_update = first_committed.clone();
+        newer_update.index_version = 3;
+        newer_update.index_file_size = 256;
+        let newer_source = IndexBuildSource::new(first_committed, schema_version);
+        let newer_committed = match region
+            .manifest_ctx
+            .update_manifest_for_index(&newer_source, newer_update)
+            .await
+            .unwrap()
+        {
+            IndexPublication::Committed { file_meta, .. } => file_meta,
+            IndexPublication::Stale(_) => panic!("newer index publication should commit"),
+        };
+
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            delayed_publication.await.unwrap().unwrap(),
+            IndexPublication::Stale(IndexPublicationStale::SourceChanged)
+        ));
+        assert_eq!(
+            region
+                .manifest_ctx
+                .manifest()
+                .await
+                .files
+                .get(&source.file_id),
+            Some(&newer_committed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_publication_rejects_older_schema_generation() {
+        let env = SchedulerEnv::new().await;
+        let region = build_test_region(&env).await;
+        let source_meta = crate::sst::file::FileMeta {
+            region_id: region.region_id,
+            file_id: FileId::random(),
+            level: 1,
+            file_size: 1024,
+            ..Default::default()
+        };
+        region
+            .manifest_ctx
+            .update_manifest(
+                RegionLeaderState::Writable,
+                RegionMetaActionList::with_action(RegionMetaAction::Edit(RegionEdit {
+                    files_to_add: vec![source_meta.clone()],
+                    ..empty_edit()
+                })),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let old_schema_version = region.version().metadata.schema_version;
+        let source = IndexBuildSource::new(source_meta.clone(), old_schema_version);
+        let mut new_metadata = region.version().metadata.as_ref().clone();
+        new_metadata.schema_version += 1;
+        region
+            .manifest_ctx
+            .update_manifest(
+                RegionLeaderState::Writable,
+                RegionMetaActionList::with_action(RegionMetaAction::Change(RegionChange {
+                    metadata: Arc::new(new_metadata),
+                    sst_format: FormatType::PrimaryKey,
+                    append_mode: None,
+                })),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut updated = source_meta.clone();
+        updated.index_version = 1;
+        updated.index_file_size = 128;
+        assert!(matches!(
+            region
+                .manifest_ctx
+                .update_manifest_for_index(&source, updated)
+                .await
+                .unwrap(),
+            IndexPublication::Stale(IndexPublicationStale::SchemaChanged)
+        ));
+
+        let manifest = region.manifest_ctx.manifest().await;
+        assert_eq!(manifest.metadata.schema_version, old_schema_version + 1);
+        assert_eq!(manifest.files.get(&source_meta.file_id), Some(&source_meta));
     }
 
     #[tokio::test]
@@ -1548,7 +2248,7 @@ mod tests {
             .await
             .unwrap();
 
-        region.exit_staging_on_success(&mut manager).await.unwrap();
+        let _hook_payload = region.exit_staging_on_success(&mut manager).await.unwrap();
         drop(manager);
 
         assert_eq!(
@@ -1587,7 +2287,7 @@ mod tests {
             .await
             .unwrap();
 
-        region.exit_staging_on_success(&mut manager).await.unwrap();
+        let _hook_payload = region.exit_staging_on_success(&mut manager).await.unwrap();
         drop(manager);
 
         assert_eq!(
@@ -1684,6 +2384,13 @@ mod tests {
             RegionRoleState::Leader(RegionLeaderState::Writable)
         );
 
+        // Direct Leader -> StagingLeader should be ignored.
+        manifest_ctx.set_role(RegionRole::StagingLeader, region_id);
+        assert_eq!(
+            manifest_ctx.state.load(),
+            RegionRoleState::Leader(RegionLeaderState::Writable)
+        );
+
         // Leader -> Downgrading Leader
         manifest_ctx.set_role(RegionRole::DowngradingLeader, region_id);
         assert_eq!(
@@ -1742,6 +2449,7 @@ mod tests {
             Arc::new(ManifestContext::new(
                 manager,
                 RegionRoleState::Leader(RegionLeaderState::Staging),
+                None,
             ))
         };
 
@@ -1810,6 +2518,7 @@ mod tests {
         let manifest_ctx = Arc::new(ManifestContext::new(
             manager,
             RegionRoleState::Leader(RegionLeaderState::Writable),
+            None,
         ));
 
         let region = MitoRegion {
@@ -1820,12 +2529,11 @@ mod tests {
             file_purger: crate::test_util::new_noop_file_purger(),
             provider: Provider::noop_provider(),
             last_flush_millis: Default::default(),
-            last_compaction_millis: Default::default(),
+            last_schedule_compaction_millis: Default::default(),
             time_provider: Arc::new(StdTimeProvider),
             topic_latest_entry_id: Default::default(),
-            written_bytes: Arc::new(AtomicU64::new(0)),
+            region_stats: RegionStats::new(),
             stats: ManifestStats::default(),
-            staging_partition_info: Mutex::new(None),
         };
 
         // Test initial state

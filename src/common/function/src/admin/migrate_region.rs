@@ -47,7 +47,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 )]
 pub(crate) async fn migrate_region(
     procedure_service_handler: &ProcedureServiceHandlerRef,
-    _ctx: &QueryContextRef,
+    query_ctx: &QueryContextRef,
     params: &[ValueRef<'_>],
 ) -> Result<Value> {
     let (region_id, from_peer, to_peer, timeout) = match params.len() {
@@ -82,12 +82,15 @@ pub(crate) async fn migrate_region(
     match (region_id, from_peer, to_peer, timeout) {
         (Some(region_id), Some(from_peer), Some(to_peer), Some(timeout)) => {
             let pid = procedure_service_handler
-                .migrate_region(MigrateRegionRequest {
-                    region_id,
-                    from_peer,
-                    to_peer,
-                    timeout: Duration::from_secs(timeout),
-                })
+                .migrate_region(
+                    query_ctx.clone(),
+                    MigrateRegionRequest {
+                        region_id,
+                        from_peer,
+                        to_peer,
+                        timeout: Duration::from_secs(timeout),
+                    },
+                )
                 .await?;
 
             match pid {
@@ -173,7 +176,7 @@ mod tests {
         };
         let result = f.invoke_async_with_args(func_args).await.unwrap_err();
         assert_eq!(
-            "Execution error: Handler error: Missing ProcedureServiceHandler, not expected",
+            "Execution error: Missing ProcedureServiceHandler, not expected",
             result.to_string()
         );
     }

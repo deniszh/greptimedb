@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DfResult;
 use datafusion::execution::SessionStateBuilder;
@@ -40,7 +41,7 @@ use snafu::{ResultExt, ensure};
 use sqlparser::dialect::Dialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
-use table::requests::validate_table_option;
+use table::requests::{SEMANTIC_PREFIX, validate_semantic_option, validate_table_option};
 
 use crate::error::{
     ConvertToLogicalExpressionSnafu, InvalidSqlSnafu, InvalidTableOptionSnafu, ParseSqlValueSnafu,
@@ -96,6 +97,14 @@ pub(crate) fn is_simple_tql_cte_query(query: &Query) -> bool {
     let reference = ParserContext::canonicalize_identifier(reference).value;
     let cte_name = ParserContext::canonicalize_identifier(cte.name.clone()).value;
     reference == cte_name
+}
+
+pub(crate) fn has_tql_cte(query: &Query) -> bool {
+    query.hybrid_cte.as_ref().is_some_and(|with| {
+        with.cte_tables
+            .iter()
+            .any(|cte| matches!(cte.content, CteContent::Tql(_)))
+    })
 }
 
 fn has_only_hybrid_tql_cte(query: &Query) -> bool {
@@ -194,6 +203,18 @@ pub fn parser_expr_to_scalar_value_literal(
     expr: sqlparser::ast::Expr,
     require_now_expr: bool,
 ) -> Result<ScalarValue> {
+    parser_expr_to_scalar_value_literal_at(expr, require_now_expr, None)
+}
+
+/// Same as [`parser_expr_to_scalar_value_literal`] but uses the provided
+/// `scheduled_time` for evaluating `now()`. If `scheduled_time` is
+/// `Some`, `now()` will be simplified to the given timestamp instead of
+/// the current wall-clock time.
+pub fn parser_expr_to_scalar_value_literal_at(
+    expr: sqlparser::ast::Expr,
+    require_now_expr: bool,
+    scheduled_time: Option<DateTime<Utc>>,
+) -> Result<ScalarValue> {
     // 1. convert parser expr to logical expr
     let empty_df_schema = DFSchema::empty();
     let logical_expr = SqlToRel::new(&StubContextProvider::default())
@@ -242,8 +263,11 @@ pub fn parser_expr_to_scalar_value_literal(
         }
     }
 
-    // 2. simplify logical expr
-    let info = SimplifyContext::default().with_current_time();
+    // 2. simplify logical expr — use scheduled time if provided, else wall-clock
+    let info = match scheduled_time {
+        Some(dt) => SimplifyContext::default().with_query_execution_start_time(Some(dt)),
+        None => SimplifyContext::default().with_current_time(),
+    };
     let simplifier = ExprSimplifier::new(info);
 
     // Coerce the logical expression so simplifier can handle it correctly. This is necessary for const eval with possible type mismatch. i.e.: `now() - now() + '15s'::interval` which is `TimestampNanosecond - TimestampNanosecond + IntervalMonthDayNano`.
@@ -395,8 +419,18 @@ pub fn parse_with_options(parser: &mut Parser) -> Result<OptionMap> {
         .into_iter()
         .map(parse_option_string)
         .collect::<Result<HashMap<String, OptionValue>>>()?;
-    for key in options.keys() {
-        ensure!(validate_table_option(key), InvalidTableOptionSnafu { key });
+    for (key, value) in &options {
+        if key.starts_with(SEMANTIC_PREFIX) {
+            // Semantic keys are whitelisted and value-checked against their domain,
+            // so a user cannot set an unknown key or an out-of-range value.
+            let value = value.as_string().unwrap_or_default();
+            ensure!(
+                validate_semantic_option(key, value),
+                InvalidTableOptionSnafu { key }
+            );
+        } else {
+            ensure!(validate_table_option(key), InvalidTableOptionSnafu { key });
+        }
     }
     Ok(OptionMap::new(options))
 }

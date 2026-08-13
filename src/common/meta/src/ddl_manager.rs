@@ -17,23 +17,27 @@ use std::time::Duration;
 
 use api::v1::Repartition;
 use api::v1::alter_table_expr::Kind;
+use api::v1::repartition::Source as PbRepartitionSource;
 use common_error::ext::BoxedError;
+use common_event_recorder::PersistentEventContext;
+#[cfg(feature = "enterprise")]
+use common_event_recorder::TriggerReason;
 use common_procedure::{
-    BoxedProcedure, BoxedProcedureLoader, Output, ProcedureId, ProcedureManagerRef,
-    ProcedureWithId, watcher,
+    BoxedProcedure, BoxedProcedureLoader, Output, ProcedureContext, ProcedureId,
+    ProcedureManagerRef, ProcedureWithId, watcher,
 };
 use common_telemetry::tracing_context::{FutureExt, TracingContext};
 use common_telemetry::{debug, info, tracing};
 use derive_builder::Builder;
 use snafu::{OptionExt, ResultExt, ensure};
-use store_api::storage::TableId;
+use store_api::storage::{RegionId, TableId};
 use table::table_name::TableName;
 
 use crate::ddl::alter_database::AlterDatabaseProcedure;
 use crate::ddl::alter_logical_tables::AlterLogicalTablesProcedure;
-use crate::ddl::alter_table::AlterTableProcedure;
+use crate::ddl::alter_table::{AlterTableProcedure, RegionRouteChanged, only_enables_skip_wal};
 use crate::ddl::comment_on::CommentOnProcedure;
-use crate::ddl::create_database::CreateDatabaseProcedure;
+use crate::ddl::create_database::{CreateDatabaseMetadataCommitterRef, CreateDatabaseProcedure};
 use crate::ddl::create_flow::CreateFlowProcedure;
 use crate::ddl::create_logical_tables::CreateLogicalTablesProcedure;
 use crate::ddl::create_table::CreateTableProcedure;
@@ -42,13 +46,18 @@ use crate::ddl::drop_database::DropDatabaseProcedure;
 use crate::ddl::drop_flow::DropFlowProcedure;
 use crate::ddl::drop_table::DropTableProcedure;
 use crate::ddl::drop_view::DropViewProcedure;
+#[cfg(feature = "enterprise")]
+use crate::ddl::purge_dropped_table::PurgeDroppedTableProcedure;
 use crate::ddl::truncate_table::TruncateTableProcedure;
+#[cfg(feature = "enterprise")]
+use crate::ddl::undrop_table::UndropTableProcedure;
 use crate::ddl::{DdlContext, utils};
 use crate::error::{
-    CreateRepartitionProcedureSnafu, EmptyDdlTasksSnafu, ProcedureOutputSnafu,
-    RegisterProcedureLoaderSnafu, RegisterRepartitionProcedureLoaderSnafu, Result,
-    SubmitProcedureSnafu, TableInfoNotFoundSnafu, TableNotFoundSnafu, TableRouteNotFoundSnafu,
-    UnexpectedLogicalRouteTableSnafu, WaitProcedureSnafu,
+    self, CreateRepartitionProcedureSnafu, EmptyDdlTasksSnafu,
+    PersistRepartitionGcRequirementSnafu, ProcedureOutputSnafu, RegisterProcedureLoaderSnafu,
+    RegisterRepartitionProcedureLoaderSnafu, Result, SubmitProcedureSnafu, TableInfoNotFoundSnafu,
+    TableNotFoundSnafu, TableRouteNotFoundSnafu, UnexpectedLogicalRouteTableSnafu,
+    UnsupportedSnafu, WaitProcedureSnafu,
 };
 use crate::key::table_info::TableInfoValue;
 use crate::key::table_name::TableNameKey;
@@ -61,7 +70,7 @@ use crate::rpc::ddl::DdlTask::DropTrigger;
 use crate::rpc::ddl::DdlTask::{
     AlterDatabase, AlterLogicalTables, AlterTable, CommentOn, CreateDatabase, CreateFlow,
     CreateLogicalTables, CreateTable, CreateView, DropDatabase, DropFlow, DropLogicalTables,
-    DropTable, DropView, TruncateTable,
+    DropTable, DropView, PurgeDroppedTable, TruncateTable, UndropTable,
 };
 #[cfg(feature = "enterprise")]
 use crate::rpc::ddl::trigger::CreateTriggerTask;
@@ -70,9 +79,11 @@ use crate::rpc::ddl::trigger::DropTriggerTask;
 use crate::rpc::ddl::{
     AlterDatabaseTask, AlterTableTask, CommentOnTask, CreateDatabaseTask, CreateFlowTask,
     CreateTableTask, CreateViewTask, DropDatabaseTask, DropFlowTask, DropTableTask, DropViewTask,
-    QueryContext, SubmitDdlTaskRequest, SubmitDdlTaskResponse, TruncateTableTask,
+    PurgeDroppedTableTask, QueryContext, SubmitDdlTaskRequest, SubmitDdlTaskResponse,
+    TruncateTableTask, UndropTableTask,
 };
-use crate::rpc::router::RegionRoute;
+
+const MAX_REGION_ROUTE_CHANGE_RETRIES: usize = 3;
 
 /// A configurator that customizes or enhances a [`DdlManager`].
 #[async_trait::async_trait]
@@ -112,6 +123,7 @@ pub trait TriggerDdlManager: Send + Sync {
         procedure_manager: ProcedureManagerRef,
         ddl_context: DdlContext,
         query_context: QueryContext,
+        procedure_context: ProcedureContext,
     ) -> Result<SubmitDdlTaskResponse>;
 
     async fn drop_trigger(
@@ -120,6 +132,7 @@ pub trait TriggerDdlManager: Send + Sync {
         procedure_manager: ProcedureManagerRef,
         ddl_context: DdlContext,
         query_context: QueryContext,
+        procedure_context: ProcedureContext,
     ) -> Result<SubmitDdlTaskResponse>;
 
     fn as_any(&self) -> &dyn std::any::Any;
@@ -132,7 +145,7 @@ macro_rules! procedure_loader_entry {
     ($procedure:ident) => {
         (
             $procedure::TYPE_NAME,
-            &|context: DdlContext| -> BoxedProcedureLoader {
+            &|context: DdlContext| -> common_procedure::BoxedProcedureLoader {
                 Box::new(move |json: &str| {
                     let context = context.clone();
                     $procedure::from_json(json, context).map(|p| Box::new(p) as _)
@@ -152,13 +165,30 @@ macro_rules! procedure_loader {
 
 pub type RepartitionProcedureFactoryRef = Arc<dyn RepartitionProcedureFactory>;
 
+pub enum RepartitionSource {
+    Partitioned {
+        exprs: Vec<String>,
+        /// Full target partition columns to overwrite table metadata.
+        ///
+        /// `None` means the repartition keeps using the current table
+        /// partition columns, so the procedure won't update
+        /// `partition_key_indices`.
+        target_partition_columns: Option<Vec<String>>,
+    },
+    Unpartitioned {
+        partition_columns: Vec<String>,
+    },
+}
+
+#[async_trait::async_trait]
 pub trait RepartitionProcedureFactory: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     fn create(
         &self,
         ddl_ctx: &DdlContext,
         table_name: TableName,
         table_id: TableId,
-        from_exprs: Vec<String>,
+        source: RepartitionSource,
         to_exprs: Vec<String>,
         timeout: Option<Duration>,
     ) -> std::result::Result<BoxedProcedure, BoxedError>;
@@ -168,6 +198,9 @@ pub trait RepartitionProcedureFactory: Send + Sync {
         ddl_ctx: &DdlContext,
         procedure_manager: &ProcedureManagerRef,
     ) -> std::result::Result<(), BoxedError>;
+
+    /// Persists the cluster-level GC requirement before submitting a repartition.
+    async fn ensure_gc_requirement(&self) -> std::result::Result<(), BoxedError>;
 }
 
 /// The options for DDL tasks.
@@ -190,29 +223,32 @@ pub struct DdlOptions {
 }
 
 impl DdlManager {
-    /// Returns a new [DdlManager] with all Ddl [BoxedProcedureLoader](common_procedure::procedure::BoxedProcedureLoader)s registered.
-    pub fn try_new(
+    /// Returns a new [DdlManager].
+    pub fn new(
         ddl_context: DdlContext,
         procedure_manager: ProcedureManagerRef,
         repartition_procedure_factory: RepartitionProcedureFactoryRef,
-        register_loaders: bool,
-    ) -> Result<Self> {
-        let manager = Self {
+    ) -> Self {
+        Self {
             ddl_context,
             procedure_manager,
             repartition_procedure_factory,
             #[cfg(feature = "enterprise")]
             trigger_ddl_manager: None,
-        };
-        if register_loaders {
-            manager.register_loaders()?;
         }
-        Ok(manager)
     }
 
     #[cfg(feature = "enterprise")]
     pub fn with_trigger_ddl_manager(mut self, trigger_ddl_manager: TriggerDdlManagerRef) -> Self {
         self.trigger_ddl_manager = Some(trigger_ddl_manager);
+        self
+    }
+
+    pub fn with_create_database_metadata_committer(
+        mut self,
+        committer: CreateDatabaseMetadataCommitterRef,
+    ) -> Self {
+        self.ddl_context.create_database_metadata_committer = Some(committer);
         self
     }
 
@@ -233,22 +269,46 @@ impl DdlManager {
             CreateLogicalTablesProcedure,
             CreateViewProcedure,
             CreateFlowProcedure,
+            CreateDatabaseProcedure,
             AlterTableProcedure,
             AlterLogicalTablesProcedure,
             AlterDatabaseProcedure,
             DropTableProcedure,
             DropFlowProcedure,
             TruncateTableProcedure,
-            CreateDatabaseProcedure,
             DropDatabaseProcedure,
             DropViewProcedure,
             CommentOnProcedure
         );
+        #[cfg(feature = "enterprise")]
+        let loaders = {
+            let soft_drop_loaders: Vec<(&str, &BoxedProcedureLoaderFactory)> =
+                procedure_loader!(UndropTableProcedure, PurgeDroppedTableProcedure);
+            loaders
+                .into_iter()
+                .chain(soft_drop_loaders)
+                .collect::<Vec<_>>()
+        };
 
         for (type_name, loader_factory) in loaders {
             let context = self.create_context();
             self.procedure_manager
                 .register_loader(type_name, loader_factory(context))
+                .context(RegisterProcedureLoaderSnafu { type_name })?;
+        }
+
+        #[cfg(feature = "enterprise")]
+        {
+            let type_name = PurgeDroppedTableProcedure::EXPIRED_TYPE_NAME;
+            let context = self.create_context();
+            self.procedure_manager
+                .register_loader(
+                    type_name,
+                    Box::new(move |json: &str| {
+                        PurgeDroppedTableProcedure::from_json(json, context.clone())
+                            .map(|procedure| Box::new(procedure) as _)
+                    }),
+                )
                 .context(RegisterProcedureLoaderSnafu { type_name })?;
         }
 
@@ -281,14 +341,35 @@ impl DdlManager {
         &self,
         table_id: TableId,
         table_name: TableName,
-        Repartition {
-            from_partition_exprs,
-            into_partition_exprs,
-        }: Repartition,
+        repartition: Repartition,
         wait: bool,
         timeout: Duration,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
+
+        let into_partition_exprs = repartition.into_partition_exprs;
+        let source = repartition.source;
+
+        let source = match source {
+            Some(PbRepartitionSource::PartitionExprs(source)) => RepartitionSource::Partitioned {
+                exprs: source.exprs,
+                target_partition_columns: source
+                    .target_partition_columns
+                    .map(|columns| columns.columns),
+            },
+            Some(PbRepartitionSource::Unpartitioned(source)) => RepartitionSource::Unpartitioned {
+                partition_columns: source.partition_columns,
+            },
+            None => {
+                // Reads the deprecated field for backward compatibility with old persisted DDL tasks.
+                #[allow(deprecated)]
+                RepartitionSource::Partitioned {
+                    exprs: repartition.from_partition_exprs,
+                    target_partition_columns: None,
+                }
+            }
+        };
 
         let procedure = self
             .repartition_procedure_factory
@@ -296,12 +377,17 @@ impl DdlManager {
                 &context,
                 table_name,
                 table_id,
-                from_partition_exprs,
+                source,
                 into_partition_exprs,
                 Some(timeout),
             )
             .context(CreateRepartitionProcedureSnafu)?;
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        self.repartition_procedure_factory
+            .ensure_gc_requirement()
+            .await
+            .context(PersistRepartitionGcRequirementSnafu)?;
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
         if wait {
             self.execute_procedure_and_wait(procedure_with_id).await
         } else {
@@ -317,6 +403,7 @@ impl DdlManager {
         &self,
         table_id: TableId,
         alter_table_task: AlterTableTask,
+        procedure_context: ProcedureContext,
         ddl_options: DdlOptions,
     ) -> Result<(ProcedureId, Option<Output>)> {
         // make alter_table_task mutable so we can call .take() on its field
@@ -337,16 +424,66 @@ impl DdlManager {
                     repartition,
                     ddl_options.wait,
                     ddl_options.timeout,
+                    procedure_context,
                 )
                 .await;
         }
 
-        let context = self.create_context();
-        let procedure = AlterTableProcedure::new(table_id, alter_table_task, context)?;
+        let lock_regions = alter_table_task
+            .alter_table
+            .kind
+            .as_ref()
+            .is_some_and(only_enables_skip_wal);
 
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let mut route_change_retries = 0;
+        loop {
+            // Hold the same physical region locks as migration while validating that
+            // this route snapshot is still the one the procedure will mutate.
+            let region_ids_to_lock = if lock_regions {
+                let (_, route) = self
+                    .table_metadata_manager()
+                    .table_route_manager()
+                    .get_physical_table_route(table_id)
+                    .await?;
+                route
+                    .region_routes
+                    .iter()
+                    .map(|route| route.region.id)
+                    .collect::<Vec<RegionId>>()
+            } else {
+                vec![]
+            };
 
-        self.execute_procedure_and_wait(procedure_with_id).await
+            let context = self.create_context();
+            let procedure = AlterTableProcedure::new_with_region_locks(
+                table_id,
+                alter_table_task.clone(),
+                region_ids_to_lock,
+                context,
+            )?;
+
+            let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure))
+                .with_context(procedure_context.clone());
+            let result = self.execute_procedure_and_wait(procedure_with_id).await?;
+            if result
+                .1
+                .as_ref()
+                .is_some_and(|output| output.is::<RegionRouteChanged>())
+            {
+                if route_change_retries == MAX_REGION_ROUTE_CHANGE_RETRIES {
+                    let source = error::UnexpectedSnafu {
+                        err_msg: format!(
+                            "Region route kept changing while altering table {table_id}"
+                        ),
+                    }
+                    .build();
+                    return Err(error::Error::retry_later(source));
+                }
+                route_change_retries += 1;
+                continue;
+            }
+            return Ok(result);
+        }
     }
 
     /// Submits and executes a create table task.
@@ -354,12 +491,19 @@ impl DdlManager {
     pub async fn submit_create_table_task(
         &self,
         create_table_task: CreateTableTask,
+        query_context: QueryContext,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
 
-        let procedure = CreateTableProcedure::new(create_table_task, context)?;
+        let procedure = CreateTableProcedure::new_with_query_context(
+            create_table_task,
+            query_context,
+            context,
+        )?;
 
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -369,12 +513,14 @@ impl DdlManager {
     pub async fn submit_create_view_task(
         &self,
         create_view_task: CreateViewTask,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
 
         let procedure = CreateViewProcedure::new(create_view_task, context);
 
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -385,13 +531,15 @@ impl DdlManager {
         &self,
         create_table_tasks: Vec<CreateTableTask>,
         physical_table_id: TableId,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
 
         let procedure =
             CreateLogicalTablesProcedure::new(create_table_tasks, physical_table_id, context);
 
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -402,13 +550,15 @@ impl DdlManager {
         &self,
         alter_table_tasks: Vec<AlterTableTask>,
         physical_table_id: TableId,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
 
         let procedure =
             AlterLogicalTablesProcedure::new(alter_table_tasks, physical_table_id, context);
 
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -418,14 +568,116 @@ impl DdlManager {
     pub async fn submit_drop_table_task(
         &self,
         drop_table_task: DropTableTask,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
 
         let procedure = DropTableProcedure::new(drop_table_task, context);
 
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
+    }
+
+    /// Submits and executes an undrop table task.
+    #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
+    #[tracing::instrument(skip_all)]
+    pub async fn submit_undrop_table_task(
+        &self,
+        undrop_table_task: UndropTableTask,
+        procedure_context: ProcedureContext,
+    ) -> Result<(ProcedureId, Option<Output>)> {
+        #[cfg(not(feature = "enterprise"))]
+        {
+            use crate::error::UnsupportedSnafu;
+
+            return UnsupportedSnafu {
+                operation: "undrop table is only available in GreptimeDB Enterprise Edition",
+            }
+            .fail();
+        }
+        #[cfg(feature = "enterprise")]
+        {
+            let context = self.create_context();
+            let original_table_name = context
+                .table_metadata_manager
+                .get_dropped_table_by_id(undrop_table_task.table_id)
+                .await?
+                .with_context(|| TableNotFoundSnafu {
+                    table_name: undrop_table_task.table_id.to_string(),
+                })?
+                .table_name;
+            let procedure = UndropTableProcedure::new_with_original_table_name(
+                undrop_table_task,
+                context,
+                Some(original_table_name),
+            );
+            let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure))
+                .with_context(procedure_context);
+
+            self.execute_procedure_and_wait(procedure_with_id).await
+        }
+    }
+
+    /// Submits and executes a purge dropped table task.
+    #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
+    #[tracing::instrument(skip_all)]
+    pub async fn submit_purge_dropped_table_task(
+        &self,
+        purge_dropped_table_task: PurgeDroppedTableTask,
+        procedure_context: ProcedureContext,
+    ) -> Result<(ProcedureId, Option<Output>)> {
+        #[cfg(not(feature = "enterprise"))]
+        {
+            use crate::error::UnsupportedSnafu;
+
+            return UnsupportedSnafu {
+                operation: "purge dropped table is only available in GreptimeDB Enterprise Edition",
+            }
+            .fail();
+        }
+        #[cfg(feature = "enterprise")]
+        {
+            let context = self.create_context();
+            let procedure = PurgeDroppedTableProcedure::new(purge_dropped_table_task, context);
+            let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure))
+                .with_context(procedure_context);
+
+            self.execute_procedure_and_wait(procedure_with_id).await
+        }
+    }
+
+    /// Submits and executes a purge task that first rechecks the tombstone deadline.
+    #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
+    #[tracing::instrument(skip_all)]
+    pub async fn submit_expired_purge_dropped_table_task(
+        &self,
+        purge_dropped_table_task: PurgeDroppedTableTask,
+    ) -> Result<(ProcedureId, Option<Output>)> {
+        #[cfg(not(feature = "enterprise"))]
+        {
+            use crate::error::UnsupportedSnafu;
+
+            return UnsupportedSnafu {
+                operation:
+                    "purge expired dropped table is only available in GreptimeDB Enterprise Edition",
+            }
+            .fail();
+        }
+        #[cfg(feature = "enterprise")]
+        {
+            let context = self.create_context();
+            let procedure_context = ProcedureContext::from_event_context(
+                PersistentEventContext::new(TriggerReason::ScheduledGc),
+            );
+            let procedure =
+                PurgeDroppedTableProcedure::new_if_expired(purge_dropped_table_task, context);
+            let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure))
+                .with_context(procedure_context);
+
+            self.execute_procedure_and_wait(procedure_with_id).await
+        }
     }
 
     /// Submits and executes a create database task.
@@ -437,12 +689,21 @@ impl DdlManager {
             schema,
             create_if_not_exists,
             options,
+            creator,
         }: CreateDatabaseTask,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
-        let procedure =
-            CreateDatabaseProcedure::new(catalog, schema, create_if_not_exists, options, context);
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure = CreateDatabaseProcedure::new(
+            catalog,
+            schema,
+            create_if_not_exists,
+            options,
+            creator,
+            context,
+        );
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -456,10 +717,12 @@ impl DdlManager {
             schema,
             drop_if_exists,
         }: DropDatabaseTask,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
         let procedure = DropDatabaseProcedure::new(catalog, schema, drop_if_exists, context);
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -467,10 +730,12 @@ impl DdlManager {
     pub async fn submit_alter_database(
         &self,
         alter_database_task: AlterDatabaseTask,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
         let procedure = AlterDatabaseProcedure::new(alter_database_task, context)?;
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -481,10 +746,12 @@ impl DdlManager {
         &self,
         create_flow: CreateFlowTask,
         query_context: QueryContext,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
         let procedure = CreateFlowProcedure::new(create_flow, query_context, context);
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -494,10 +761,12 @@ impl DdlManager {
     pub async fn submit_drop_flow_task(
         &self,
         drop_flow: DropFlowTask,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
         let procedure = DropFlowProcedure::new(drop_flow, context);
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -507,10 +776,12 @@ impl DdlManager {
     pub async fn submit_drop_view_task(
         &self,
         drop_view: DropViewTask,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
         let procedure = DropViewProcedure::new(drop_view, context);
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -521,17 +792,13 @@ impl DdlManager {
         &self,
         truncate_table_task: TruncateTableTask,
         table_info_value: DeserializedValueWithBytes<TableInfoValue>,
-        region_routes: Vec<RegionRoute>,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
-        let procedure = TruncateTableProcedure::new(
-            truncate_table_task,
-            table_info_value,
-            region_routes,
-            context,
-        );
+        let procedure = TruncateTableProcedure::new(truncate_table_task, table_info_value, context);
 
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -540,11 +807,19 @@ impl DdlManager {
     #[tracing::instrument(skip_all)]
     pub async fn submit_comment_on_task(
         &self,
-        comment_on_task: CommentOnTask,
+        mut comment_on_task: CommentOnTask,
+        procedure_context: ProcedureContext,
     ) -> Result<(ProcedureId, Option<Output>)> {
         let context = self.create_context();
+        comment_on_task
+            .enrich_object_id(
+                context.table_metadata_manager.table_name_manager(),
+                context.flow_metadata_manager.flow_name_manager(),
+            )
+            .await?;
         let procedure = CommentOnProcedure::new(comment_on_task, context);
-        let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
+        let procedure_with_id =
+            ProcedureWithId::with_random_id(Box::new(procedure)).with_context(procedure_context);
 
         self.execute_procedure_and_wait(procedure_with_id).await
     }
@@ -583,65 +858,125 @@ impl DdlManager {
 
     pub async fn submit_ddl_task(
         &self,
-        ctx: &ExecutorContext,
+        context: ExecutorContext,
         request: SubmitDdlTaskRequest,
     ) -> Result<SubmitDdlTaskResponse> {
-        let span = ctx
-            .tracing_context
+        let ExecutorContext {
+            tracing_context,
+            query_context,
+            actor,
+            event_input,
+        } = context;
+        let query_context = query_context.context(UnsupportedSnafu {
+            operation: "submit_ddl_task without query context",
+        })?;
+        let procedure_context = ProcedureContext {
+            actor,
+            event_context: event_input
+                .map(|input| PersistentEventContext::from((input, query_context.protocol()))),
+        };
+        let span = tracing_context
             .as_ref()
             .map(TracingContext::from_w3c)
             .unwrap_or_else(TracingContext::from_current_span)
             .attach(tracing::info_span!("DdlManager::submit_ddl_task"));
-        let ddl_options = DdlOptions {
-            wait: request.wait,
-            timeout: request.timeout,
-        };
+        let SubmitDdlTaskRequest {
+            wait,
+            timeout,
+            task,
+        } = request;
+        let ddl_options = DdlOptions { wait, timeout };
         async move {
-            debug!("Submitting Ddl task: {:?}", request.task);
-            match request.task {
+            debug!("Submitting Ddl task: {:?}", task);
+            match task {
                 CreateTable(create_table_task) => {
-                    handle_create_table_task(self, create_table_task).await
+                    handle_create_table_task(
+                        self,
+                        create_table_task,
+                        query_context,
+                        procedure_context,
+                    )
+                    .await
                 }
-                DropTable(drop_table_task) => handle_drop_table_task(self, drop_table_task).await,
+                DropTable(drop_table_task) => {
+                    handle_drop_table_task(self, drop_table_task, procedure_context).await
+                }
+                UndropTable(undrop_table_task) => {
+                    handle_undrop_table_task(self, undrop_table_task, procedure_context).await
+                }
+                PurgeDroppedTable(purge_dropped_table_task) => {
+                    handle_purge_dropped_table_task(
+                        self,
+                        purge_dropped_table_task,
+                        procedure_context,
+                    )
+                    .await
+                }
                 AlterTable(alter_table_task) => {
-                    handle_alter_table_task(self, alter_table_task, ddl_options).await
+                    handle_alter_table_task(self, alter_table_task, ddl_options, procedure_context)
+                        .await
                 }
                 TruncateTable(truncate_table_task) => {
-                    handle_truncate_table_task(self, truncate_table_task).await
+                    handle_truncate_table_task(self, truncate_table_task, procedure_context).await
                 }
                 CreateLogicalTables(create_table_tasks) => {
-                    handle_create_logical_table_tasks(self, create_table_tasks).await
+                    handle_create_logical_table_tasks(self, create_table_tasks, procedure_context)
+                        .await
                 }
                 AlterLogicalTables(alter_table_tasks) => {
-                    handle_alter_logical_table_tasks(self, alter_table_tasks).await
+                    handle_alter_logical_table_tasks(self, alter_table_tasks, procedure_context)
+                        .await
                 }
                 DropLogicalTables(_) => todo!(),
                 CreateDatabase(create_database_task) => {
-                    handle_create_database_task(self, create_database_task).await
+                    handle_create_database_task(self, create_database_task, procedure_context).await
                 }
                 DropDatabase(drop_database_task) => {
-                    handle_drop_database_task(self, drop_database_task).await
+                    handle_drop_database_task(self, drop_database_task, procedure_context).await
                 }
                 AlterDatabase(alter_database_task) => {
-                    handle_alter_database_task(self, alter_database_task).await
+                    handle_alter_database_task(self, alter_database_task, procedure_context).await
                 }
                 CreateFlow(create_flow_task) => {
-                    handle_create_flow_task(self, create_flow_task, request.query_context).await
+                    handle_create_flow_task(
+                        self,
+                        create_flow_task,
+                        query_context,
+                        procedure_context,
+                    )
+                    .await
                 }
-                DropFlow(drop_flow_task) => handle_drop_flow_task(self, drop_flow_task).await,
+                DropFlow(drop_flow_task) => {
+                    handle_drop_flow_task(self, drop_flow_task, procedure_context).await
+                }
                 CreateView(create_view_task) => {
-                    handle_create_view_task(self, create_view_task).await
+                    handle_create_view_task(self, create_view_task, procedure_context).await
                 }
-                DropView(drop_view_task) => handle_drop_view_task(self, drop_view_task).await,
-                CommentOn(comment_on_task) => handle_comment_on_task(self, comment_on_task).await,
+                DropView(drop_view_task) => {
+                    handle_drop_view_task(self, drop_view_task, procedure_context).await
+                }
+                CommentOn(comment_on_task) => {
+                    handle_comment_on_task(self, comment_on_task, procedure_context).await
+                }
                 #[cfg(feature = "enterprise")]
                 CreateTrigger(create_trigger_task) => {
-                    handle_create_trigger_task(self, create_trigger_task, request.query_context)
-                        .await
+                    handle_create_trigger_task(
+                        self,
+                        create_trigger_task,
+                        query_context,
+                        procedure_context,
+                    )
+                    .await
                 }
                 #[cfg(feature = "enterprise")]
                 DropTrigger(drop_trigger_task) => {
-                    handle_drop_trigger_task(self, drop_trigger_task, request.query_context).await
+                    handle_drop_trigger_task(
+                        self,
+                        drop_trigger_task,
+                        query_context,
+                        procedure_context,
+                    )
+                    .await
                 }
             }
         }
@@ -653,24 +988,32 @@ impl DdlManager {
 async fn handle_truncate_table_task(
     ddl_manager: &DdlManager,
     truncate_table_task: TruncateTableTask,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let table_id = truncate_table_task.table_id;
     let table_metadata_manager = &ddl_manager.table_metadata_manager();
     let table_ref = truncate_table_task.table_ref();
 
-    let (table_info_value, table_route_value) =
-        table_metadata_manager.get_full_table_info(table_id).await?;
-
-    let table_info_value = table_info_value.with_context(|| TableInfoNotFoundSnafu {
-        table: table_ref.to_string(),
-    })?;
-
-    let table_route_value = table_route_value.context(TableRouteNotFoundSnafu { table_id })?;
-
-    let table_route = table_route_value.into_inner().region_routes()?.clone();
+    let table_info_value = table_metadata_manager
+        .table_info_manager()
+        .get(table_id)
+        .await?
+        .with_context(|| TableInfoNotFoundSnafu {
+            table: table_ref.to_string(),
+        })?;
+    let physical_table_id = table_metadata_manager
+        .table_route_manager()
+        .get_physical_table_id(table_id)
+        .await?;
+    ensure!(
+        physical_table_id == table_id,
+        error::UnexpectedSnafu {
+            err_msg: "Truncate table is only supported for physical tables."
+        }
+    );
 
     let (id, _) = ddl_manager
-        .submit_truncate_table_task(truncate_table_task, table_info_value, table_route)
+        .submit_truncate_table_task(truncate_table_task, table_info_value, procedure_context)
         .await?;
 
     info!("Table: {table_id} is truncated via procedure_id {id:?}");
@@ -685,6 +1028,7 @@ async fn handle_alter_table_task(
     ddl_manager: &DdlManager,
     alter_table_task: AlterTableTask,
     ddl_options: DdlOptions,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let table_ref = alter_table_task.table_ref();
 
@@ -717,7 +1061,7 @@ async fn handle_alter_table_task(
     );
 
     let (id, _) = ddl_manager
-        .submit_alter_table_task(table_id, alter_table_task, ddl_options)
+        .submit_alter_table_task(table_id, alter_table_task, procedure_context, ddl_options)
         .await?;
 
     info!("Table: {table_id} is altered via procedure_id {id:?}");
@@ -731,11 +1075,49 @@ async fn handle_alter_table_task(
 async fn handle_drop_table_task(
     ddl_manager: &DdlManager,
     drop_table_task: DropTableTask,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let table_id = drop_table_task.table_id;
-    let (id, _) = ddl_manager.submit_drop_table_task(drop_table_task).await?;
+    let (id, _) = ddl_manager
+        .submit_drop_table_task(drop_table_task, procedure_context)
+        .await?;
 
     info!("Table: {table_id} is dropped via procedure_id {id:?}");
+
+    Ok(SubmitDdlTaskResponse {
+        key: id.to_string().into(),
+        ..Default::default()
+    })
+}
+
+async fn handle_undrop_table_task(
+    ddl_manager: &DdlManager,
+    undrop_table_task: UndropTableTask,
+    procedure_context: ProcedureContext,
+) -> Result<SubmitDdlTaskResponse> {
+    let table_id = undrop_table_task.table_id;
+    let (id, _) = ddl_manager
+        .submit_undrop_table_task(undrop_table_task, procedure_context)
+        .await?;
+
+    info!("Table: {table_id} is undropped via procedure_id {id:?}");
+
+    Ok(SubmitDdlTaskResponse {
+        key: id.to_string().into(),
+        ..Default::default()
+    })
+}
+
+async fn handle_purge_dropped_table_task(
+    ddl_manager: &DdlManager,
+    purge_dropped_table_task: PurgeDroppedTableTask,
+    procedure_context: ProcedureContext,
+) -> Result<SubmitDdlTaskResponse> {
+    let (id, _) = ddl_manager
+        .submit_purge_dropped_table_task(purge_dropped_table_task, procedure_context)
+        .await?;
+
+    info!("Dropped table is purged via procedure_id {id:?}");
 
     Ok(SubmitDdlTaskResponse {
         key: id.to_string().into(),
@@ -746,9 +1128,11 @@ async fn handle_drop_table_task(
 async fn handle_create_table_task(
     ddl_manager: &DdlManager,
     create_table_task: CreateTableTask,
+    query_context: QueryContext,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let (id, output) = ddl_manager
-        .submit_create_table_task(create_table_task)
+        .submit_create_table_task(create_table_task, query_context, procedure_context)
         .await?;
 
     let procedure_id = id.to_string();
@@ -771,6 +1155,7 @@ async fn handle_create_table_task(
 async fn handle_create_logical_table_tasks(
     ddl_manager: &DdlManager,
     create_table_tasks: Vec<CreateTableTask>,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     ensure!(
         !create_table_tasks.is_empty(),
@@ -786,7 +1171,7 @@ async fn handle_create_logical_table_tasks(
     let num_logical_tables = create_table_tasks.len();
 
     let (id, output) = ddl_manager
-        .submit_create_logical_table_tasks(create_table_tasks, physical_table_id)
+        .submit_create_logical_table_tasks(create_table_tasks, physical_table_id, procedure_context)
         .await?;
 
     info!(
@@ -815,15 +1200,18 @@ async fn handle_create_logical_table_tasks(
 async fn handle_create_database_task(
     ddl_manager: &DdlManager,
     create_database_task: CreateDatabaseTask,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
+    let catalog = create_database_task.catalog.clone();
+    let schema = create_database_task.schema.clone();
     let (id, _) = ddl_manager
-        .submit_create_database(create_database_task.clone())
+        .submit_create_database(create_database_task, procedure_context)
         .await?;
 
     let procedure_id = id.to_string();
     info!(
         "Database {}.{} is created via procedure_id {id:?}",
-        create_database_task.catalog, create_database_task.schema
+        catalog, schema
     );
 
     Ok(SubmitDdlTaskResponse {
@@ -835,9 +1223,10 @@ async fn handle_create_database_task(
 async fn handle_drop_database_task(
     ddl_manager: &DdlManager,
     drop_database_task: DropDatabaseTask,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let (id, _) = ddl_manager
-        .submit_drop_database(drop_database_task.clone())
+        .submit_drop_database(drop_database_task.clone(), procedure_context)
         .await?;
 
     let procedure_id = id.to_string();
@@ -855,9 +1244,10 @@ async fn handle_drop_database_task(
 async fn handle_alter_database_task(
     ddl_manager: &DdlManager,
     alter_database_task: AlterDatabaseTask,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let (id, _) = ddl_manager
-        .submit_alter_database(alter_database_task.clone())
+        .submit_alter_database(alter_database_task.clone(), procedure_context)
         .await?;
 
     let procedure_id = id.to_string();
@@ -876,9 +1266,10 @@ async fn handle_alter_database_task(
 async fn handle_drop_flow_task(
     ddl_manager: &DdlManager,
     drop_flow_task: DropFlowTask,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let (id, _) = ddl_manager
-        .submit_drop_flow_task(drop_flow_task.clone())
+        .submit_drop_flow_task(drop_flow_task.clone(), procedure_context)
         .await?;
 
     let procedure_id = id.to_string();
@@ -898,6 +1289,7 @@ async fn handle_drop_trigger_task(
     ddl_manager: &DdlManager,
     drop_trigger_task: DropTriggerTask,
     query_context: QueryContext,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let Some(m) = ddl_manager.trigger_ddl_manager.as_ref() else {
         use crate::error::UnsupportedSnafu;
@@ -913,6 +1305,7 @@ async fn handle_drop_trigger_task(
         ddl_manager.procedure_manager.clone(),
         ddl_manager.ddl_context.clone(),
         query_context,
+        procedure_context,
     )
     .await
 }
@@ -920,9 +1313,10 @@ async fn handle_drop_trigger_task(
 async fn handle_drop_view_task(
     ddl_manager: &DdlManager,
     drop_view_task: DropViewTask,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let (id, _) = ddl_manager
-        .submit_drop_view_task(drop_view_task.clone())
+        .submit_drop_view_task(drop_view_task.clone(), procedure_context)
         .await?;
 
     let procedure_id = id.to_string();
@@ -942,9 +1336,10 @@ async fn handle_create_flow_task(
     ddl_manager: &DdlManager,
     create_flow_task: CreateFlowTask,
     query_context: QueryContext,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let (id, output) = ddl_manager
-        .submit_create_flow_task(create_flow_task.clone(), query_context)
+        .submit_create_flow_task(create_flow_task.clone(), query_context, procedure_context)
         .await?;
 
     let procedure_id = id.to_string();
@@ -979,6 +1374,7 @@ async fn handle_create_trigger_task(
     ddl_manager: &DdlManager,
     create_trigger_task: CreateTriggerTask,
     query_context: QueryContext,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let Some(m) = ddl_manager.trigger_ddl_manager.as_ref() else {
         use crate::error::UnsupportedSnafu;
@@ -994,6 +1390,7 @@ async fn handle_create_trigger_task(
         ddl_manager.procedure_manager.clone(),
         ddl_manager.ddl_context.clone(),
         query_context,
+        procedure_context,
     )
     .await
 }
@@ -1001,6 +1398,7 @@ async fn handle_create_trigger_task(
 async fn handle_alter_logical_table_tasks(
     ddl_manager: &DdlManager,
     alter_table_tasks: Vec<AlterTableTask>,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     ensure!(
         !alter_table_tasks.is_empty(),
@@ -1020,7 +1418,7 @@ async fn handle_alter_logical_table_tasks(
     let num_logical_tables = alter_table_tasks.len();
 
     let (id, _) = ddl_manager
-        .submit_alter_logical_table_tasks(alter_table_tasks, physical_table_id)
+        .submit_alter_logical_table_tasks(alter_table_tasks, physical_table_id, procedure_context)
         .await?;
 
     info!(
@@ -1039,9 +1437,10 @@ async fn handle_alter_logical_table_tasks(
 async fn handle_create_view_task(
     ddl_manager: &DdlManager,
     create_view_task: CreateViewTask,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let (id, output) = ddl_manager
-        .submit_create_view_task(create_view_task)
+        .submit_create_view_task(create_view_task, procedure_context)
         .await?;
 
     let procedure_id = id.to_string();
@@ -1064,9 +1463,10 @@ async fn handle_create_view_task(
 async fn handle_comment_on_task(
     ddl_manager: &DdlManager,
     comment_on_task: CommentOnTask,
+    procedure_context: ProcedureContext,
 ) -> Result<SubmitDdlTaskResponse> {
     let (id, _) = ddl_manager
-        .submit_comment_on_task(comment_on_task.clone())
+        .submit_comment_on_task(comment_on_task.clone(), procedure_context)
         .await?;
 
     let procedure_id = id.to_string();
@@ -1084,34 +1484,56 @@ async fn handle_comment_on_task(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    #[cfg(feature = "enterprise")]
+    use std::sync::Mutex;
     use std::time::Duration;
 
+    #[cfg(feature = "enterprise")]
+    use common_base::protocol::Channel;
     use common_error::ext::BoxedError;
+    #[cfg(feature = "enterprise")]
+    use common_error::ext::ErrorExt;
+    #[cfg(feature = "enterprise")]
+    use common_error::status_code::StatusCode;
+    #[cfg(feature = "enterprise")]
+    use common_event_recorder::{PersistentEventContext, ProcedureEventInput, TriggerReason};
     use common_procedure::local::LocalManager;
     use common_procedure::test_util::InMemoryPoisonStore;
-    use common_procedure::{BoxedProcedure, ProcedureManagerRef};
+    use common_procedure::{BoxedProcedure, ProcedureContext, ProcedureManagerRef};
     use store_api::storage::TableId;
     use table::table_name::TableName;
 
     use super::DdlManager;
     use crate::cache_invalidator::DummyCacheInvalidator;
     use crate::ddl::alter_table::AlterTableProcedure;
+    use crate::ddl::create_database::{
+        AtomicCreateOutcome, CreateDatabaseMetadataCommitter, CreateDatabaseProcedure,
+    };
     use crate::ddl::create_table::CreateTableProcedure;
     use crate::ddl::drop_table::DropTableProcedure;
     use crate::ddl::flow_meta::FlowMetadataAllocator;
     use crate::ddl::table_meta::TableMetadataAllocator;
     use crate::ddl::truncate_table::TruncateTableProcedure;
     use crate::ddl::{DdlContext, NoopRegionFailureDetectorControl};
-    use crate::ddl_manager::RepartitionProcedureFactory;
+    use crate::ddl_manager::{RepartitionProcedureFactory, RepartitionSource};
     use crate::key::TableMetadataManager;
     use crate::key::flow::FlowMetadataManager;
     use crate::kv_backend::memory::MemoryKvBackend;
     use crate::node_manager::{DatanodeManager, DatanodeRef, FlownodeManager, FlownodeRef};
     use crate::peer::Peer;
+    use crate::procedure_executor::ExecutorContext;
     use crate::region_keeper::MemoryRegionKeeper;
     use crate::region_registry::LeaderRegionRegistry;
+    #[cfg(feature = "enterprise")]
+    use crate::rpc::ddl::trigger::{CreateTriggerTask, DropTriggerTask};
+    use crate::rpc::ddl::{CreatorGrantIntent, UndropTableTask};
+    #[cfg(not(feature = "enterprise"))]
+    use crate::rpc::ddl::{DdlTask, PurgeDroppedTableTask, QueryContext, SubmitDdlTaskRequest};
+    #[cfg(feature = "enterprise")]
+    use crate::rpc::ddl::{DdlTask, QueryContext, SubmitDdlTaskRequest};
     use crate::sequence::SequenceBuilder;
     use crate::state_store::KvStateStore;
+    use crate::test_util::{MockDatanodeManager, new_ddl_context};
     use crate::wal_provider::WalProvider;
 
     /// A dummy implemented [NodeManager].
@@ -1140,7 +1562,7 @@ mod tests {
             _ddl_ctx: &DdlContext,
             _table_name: TableName,
             _table_id: TableId,
-            _from_exprs: Vec<String>,
+            _source: RepartitionSource,
             _to_exprs: Vec<String>,
             _timeout: Option<Duration>,
         ) -> std::result::Result<BoxedProcedure, BoxedError> {
@@ -1154,10 +1576,99 @@ mod tests {
         ) -> std::result::Result<(), BoxedError> {
             Ok(())
         }
+
+        async fn ensure_gc_requirement(&self) -> std::result::Result<(), BoxedError> {
+            Ok(())
+        }
+    }
+
+    struct LoaderCommitter;
+
+    #[async_trait::async_trait]
+    impl CreateDatabaseMetadataCommitter for LoaderCommitter {
+        async fn commit(
+            &self,
+            _catalog: &str,
+            _schema: &str,
+            _value: &crate::key::schema_name::SchemaNameValue,
+            _creator: &CreatorGrantIntent,
+        ) -> std::result::Result<AtomicCreateOutcome, BoxedError> {
+            unreachable!()
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[derive(Default)]
+    struct RecordingTriggerDdlManager {
+        procedure_contexts: Mutex<Vec<ProcedureContext>>,
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[async_trait::async_trait]
+    impl super::TriggerDdlManager for RecordingTriggerDdlManager {
+        async fn create_trigger(
+            &self,
+            _create_trigger_task: CreateTriggerTask,
+            _procedure_manager: ProcedureManagerRef,
+            _ddl_context: DdlContext,
+            _query_context: QueryContext,
+            procedure_context: ProcedureContext,
+        ) -> crate::error::Result<crate::rpc::ddl::SubmitDdlTaskResponse> {
+            self.procedure_contexts
+                .lock()
+                .unwrap()
+                .push(procedure_context);
+            Ok(Default::default())
+        }
+
+        async fn drop_trigger(
+            &self,
+            _drop_trigger_task: DropTriggerTask,
+            _procedure_manager: ProcedureManagerRef,
+            _ddl_context: DdlContext,
+            _query_context: QueryContext,
+            procedure_context: ProcedureContext,
+        ) -> crate::error::Result<crate::rpc::ddl::SubmitDdlTaskResponse> {
+            self.procedure_contexts
+                .lock()
+                .unwrap()
+                .push(procedure_context);
+            Ok(Default::default())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     #[test]
-    fn test_try_new() {
+    fn test_generic_loader_captures_configured_committer() {
+        let mut context = new_ddl_context(Arc::new(MockDatanodeManager::new(())));
+        let committer = Arc::new(LoaderCommitter);
+        context.create_database_metadata_committer = Some(committer.clone());
+        let loader = procedure_loader!(CreateDatabaseProcedure)[0].1(context);
+        assert_eq!(Arc::strong_count(&committer), 2);
+
+        let loaded = loader(
+            r#"{
+                "state":"CreateMetadata",
+                "catalog":"greptime",
+                "schema":"metrics",
+                "create_if_not_exists":false,
+                "options":{},
+                "creator":{"username":"alice","created_at_ns":42}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.type_name(), "metasrv-procedure::CreateDatabase");
+        assert_eq!(Arc::strong_count(&committer), 3);
+        drop(loaded);
+        assert_eq!(Arc::strong_count(&committer), 2);
+    }
+
+    #[test]
+    fn test_register_loaders() {
         let kv_backend = Arc::new(MemoryKvBackend::new());
         let table_metadata_manager = Arc::new(TableMetadataManager::new(kv_backend.clone()));
         let table_metadata_allocator = Arc::new(TableMetadataAllocator::new(
@@ -1179,7 +1690,7 @@ mod tests {
             None,
         ));
 
-        let _ = DdlManager::try_new(
+        let ddl_manager = DdlManager::new(
             DdlContext {
                 node_manager: Arc::new(DummyDatanodeManager),
                 cache_invalidator: Arc::new(DummyCacheInvalidator),
@@ -1190,11 +1701,14 @@ mod tests {
                 memory_region_keeper: Arc::new(MemoryRegionKeeper::default()),
                 leader_region_registry: Arc::new(LeaderRegionRegistry::default()),
                 region_failure_detector_controller: Arc::new(NoopRegionFailureDetectorControl),
+                soft_drop_enabled: false,
+                soft_drop_retention: None,
+                create_database_metadata_committer: None,
             },
             procedure_manager.clone(),
             Arc::new(DummyRepartitionProcedureFactory),
-            true,
         );
+        ddl_manager.register_loaders().unwrap();
 
         let expected_loaders = vec![
             CreateTableProcedure::TYPE_NAME,
@@ -1205,6 +1719,185 @@ mod tests {
 
         for loader in expected_loaders {
             assert!(procedure_manager.contains_loader(loader));
+        }
+
+        let soft_drop_loaders = [
+            "metasrv-procedure::UndropTable",
+            "metasrv-procedure::PurgeDroppedTable",
+            "metasrv-procedure::PurgeExpiredDroppedTable",
+        ];
+        for loader in soft_drop_loaders {
+            assert_eq!(
+                cfg!(feature = "enterprise"),
+                procedure_manager.contains_loader(loader)
+            );
+        }
+    }
+
+    fn build_soft_drop_test_ddl_manager() -> DdlManager {
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let table_metadata_manager = Arc::new(TableMetadataManager::new(kv_backend.clone()));
+        let table_metadata_allocator = Arc::new(TableMetadataAllocator::new(
+            Arc::new(SequenceBuilder::new("test", kv_backend.clone()).build()),
+            Arc::new(WalProvider::default()),
+        ));
+        let flow_metadata_manager = Arc::new(FlowMetadataManager::new(kv_backend.clone()));
+        let flow_metadata_allocator = Arc::new(FlowMetadataAllocator::with_noop_peer_allocator(
+            Arc::new(SequenceBuilder::new("flow-test", kv_backend.clone()).build()),
+        ));
+
+        let state_store = Arc::new(KvStateStore::new(kv_backend.clone()));
+        let poison_manager = Arc::new(InMemoryPoisonStore::default());
+        let procedure_manager = Arc::new(LocalManager::new(
+            Default::default(),
+            state_store,
+            poison_manager,
+            None,
+            None,
+        ));
+
+        DdlManager::new(
+            DdlContext {
+                node_manager: Arc::new(DummyDatanodeManager),
+                cache_invalidator: Arc::new(DummyCacheInvalidator),
+                table_metadata_manager,
+                table_metadata_allocator,
+                flow_metadata_manager,
+                flow_metadata_allocator,
+                memory_region_keeper: Arc::new(MemoryRegionKeeper::default()),
+                leader_region_registry: Arc::new(LeaderRegionRegistry::default()),
+                region_failure_detector_controller: Arc::new(NoopRegionFailureDetectorControl),
+                soft_drop_enabled: true,
+                soft_drop_retention: Some(std::time::Duration::from_secs(1)),
+                create_database_metadata_committer: None,
+            },
+            procedure_manager,
+            Arc::new(DummyRepartitionProcedureFactory),
+        )
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn test_trigger_ddl_forwards_procedure_context() {
+        let trigger_ddl_manager = Arc::new(RecordingTriggerDdlManager::default());
+        let ddl_manager = build_soft_drop_test_ddl_manager()
+            .with_trigger_ddl_manager(trigger_ddl_manager.clone());
+        let procedure_context = ProcedureContext {
+            actor: Some("test-user".to_string()),
+            event_context: Some(
+                PersistentEventContext::new(TriggerReason::Manual).with_protocol("mysql"),
+            ),
+        };
+        let executor_context = || ExecutorContext {
+            query_context: Some(QueryContext {
+                channel: Channel::Mysql as u8,
+                ..Default::default()
+            }),
+            actor: Some("test-user".to_string()),
+            event_input: Some(ProcedureEventInput::new(TriggerReason::Manual)),
+            ..Default::default()
+        };
+
+        ddl_manager
+            .submit_ddl_task(
+                executor_context(),
+                SubmitDdlTaskRequest::new(DdlTask::CreateTrigger(CreateTriggerTask {
+                    catalog_name: "greptime".to_string(),
+                    trigger_name: "test_trigger".to_string(),
+                    if_not_exists: false,
+                    sql: "SELECT 1".to_string(),
+                    channels: vec![],
+                    labels: Default::default(),
+                    annotations: Default::default(),
+                    interval: Duration::from_secs(1),
+                    raw_interval_expr: None,
+                    r#for: None,
+                    for_raw_expr: None,
+                    keep_firing_for: None,
+                    keep_firing_for_raw_expr: None,
+                })),
+            )
+            .await
+            .unwrap();
+        ddl_manager
+            .submit_ddl_task(
+                executor_context(),
+                SubmitDdlTaskRequest::new(DdlTask::DropTrigger(DropTriggerTask {
+                    catalog_name: "greptime".to_string(),
+                    trigger_name: "test_trigger".to_string(),
+                    drop_if_exists: false,
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *trigger_ddl_manager.procedure_contexts.lock().unwrap(),
+            vec![procedure_context.clone(), procedure_context]
+        );
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn test_submit_undrop_missing_tombstone_returns_table_not_found_directly() {
+        let ddl_manager = build_soft_drop_test_ddl_manager();
+
+        let err = ddl_manager
+            .submit_undrop_table_task(
+                UndropTableTask { table_id: 1024 },
+                ProcedureContext::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status_code(), StatusCode::TableNotFound);
+        assert!(matches!(err, crate::error::Error::TableNotFound { .. }));
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    #[tokio::test]
+    async fn test_submit_undrop_and_purge_rejected_in_non_enterprise_build() {
+        let ddl_manager = build_soft_drop_test_ddl_manager();
+
+        let err = ddl_manager
+            .submit_undrop_table_task(
+                UndropTableTask { table_id: 1024 },
+                ProcedureContext::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Unsupported { .. }));
+
+        let err = ddl_manager
+            .submit_purge_dropped_table_task(
+                PurgeDroppedTableTask { table_id: 1024 },
+                ProcedureContext::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Unsupported { .. }));
+
+        let err = ddl_manager
+            .submit_expired_purge_dropped_table_task(PurgeDroppedTableTask { table_id: 1024 })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Unsupported { .. }));
+
+        for task in [
+            DdlTask::UndropTable(UndropTableTask { table_id: 1024 }),
+            DdlTask::PurgeDroppedTable(PurgeDroppedTableTask { table_id: 1024 }),
+        ] {
+            let err = ddl_manager
+                .submit_ddl_task(
+                    ExecutorContext {
+                        query_context: Some(QueryContext::default()),
+                        ..Default::default()
+                    },
+                    SubmitDdlTaskRequest::new(task),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, crate::error::Error::Unsupported { .. }));
         }
     }
 }

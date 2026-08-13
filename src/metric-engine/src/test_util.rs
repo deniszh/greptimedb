@@ -144,6 +144,7 @@ impl TestEnv {
                     options: physical_region_option,
                     skip_wal_replay: true,
                     checkpoint: None,
+                    requirements: Default::default(),
                 }),
             )
             .await
@@ -188,6 +189,7 @@ impl TestEnv {
             table_dir: table_dir.to_string(),
             path_type: PathType::Bare, // Use Bare path type for engine regions
             partition_expr_json: Some("".to_string()),
+            requirements: Default::default(),
         };
 
         // create physical region
@@ -373,6 +375,7 @@ pub fn create_logical_region_request(
         table_dir: table_dir.to_string(),
         path_type: PathType::Bare, // Use Bare path type for engine regions
         partition_expr_json: Some("".to_string()),
+        requirements: Default::default(),
     }
 }
 

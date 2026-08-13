@@ -30,7 +30,8 @@ use crate::error::{self, Result};
 use crate::handler::HeartbeatMailbox;
 use crate::procedure::repartition::group::apply_staging_manifest::ApplyStagingManifest;
 use crate::procedure::repartition::group::{Context, State};
-use crate::procedure::repartition::plan::RegionDescriptor;
+use crate::procedure::repartition::plan::{SourceRegionDescriptor, TargetRegionDescriptor};
+use crate::procedure::utils::instruction_error_result;
 use crate::service::mailbox::{Channel, MailboxRef};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,8 +99,8 @@ impl State for RemapManifest {
 
 impl RemapManifest {
     fn build_remap_manifest_instructions(
-        source_regions: &[RegionDescriptor],
-        target_regions: &[RegionDescriptor],
+        source_regions: &[SourceRegionDescriptor],
+        target_regions: &[TargetRegionDescriptor],
         region_mapping: &HashMap<RegionId, Vec<RegionId>>,
         central_region_id: RegionId,
     ) -> Result<common_meta::instruction::RemapManifest> {
@@ -117,7 +118,7 @@ impl RemapManifest {
 
         Ok(common_meta::instruction::RemapManifest {
             region_id: central_region_id,
-            input_regions: source_regions.iter().map(|r| r.region_id).collect(),
+            input_regions: source_regions.iter().map(|r| r.region_id()).collect(),
             region_mapping: region_mapping.clone(),
             new_partition_exprs,
         })
@@ -184,6 +185,14 @@ impl RemapManifest {
 
                 Self::handle_remap_manifest_reply(remap.region_id, reply, &now, peer)
             }
+            Err(error::Error::MailboxChannelClosed { .. }) => error::RetryLaterSnafu {
+                reason: format!(
+                    "Mailbox closed when sending remap manifests to datanode {:?}, elapsed: {:?}",
+                    peer,
+                    now.elapsed()
+                ),
+            }
+            .fail()?,
             Err(error::Error::MailboxTimeout { .. }) => {
                 let reason = format!(
                     "Mailbox received timeout for remap manifests on datanode {:?}, elapsed: {:?}",
@@ -218,16 +227,16 @@ impl RemapManifest {
             }
         );
 
-        if error.is_some() {
-            return error::RetryLaterSnafu {
-                reason: format!(
+        if let Some(error) = error {
+            return instruction_error_result(
+                &error,
+                format!(
                     "Failed to remap manifest on datanode {:?}, error: {:?}, elapsed: {:?}",
                     peer,
                     error,
                     now.elapsed()
                 ),
-            }
-            .fail();
+            );
         }
 
         Ok(manifest_paths)

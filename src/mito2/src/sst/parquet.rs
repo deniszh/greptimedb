@@ -24,13 +24,15 @@ use crate::sst::DEFAULT_WRITE_BUFFER_SIZE;
 use crate::sst::file::FileTimeRange;
 use crate::sst::index::IndexOutput;
 
-pub(crate) mod async_reader;
 pub mod file_range;
 pub mod flat_format;
 pub mod format;
 pub(crate) mod helper;
-pub(crate) mod metadata;
+pub(crate) mod json_align;
+pub mod metadata;
 pub mod prefilter;
+pub mod push_decoder;
+pub mod read_columns;
 pub mod reader;
 pub mod row_group;
 pub mod row_selection;
@@ -41,9 +43,17 @@ pub mod writer;
 pub const PARQUET_METADATA_KEY: &str = "greptime:metadata";
 
 /// Default batch size to read parquet files.
-pub(crate) const DEFAULT_READ_BATCH_SIZE: usize = 1024;
+///
+/// This is a runtime-only scan granularity, so we align it with DataFusion's
+/// default execution batch size to reduce rebatching and concatenation in the
+/// query pipeline.
+pub(crate) const DEFAULT_READ_BATCH_SIZE: usize = 8 * 1024;
 /// Default row group size for parquet files.
-pub const DEFAULT_ROW_GROUP_SIZE: usize = 100 * DEFAULT_READ_BATCH_SIZE;
+///
+/// Keep the existing persisted/on-disk default stable. It intentionally stays
+/// decoupled from [`DEFAULT_READ_BATCH_SIZE`] so we can tune runtime scan
+/// batching without changing the row group layout of newly written SSTs.
+pub const DEFAULT_ROW_GROUP_SIZE: usize = 100 * 1024;
 
 /// Parquet write options.
 #[derive(Debug, Clone)]
@@ -129,8 +139,9 @@ mod tests {
 
     use super::*;
     use crate::access_layer::{FilePathProvider, Metrics, RegionFilePathFactory, WriteType};
+    use crate::cache::index::result_cache::PredicateKey;
     use crate::cache::test_util::assert_parquet_metadata_equal;
-    use crate::cache::{CacheManager, CacheStrategy, PageKey};
+    use crate::cache::{CacheManager, CacheStrategy};
     use crate::config::IndexConfig;
     use crate::read::FlatSource;
     use crate::region::options::{IndexOptions, InvertedIndexOptions};
@@ -181,7 +192,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IndexerBuilder for NoopIndexBuilder {
-        async fn build(&self, _file_id: FileId, _index_version: u64) -> Indexer {
+        async fn build(
+            &self,
+            _file_id: RegionFileId,
+            _index_version: u64,
+            _row_group_size: Option<usize>,
+        ) -> Indexer {
             Indexer::default()
         }
     }
@@ -330,11 +346,20 @@ mod tests {
 
         // Cache 4 row groups.
         for i in 0..4 {
-            let page_key = PageKey::new(handle.file_id().file_id(), i, get_ranges(i));
-            assert!(cache.get_pages(&page_key).is_some());
+            let lookup = cache
+                .get_page_ranges(handle.file_id().file_id(), i, &get_ranges(i))
+                .unwrap();
+            assert!(lookup.is_fully_cached());
         }
-        let page_key = PageKey::new(handle.file_id().file_id(), 5, vec![]);
-        assert!(cache.get_pages(&page_key).is_none());
+        let missing_range = 0..10;
+        let lookup = cache
+            .get_page_ranges(
+                handle.file_id().file_id(),
+                5,
+                std::slice::from_ref(&missing_range),
+            )
+            .unwrap();
+        assert_eq!(vec![0..10], lookup.missing_ranges);
     }
 
     #[tokio::test]
@@ -581,7 +606,7 @@ mod tests {
             .set_key_value_metadata(Some(vec![key_value_meta]))
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .set_encoding(Encoding::PLAIN)
-            .set_max_row_group_size(write_opts.row_group_size);
+            .set_max_row_group_row_count(Some(write_opts.row_group_size));
 
         let writer_props = props_builder.build();
 
@@ -749,7 +774,6 @@ mod tests {
         let indexer_builder = IndexerBuilderImpl {
             build_type: IndexBuildType::Flush,
             metadata: metadata.clone(),
-            row_group_size,
             puffin_manager,
             write_cache_enabled: false,
             intermediate_manager,
@@ -823,6 +847,7 @@ mod tests {
                     None => None,
                 },
                 num_series: 0,
+                ..Default::default()
             },
             Arc::new(NoopFilePurger),
         );
@@ -919,11 +944,14 @@ mod tests {
         assert_eq!(metrics.filter_metrics.rg_minmax_filtered, 3);
         assert_eq!(metrics.filter_metrics.rg_inverted_filtered, 0);
         assert_eq!(metrics.filter_metrics.rows_inverted_filtered, 30);
+        let plan = inverted_index_applier
+            .as_ref()
+            .unwrap()
+            .plan_for_sst(&metadata)
+            .unwrap()
+            .unwrap();
         let cached = index_result_cache
-            .get(
-                inverted_index_applier.unwrap().predicate_key(),
-                handle.file_id().file_id(),
-            )
+            .get(&plan.predicate_key, handle.file_id().file_id())
             .unwrap();
         // inverted index will search all row groups
         assert!(cached.contains_row_group(0));
@@ -972,11 +1000,14 @@ mod tests {
         assert_eq!(metrics.filter_metrics.rg_minmax_filtered, 2);
         assert_eq!(metrics.filter_metrics.rg_bloom_filtered, 2);
         assert_eq!(metrics.filter_metrics.rows_bloom_filtered, 100);
+        let bloom_predicates = bloom_filter_applier
+            .as_ref()
+            .unwrap()
+            .compatible_predicate_for_sst(&metadata)
+            .unwrap();
+        let bloom_predicate_key = PredicateKey::new_bloom(bloom_predicates);
         let cached = index_result_cache
-            .get(
-                bloom_filter_applier.unwrap().predicate_key(),
-                handle.file_id().file_id(),
-            )
+            .get(&bloom_predicate_key, handle.file_id().file_id())
             .unwrap();
         assert!(cached.contains_row_group(2));
         assert!(cached.contains_row_group(3));
@@ -1042,11 +1073,14 @@ mod tests {
         assert_eq!(metrics.filter_metrics.rg_minmax_filtered, 0);
         assert_eq!(metrics.filter_metrics.rg_bloom_filtered, 2);
         assert_eq!(metrics.filter_metrics.rows_bloom_filtered, 140);
+        let bloom_predicates = bloom_filter_applier
+            .as_ref()
+            .unwrap()
+            .compatible_predicate_for_sst(&metadata)
+            .unwrap();
+        let bloom_predicate_key = PredicateKey::new_bloom(bloom_predicates);
         let cached = index_result_cache
-            .get(
-                bloom_filter_applier.unwrap().predicate_key(),
-                handle.file_id().file_id(),
-            )
+            .get(&bloom_predicate_key, handle.file_id().file_id())
             .unwrap();
         assert!(cached.contains_row_group(0));
         assert!(cached.contains_row_group(1));
@@ -1197,7 +1231,6 @@ mod tests {
         object_store: ObjectStore,
         file_path: RegionFilePathFactory,
         metadata: Arc<RegionMetadata>,
-        row_group_size: usize,
     ) -> IndexerBuilderImpl {
         let puffin_manager = env.get_puffin_manager().build(object_store, file_path);
         let intermediate_manager = env.get_intermediate_manager();
@@ -1205,7 +1238,6 @@ mod tests {
         IndexerBuilderImpl {
             build_type: IndexBuildType::Flush,
             metadata,
-            row_group_size,
             puffin_manager,
             write_cache_enabled: false,
             intermediate_manager,
@@ -1276,6 +1308,7 @@ mod tests {
                     None => None,
                 },
                 num_series: 0,
+                ..Default::default()
             },
             Arc::new(NoopFilePurger),
         )
@@ -1326,7 +1359,6 @@ mod tests {
         let indexer_builder = IndexerBuilderImpl {
             build_type: IndexBuildType::Flush,
             metadata: metadata.clone(),
-            row_group_size,
             puffin_manager,
             write_cache_enabled: false,
             intermediate_manager,
@@ -1503,7 +1535,6 @@ mod tests {
             object_store.clone(),
             file_path.clone(),
             metadata.clone(),
-            row_group_size,
         );
 
         let info = write_flat_sst(
@@ -1602,7 +1633,6 @@ mod tests {
             object_store.clone(),
             file_path.clone(),
             metadata.clone(),
-            row_group_size,
         );
 
         let info = write_flat_sst(
@@ -1692,7 +1722,6 @@ mod tests {
             object_store.clone(),
             file_path.clone(),
             metadata.clone(),
-            row_group_size,
         );
         let info = write_flat_sst(
             object_store.clone(),
@@ -1753,7 +1782,6 @@ mod tests {
             object_store.clone(),
             file_path.clone(),
             metadata.clone(),
-            row_group_size,
         );
         let info = write_flat_sst(
             object_store.clone(),
@@ -1834,7 +1862,6 @@ mod tests {
             object_store.clone(),
             file_path.clone(),
             metadata.clone(),
-            row_group_size,
         );
 
         let info = write_flat_sst(
@@ -1937,7 +1964,6 @@ mod tests {
             object_store.clone(),
             file_path.clone(),
             metadata.clone(),
-            row_group_size,
         );
 
         let info = write_flat_sst(
@@ -2168,7 +2194,6 @@ mod tests {
             object_store.clone(),
             file_path.clone(),
             metadata.clone(),
-            row_group_size,
         );
 
         let mut info = write_flat_sst(

@@ -14,20 +14,29 @@
 
 mod cluster_info;
 pub mod columns;
+pub mod flow_statistics;
 pub mod flows;
 mod information_memory_table;
 pub mod key_column_usage;
 mod partitions;
 mod procedure_info;
 pub mod process_list;
+#[cfg(feature = "enterprise")]
+mod recycle_bin;
+mod region_info;
 pub mod region_peers;
 mod region_statistics;
 pub mod schemata;
 mod ssts;
+pub mod statistics;
 mod table_constraints;
 mod table_names;
+mod table_semantics;
 pub mod tables;
 mod views;
+
+#[cfg(all(test, feature = "enterprise"))]
+mod recycle_bin_test;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -43,10 +52,16 @@ use common_procedure::ProcedureInfo;
 use common_recordbatch::SendableRecordBatchStream;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::ExecutionPlan;
 use datatypes::schema::SchemaRef;
 use lazy_static::lazy_static;
 use paste::paste;
 use process_list::InformationSchemaProcessList;
+use region_info::InformationSchemaRegionInfo;
+use store_api::metric_engine_consts::{
+    MEMTABLE_PARTITION_TREE_PRIMARY_KEY_ENCODING, PRIMARY_KEY_ENCODING,
+};
+use store_api::region_info::RegionInfoEntry;
 use store_api::sst_entry::{ManifestSstEntry, PuffinIndexMetaEntry, StorageSstEntry};
 use store_api::storage::{ScanRequest, TableId};
 use table::TableRef;
@@ -59,22 +74,44 @@ use crate::CatalogManager;
 use crate::error::{Error, Result};
 use crate::process_manager::ProcessManagerRef;
 use crate::system_schema::information_schema::cluster_info::InformationSchemaClusterInfo;
+use crate::system_schema::information_schema::flow_statistics::InformationSchemaFlowStatistics;
 use crate::system_schema::information_schema::flows::InformationSchemaFlows;
 use crate::system_schema::information_schema::information_memory_table::get_schema_columns;
 use crate::system_schema::information_schema::key_column_usage::InformationSchemaKeyColumnUsage;
 use crate::system_schema::information_schema::partitions::InformationSchemaPartitions;
+#[cfg(feature = "enterprise")]
+use crate::system_schema::information_schema::recycle_bin::InformationSchemaRecycleBin;
 use crate::system_schema::information_schema::region_peers::InformationSchemaRegionPeers;
 use crate::system_schema::information_schema::schemata::InformationSchemaSchemata;
 use crate::system_schema::information_schema::ssts::{
     InformationSchemaSstsIndexMeta, InformationSchemaSstsManifest, InformationSchemaSstsStorage,
 };
+use crate::system_schema::information_schema::statistics::InformationSchemaStatistics;
 use crate::system_schema::information_schema::table_constraints::InformationSchemaTableConstraints;
+use crate::system_schema::information_schema::table_semantics::InformationSchemaTableSemantics;
 use crate::system_schema::information_schema::tables::InformationSchemaTables;
 use crate::system_schema::memory_table::MemoryTable;
 pub(crate) use crate::system_schema::predicate::Predicates;
 use crate::system_schema::{
     SystemSchemaProvider, SystemSchemaProviderInner, SystemTable, SystemTableRef,
 };
+
+const DENSE_PRIMARY_KEY_ENCODING: &str = "dense";
+const SPARSE_PRIMARY_KEY_ENCODING: &str = "sparse";
+
+pub(crate) fn primary_key_encoding_index_type(options: &HashMap<String, String>) -> &'static str {
+    options
+        .get(PRIMARY_KEY_ENCODING)
+        .or_else(|| options.get(MEMTABLE_PARTITION_TREE_PRIMARY_KEY_ENCODING))
+        .map(|value| {
+            if value.eq_ignore_ascii_case(SPARSE_PRIMARY_KEY_ENCODING) {
+                SPARSE_PRIMARY_KEY_ENCODING
+            } else {
+                DENSE_PRIMARY_KEY_ENCODING
+            }
+        })
+        .unwrap_or(DENSE_PRIMARY_KEY_ENCODING)
+}
 
 lazy_static! {
     // Memory tables in `information_schema`.
@@ -220,6 +257,10 @@ impl SystemSchemaProviderInner for InformationSchemaProvider {
                 self.catalog_name.clone(),
                 self.catalog_manager.clone(),
             )) as _),
+            STATISTICS => Some(Arc::new(InformationSchemaStatistics::new(
+                self.catalog_name.clone(),
+                self.catalog_manager.clone(),
+            )) as _),
             CLUSTER_INFO => Some(Arc::new(InformationSchemaClusterInfo::new(
                 self.catalog_manager.clone(),
             )) as _),
@@ -232,16 +273,29 @@ impl SystemSchemaProviderInner for InformationSchemaProvider {
                 self.catalog_manager.clone(),
                 self.flow_metadata_manager.clone(),
             )) as _),
+            FLOW_STATISTICS => Some(Arc::new(InformationSchemaFlowStatistics::new(
+                self.catalog_name.clone(),
+                self.catalog_manager.clone(),
+                self.flow_metadata_manager.clone(),
+            )) as _),
             PROCEDURE_INFO => Some(
                 Arc::new(procedure_info::InformationSchemaProcedureInfo::new(
                     self.catalog_manager.clone(),
                 )) as _,
             ),
+            #[cfg(feature = "enterprise")]
+            RECYCLE_BIN => Some(Arc::new(InformationSchemaRecycleBin::new(
+                self.catalog_name.clone(),
+                self.catalog_manager.clone(),
+            )) as _),
             REGION_STATISTICS => Some(Arc::new(
                 region_statistics::InformationSchemaRegionStatistics::new(
                     self.catalog_manager.clone(),
                 ),
             ) as _),
+            REGION_INFO => Some(Arc::new(InformationSchemaRegionInfo::new(
+                self.catalog_manager.clone(),
+            )) as _),
             PROCESS_LIST => self
                 .process_manager
                 .as_ref()
@@ -253,6 +307,10 @@ impl SystemSchemaProviderInner for InformationSchemaProvider {
                 self.catalog_manager.clone(),
             )) as _),
             SSTS_INDEX_META => Some(Arc::new(InformationSchemaSstsIndexMeta::new(
+                self.catalog_manager.clone(),
+            )) as _),
+            TABLE_SEMANTICS => Some(Arc::new(InformationSchemaTableSemantics::new(
+                self.catalog_name.clone(),
                 self.catalog_manager.clone(),
             )) as _),
             _ => None,
@@ -321,6 +379,10 @@ impl InformationSchemaProvider {
                 self.build_table(REGION_STATISTICS).unwrap(),
             );
             tables.insert(
+                REGION_INFO.to_string(),
+                self.build_table(REGION_INFO).unwrap(),
+            );
+            tables.insert(
                 SSTS_MANIFEST.to_string(),
                 self.build_table(SSTS_MANIFEST).unwrap(),
             );
@@ -346,7 +408,24 @@ impl InformationSchemaProvider {
             TABLE_CONSTRAINTS.to_string(),
             self.build_table(TABLE_CONSTRAINTS).unwrap(),
         );
+        tables.insert(
+            STATISTICS.to_string(),
+            self.build_table(STATISTICS).unwrap(),
+        );
         tables.insert(FLOWS.to_string(), self.build_table(FLOWS).unwrap());
+        tables.insert(
+            FLOW_STATISTICS.to_string(),
+            self.build_table(FLOW_STATISTICS).unwrap(),
+        );
+        #[cfg(feature = "enterprise")]
+        tables.insert(
+            RECYCLE_BIN.to_string(),
+            self.build_table(RECYCLE_BIN).unwrap(),
+        );
+        tables.insert(
+            TABLE_SEMANTICS.to_string(),
+            self.build_table(TABLE_SEMANTICS).unwrap(),
+        );
         if let Some(process_list) = self.build_table(PROCESS_LIST) {
             tables.insert(PROCESS_LIST.to_string(), process_list);
         }
@@ -369,6 +448,10 @@ pub trait InformationTable {
     fn schema(&self) -> SchemaRef;
 
     fn to_stream(&self, request: ScanRequest) -> Result<SendableRecordBatchStream>;
+
+    fn scan_plan(&self, _request: ScanRequest) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
 
     fn table_type(&self) -> TableType {
         TableType::Temporary
@@ -399,6 +482,10 @@ where
     fn to_stream(&self, request: ScanRequest) -> Result<SendableRecordBatchStream> {
         InformationTable::to_stream(self, request)
     }
+
+    fn scan_plan(&self, request: ScanRequest) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        InformationTable::scan_plan(self, request)
+    }
 }
 
 pub type InformationExtensionRef = Arc<dyn InformationExtension<Error = Error> + Send + Sync>;
@@ -425,6 +512,16 @@ pub trait InformationExtension {
         &self,
         request: DatanodeInspectRequest,
     ) -> std::result::Result<SendableRecordBatchStream, Self::Error>;
+
+    /// Builds a physical plan for datanode inspect if the extension can expose
+    /// the distributed fan-in semantics to DataFusion.
+    fn inspect_datanode_plan(
+        &self,
+        _request: DatanodeInspectRequest,
+        _schema: SchemaRef,
+    ) -> std::result::Result<Option<Arc<dyn ExecutionPlan>>, Self::Error> {
+        Ok(None)
+    }
 }
 
 /// The request to inspect the datanode.
@@ -447,6 +544,8 @@ pub enum DatanodeInspectKind {
     SstStorage,
     /// List index metadata collected from manifest
     SstIndexMeta,
+    /// List region runtime and manifest info
+    RegionInfo,
 }
 
 impl DatanodeInspectRequest {
@@ -456,6 +555,7 @@ impl DatanodeInspectRequest {
             DatanodeInspectKind::SstManifest => ManifestSstEntry::build_plan(self.scan),
             DatanodeInspectKind::SstStorage => StorageSstEntry::build_plan(self.scan),
             DatanodeInspectKind::SstIndexMeta => PuffinIndexMetaEntry::build_plan(self.scan),
+            DatanodeInspectKind::RegionInfo => RegionInfoEntry::build_plan(self.scan),
         }
     }
 }
@@ -486,5 +586,30 @@ impl InformationExtension for NoopInformationExtension {
         _request: DatanodeInspectRequest,
     ) -> std::result::Result<SendableRecordBatchStream, Self::Error> {
         Ok(common_recordbatch::RecordBatches::empty().as_stream())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use store_api::region_info::RegionInfoEntry;
+
+    use super::*;
+
+    #[test]
+    fn test_datanode_inspect_region_info_build_plan() {
+        let plan = DatanodeInspectRequest {
+            kind: DatanodeInspectKind::RegionInfo,
+            scan: ScanRequest::default(),
+        }
+        .build_plan()
+        .unwrap();
+
+        let LogicalPlan::TableScan(scan) = plan else {
+            panic!("expected table scan");
+        };
+        assert_eq!(
+            scan.table_name.to_string(),
+            RegionInfoEntry::reserved_table_name_for_inspection()
+        );
     }
 }

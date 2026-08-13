@@ -23,11 +23,11 @@ use async_trait::async_trait;
 use auth::UserProviderRef;
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode as HttpStatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::Route;
 use axum::serve::ListenerExt;
 use axum::{Router, middleware, routing};
-use common_base::Plugins;
 use common_base::readable_size::ReadableSize;
 use common_recordbatch::RecordBatch;
 use common_telemetry::{error, info};
@@ -52,19 +52,18 @@ use tower_http::trace::TraceLayer;
 
 use self::authorize::AuthState;
 use self::result::table_result::TableResponse;
-use crate::configurator::HttpConfiguratorRef;
 use crate::elasticsearch;
 use crate::error::{
     AddressBindSnafu, AlreadyStartedSnafu, Error, InternalIoSnafu, InvalidHeaderValueSnafu,
-    InvalidParameterSnafu, OtherSnafu, Result,
+    InvalidParameterSnafu, Result,
 };
 use crate::http::header::constants::GREPTIME_DB_HEADER_NAME;
 use crate::http::influxdb::{influxdb_health, influxdb_ping, influxdb_write_v1, influxdb_write_v2};
 use crate::http::otlp::OtlpState;
 use crate::http::prom_store::PromStoreState;
 use crate::http::prometheus::{
-    build_info_query, format_query, instant_query, label_values_query, labels_query, parse_query,
-    range_query, series_query,
+    build_info_query, format_query, instant_query, label_values_query, labels_query,
+    metadata_query, parse_query, range_query, series_query,
 };
 use crate::http::result::arrow_result::ArrowResponse;
 use crate::http::result::csv_result::CsvResponse;
@@ -108,6 +107,7 @@ pub mod pprof;
 pub mod prom_store;
 pub mod prometheus;
 pub mod result;
+pub mod splunk;
 mod timeout;
 pub mod utils;
 
@@ -123,14 +123,70 @@ pub mod test_helpers;
 
 pub const HTTP_API_VERSION: &str = "v1";
 pub const HTTP_API_PREFIX: &str = "/v1/";
+pub const HTTP_API_PREFIX_WITHOUT_TRAILING_SLASH: &str = "/v1";
+
+/// Provides an extra router to merge into an HTTP server.
+pub trait ExtraHttpRouterProvider: Send + Sync {
+    /// Returns the extra HTTP router.
+    fn router(&self) -> Router;
+}
+
+pub type ExtraHttpRouterProviderRef = Arc<dyn ExtraHttpRouterProvider>;
+
+/// Collection of extra HTTP router providers.
+#[derive(Clone, Default)]
+pub struct ExtraHttpRouterProviders {
+    providers: Vec<ExtraHttpRouterProviderRef>,
+}
+
+impl ExtraHttpRouterProviders {
+    /// Creates an empty provider collection.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds an extra HTTP router provider.
+    pub fn add(&mut self, provider: ExtraHttpRouterProviderRef) {
+        self.providers.push(provider);
+    }
+
+    /// Returns all registered providers.
+    pub fn iter(&self) -> impl Iterator<Item = &dyn ExtraHttpRouterProvider> {
+        self.providers.iter().map(|x| x.as_ref())
+    }
+}
+
 /// Default http body limit (64M).
 const DEFAULT_BODY_LIMIT: ReadableSize = ReadableSize::mb(64);
+/// Default address port for the public HTTP API server.
+const DEFAULT_HTTP_API_ADDR_PORT: u16 = 4006;
 
 /// Authorization header
 pub const AUTHORIZATION_HEADER: &str = "x-greptime-auth";
 
 // TODO(fys): This is a temporary workaround, it will be improved later
-pub static PUBLIC_APIS: [&str; 3] = ["/v1/influxdb/ping", "/v1/influxdb/health", "/v1/health"];
+// these APIs will bypass authentication.
+pub static PUBLIC_API_PREFIX: [&str; 4] = [
+    "/v1/influxdb/ping",
+    "/v1/influxdb/health",
+    "/v1/health",
+    "/v1/splunk/services/collector/health",
+];
+
+/// Listener mode for an [`HttpServer`].
+///
+/// Both modes share the *same* complete route registry; the [`HttpServerKind::Api`]
+/// listener additionally installs an outer guard that only exposes the `/v1` APIs
+/// and the dashboard, returning `404` for every other path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum HttpServerKind {
+    /// Serves the complete historical HTTP surface (both `v1` APIs and internal
+    /// interfaces such as health, status, metrics, config and debug).
+    #[default]
+    Full,
+    /// Serves only the `v1` interfaces plus the dashboard.
+    Api,
+}
 
 #[derive(Default)]
 pub struct HttpServer {
@@ -139,12 +195,46 @@ pub struct HttpServer {
     user_provider: Option<UserProviderRef>,
     memory_limiter: ServerMemoryLimiter,
 
-    // plugins
-    plugins: Plugins,
-
     // server configs
     options: HttpOptions,
     bind_addr: Option<SocketAddr>,
+    /// What this server instance exposes. See [`HttpServerKind`].
+    kind: HttpServerKind,
+}
+
+/// Returns `true` when `path` equals `root` or is nested directly under it
+/// (`root/...`). Uses an exact slash boundary so `/v1` does **not** match `/v10`
+/// or `/v1-internal`.
+pub(crate) fn is_namespace(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Paths visible on the dedicated API listener: the `/v1` APIs and the dashboard.
+pub fn is_api_listener_path(path: &str) -> bool {
+    is_namespace(path, HTTP_API_PREFIX_WITHOUT_TRAILING_SLASH) || is_namespace(path, "/dashboard")
+}
+
+/// Outer guard for the API listener. Rejects any path outside the API surface
+/// with `404 Not Found` before it can reach a handler (and before auth side
+/// effects). Reachability is kept separate from authentication.
+async fn enforce_api_surface(req: Request, next: Next) -> Response {
+    if !is_api_listener_path(req.uri().path()) {
+        return HttpStatusCode::NOT_FOUND.into_response();
+    }
+    next.run(req).await
+}
+
+impl HttpServer {
+    /// A short human-readable label for this server instance, used in logs.
+    fn kind(&self) -> &'static str {
+        match self.kind {
+            HttpServerKind::Api => "HTTP API",
+            HttpServerKind::Full => "HTTP",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,10 +255,20 @@ pub struct HttpOptions {
 
     /// Validation mode while decoding Prometheus remote write requests.
     pub prom_validation_mode: PromValidationMode,
-
     pub cors_allowed_origins: Vec<String>,
 
     pub enable_cors: bool,
+
+    pub experimental_enable_explain_analyze_stream: bool,
+
+    /// Whether to start the dedicated public HTTP **API** server, which serves
+    /// only the `v1` interfaces plus the dashboard. It shares every other
+    /// `[http]` option with the main server and only differs by its bound
+    /// address (see `api_server_addr`).
+    pub enable_api_server: bool,
+    /// The address to bind the dedicated HTTP API server, in the same form as
+    /// `addr` (e.g. `127.0.0.1:4006`).
+    pub api_server_addr: String,
 }
 
 impl Default for HttpOptions {
@@ -179,9 +279,12 @@ impl Default for HttpOptions {
             disable_dashboard: false,
             body_limit: DEFAULT_BODY_LIMIT,
             db_name_header_name: GREPTIME_DB_HEADER_NAME.to_string(),
+            prom_validation_mode: PromValidationMode::Strict,
             cors_allowed_origins: Vec::new(),
             enable_cors: true,
-            prom_validation_mode: PromValidationMode::Strict,
+            experimental_enable_explain_analyze_stream: true,
+            enable_api_server: false,
+            api_server_addr: format!("127.0.0.1:{}", DEFAULT_HTTP_API_ADDR_PORT),
         }
     }
 }
@@ -506,6 +609,7 @@ impl From<NullResponse> for HttpResponse {
 #[derive(Clone)]
 pub struct ApiState {
     pub sql_handler: ServerSqlQueryHandlerRef,
+    pub experimental_enable_explain_analyze_stream: bool,
 }
 
 #[derive(Clone)]
@@ -520,7 +624,6 @@ pub struct DashboardState {
 
 pub struct HttpServerBuilder {
     options: HttpOptions,
-    plugins: Plugins,
     user_provider: Option<UserProviderRef>,
     router: Router,
     memory_limiter: ServerMemoryLimiter,
@@ -530,7 +633,6 @@ impl HttpServerBuilder {
     pub fn new(options: HttpOptions) -> Self {
         Self {
             options,
-            plugins: Plugins::default(),
             user_provider: None,
             router: Router::new(),
             memory_limiter: ServerMemoryLimiter::default(),
@@ -544,7 +646,12 @@ impl HttpServerBuilder {
     }
 
     pub fn with_sql_handler(self, sql_handler: ServerSqlQueryHandlerRef) -> Self {
-        let sql_router = HttpServer::route_sql(ApiState { sql_handler });
+        let sql_router = HttpServer::route_sql(ApiState {
+            sql_handler,
+            experimental_enable_explain_analyze_stream: self
+                .options
+                .experimental_enable_explain_analyze_stream,
+        });
 
         Self {
             router: self
@@ -591,6 +698,7 @@ impl HttpServerBuilder {
         pipeline_handler: Option<PipelineHandlerRef>,
         prom_store_with_metric_engine: bool,
         prom_validation_mode: PromValidationMode,
+        experimental_enable_prometheus_native_histogram: bool,
         pending_rows_batcher: Option<Arc<PendingRowsBatcher>>,
     ) -> Self {
         let state = PromStoreState {
@@ -598,6 +706,7 @@ impl HttpServerBuilder {
             pipeline_handler,
             prom_store_with_metric_engine,
             prom_validation_mode,
+            experimental_enable_prometheus_native_histogram,
             pending_rows_batcher,
         };
 
@@ -685,14 +794,15 @@ impl HttpServerBuilder {
             &format!("/{HTTP_API_VERSION}/elasticsearch/"),
             Router::new()
                 .route("/", routing::get(elasticsearch::handle_get_version))
-                .with_state(log_state),
+                .with_state(log_state.clone()),
+        );
+
+        let router = router.nest(
+            &format!("/{HTTP_API_VERSION}/splunk"),
+            HttpServer::route_splunk(log_state),
         );
 
         Self { router, ..self }
-    }
-
-    pub fn with_plugins(self, plugins: Plugins) -> Self {
-        Self { plugins, ..self }
     }
 
     pub fn with_greptime_config_options(self, opts: String) -> Self {
@@ -752,11 +862,66 @@ impl HttpServerBuilder {
             options: self.options,
             user_provider: self.user_provider,
             shutdown_tx: Mutex::new(None),
-            plugins: self.plugins,
             router: StdMutex::new(self.router),
             bind_addr: None,
             memory_limiter: self.memory_limiter,
+            kind: HttpServerKind::Full,
         }
+    }
+
+    /// Builds the full HTTP server (serves the `v1` interfaces **and** the
+    /// internal interfaces such as health, status, metrics, config and debug).
+    /// When [`HttpOptions::enable_api_server`] is `true`, it also builds a
+    /// dedicated HTTP **API** server that serves only the `v1` interfaces plus
+    /// the dashboard.
+    ///
+    /// Both servers are built from the **same** complete route registry (so every
+    /// built-in, plugin and downstream route registered via `with_extra_router()`
+    /// is present on both). The API server additionally installs an outer guard
+    /// that exposes only the `/v1` and `/dashboard` namespaces, returning `404`
+    /// for everything else. This means downstream projects (e.g. enterprise) do
+    /// not need to classify their routes as public/internal: non-`/v1`
+    /// operational routes are hidden from the API listener automatically.
+    ///
+    /// The first returned server is bound to `self.options.addr` (e.g. port
+    /// `4000`) and keeps the historical single-server behavior. The optional
+    /// second server is bound to `api_server_addr` (e.g. `127.0.0.1:4006`). The
+    /// API server inherits **every** option from `[http]` except the bound address.
+    pub fn build_servers(self) -> (HttpServer, Option<HttpServer>) {
+        let api_enabled = self.options.enable_api_server;
+        let api_addr = self.options.api_server_addr.clone();
+
+        let internal = HttpServer {
+            options: self.options,
+            user_provider: self.user_provider.clone(),
+            shutdown_tx: Mutex::new(None),
+            router: StdMutex::new(self.router.clone()),
+            bind_addr: None,
+            memory_limiter: self.memory_limiter.clone(),
+            kind: HttpServerKind::Full,
+        };
+
+        let api = if api_enabled {
+            // The API server shares every option with the full server except the
+            // bound address.
+            let api_options = HttpOptions {
+                addr: api_addr,
+                ..internal.options.clone()
+            };
+            Some(HttpServer {
+                options: api_options,
+                user_provider: self.user_provider.clone(),
+                shutdown_tx: Mutex::new(None),
+                router: StdMutex::new(self.router),
+                bind_addr: None,
+                memory_limiter: self.memory_limiter,
+                kind: HttpServerKind::Api,
+            })
+        } else {
+            None
+        };
+
+        (internal, api)
     }
 }
 
@@ -773,29 +938,36 @@ impl HttpServer {
         })
     }
 
-    /// Gets the router and adds necessary root routes (health, status, dashboard).
+    /// Builds the complete route registry shared by every HTTP server: all the
+    /// `v1` protocol routes, the root/health/status/metrics/config interfaces,
+    /// the dashboard and (via `build()`) the debug routes.
+    ///
+    /// Both [`HttpServerKind::Full`] and [`HttpServerKind::Api`] listeners are
+    /// built from this same router. The API listener hides the non-`v1` paths
+    /// later, in [`HttpServer::build`], via an outer guard. Keeping one router
+    /// means downstream routes added through `with_extra_router()` are present
+    /// on both listeners automatically, and the API guard decides exposure.
     pub fn make_app(&self) -> Router {
-        let mut router = {
-            let router = self.router.lock().unwrap();
-            router.clone()
-        };
+        let mut router = self.router.lock().unwrap().clone();
 
         router = router
+            .route(
+                &format!("/{HTTP_API_VERSION}/health"),
+                routing::get(handler::health).post(handler::health),
+            )
+            .route("/", routing::get(handler::index))
             .route(
                 "/health",
                 routing::get(handler::health).post(handler::health),
             )
             .route(
-                &format!("/{HTTP_API_VERSION}/health"),
-                routing::get(handler::health).post(handler::health),
-            )
-            .route(
                 "/ready",
                 routing::get(handler::health).post(handler::health),
-            );
+            )
+            .route("/status", routing::get(handler::status));
 
-        router = router.route("/status", routing::get(handler::status));
-
+        // The dashboard runs on top of the `v1` APIs, so it is exposed on every
+        // HTTP server (the API listener's namespace guard allows `/dashboard`).
         #[cfg(feature = "dashboard")]
         {
             if !self.options.disable_dashboard {
@@ -838,7 +1010,12 @@ impl HttpServer {
     pub fn build(&self, router: Router) -> Result<Router> {
         let db_name_header = self.db_name_header()?;
         let timeout_layer = if self.options.timeout != Duration::default() {
-            Some(ServiceBuilder::new().layer(DynamicTimeoutLayer::new(self.options.timeout)))
+            Some(
+                ServiceBuilder::new().layer(
+                    DynamicTimeoutLayer::new(self.options.timeout)
+                        .with_status_code_fn(Self::request_timeout_status_code),
+                ),
+            )
         } else {
             info!("HTTP server timeout is disabled");
             None
@@ -883,7 +1060,7 @@ impl HttpServer {
             None
         };
 
-        Ok(router
+        let router = router
             // middlewares
             .layer(
                 ServiceBuilder::new()
@@ -908,39 +1085,59 @@ impl HttpServer {
                     .layer(middleware::from_fn(
                         read_preference::extract_read_preference,
                     )),
-            )
-            // Handlers for debug, we don't expect a timeout.
-            .nest(
-                "/debug",
-                Router::new()
-                    // handler for changing log level dynamically
-                    .route("/log_level", routing::post(dyn_log::dyn_log_handler))
-                    .route("/enable_trace", routing::post(dyn_trace::dyn_trace_handler))
-                    .nest(
-                        "/prof",
-                        Router::new()
-                            .route("/cpu", routing::post(pprof::pprof_handler))
-                            .route("/mem", routing::post(mem_prof::mem_prof_handler))
-                            .route("/mem/symbol", routing::post(mem_prof::symbolicate_handler))
-                            .route(
-                                "/mem/activate",
-                                routing::post(mem_prof::activate_heap_prof_handler),
-                            )
-                            .route(
-                                "/mem/deactivate",
-                                routing::post(mem_prof::deactivate_heap_prof_handler),
-                            )
-                            .route(
-                                "/mem/status",
-                                routing::get(mem_prof::heap_prof_status_handler),
-                            ) // jemalloc gdump flag status and toggle
-                            .route(
-                                "/mem/gdump",
-                                routing::get(mem_prof::gdump_status_handler)
-                                    .post(mem_prof::gdump_toggle_handler),
-                            ),
-                    ),
-            ))
+            );
+
+        // Debug handlers are part of the complete router; the API listener hides
+        // them through the outer namespace guard applied below.
+        let router = router.nest(
+            "/debug",
+            Router::new()
+                // handler for changing log level dynamically
+                .route("/log_level", routing::post(dyn_log::dyn_log_handler))
+                .route("/enable_trace", routing::post(dyn_trace::dyn_trace_handler))
+                .nest(
+                    "/prof",
+                    Router::new()
+                        .route("/cpu", routing::post(pprof::pprof_handler))
+                        .route("/mem", routing::post(mem_prof::mem_prof_handler))
+                        .route("/mem/symbol", routing::post(mem_prof::symbolicate_handler))
+                        .route(
+                            "/mem/activate",
+                            routing::post(mem_prof::activate_heap_prof_handler),
+                        )
+                        .route(
+                            "/mem/deactivate",
+                            routing::post(mem_prof::deactivate_heap_prof_handler),
+                        )
+                        .route(
+                            "/mem/status",
+                            routing::get(mem_prof::heap_prof_status_handler),
+                        ) // jemalloc gdump flag status and toggle
+                        .route(
+                            "/mem/gdump",
+                            routing::get(mem_prof::gdump_status_handler)
+                                .post(mem_prof::gdump_toggle_handler),
+                        ),
+                ),
+        );
+
+        // Seal the API listener last: this is the outermost layer, applied after
+        // all middleware, debug routes and any caller/plugin routes, so that only
+        // `/v1` and `/dashboard` paths can reach a handler. Excluded paths return
+        // 404 before auth or any other side effect.
+        if self.kind == HttpServerKind::Api {
+            Ok(router.layer(middleware::from_fn(enforce_api_surface)))
+        } else {
+            Ok(router)
+        }
+    }
+
+    fn request_timeout_status_code(request: &Request) -> HttpStatusCode {
+        if request.uri().path() == "/v1/prometheus/write" {
+            HttpStatusCode::GATEWAY_TIMEOUT
+        } else {
+            HttpStatusCode::REQUEST_TIMEOUT
+        }
     }
 
     fn route_metrics<S>(metrics_handler: MetricsHandler) -> Router<S> {
@@ -952,6 +1149,41 @@ impl HttpServer {
     fn route_loki<S>(log_state: LogState) -> Router<S> {
         Router::new()
             .route("/api/v1/push", routing::post(loki::loki_ingest))
+            .layer(
+                ServiceBuilder::new()
+                    .layer(RequestDecompressionLayer::new().pass_through_unaccepted(true)),
+            )
+            .with_state(log_state)
+    }
+
+    fn route_splunk<S>(log_state: LogState) -> Router<S> {
+        Router::new()
+            .route(
+                "/services/collector/health",
+                routing::get(splunk::handle_health),
+            )
+            .route(
+                "/services/collector/health/1.0",
+                routing::get(splunk::handle_health),
+            )
+            // The event endpoint plus its base and versioned aliases all serve
+            // the same handler (Splunk JSON event protocol).
+            .route(
+                "/services/collector/event",
+                routing::post(splunk::handle_event),
+            )
+            .route("/services/collector", routing::post(splunk::handle_event))
+            .route(
+                "/services/collector/event/1.0",
+                routing::post(splunk::handle_event),
+            )
+            // The raw endpoint (plain-text body, one event per line) plus its
+            // versioned alias.
+            .route("/services/collector/raw", routing::post(splunk::handle_raw))
+            .route(
+                "/services/collector/raw/1.0",
+                routing::post(splunk::handle_raw),
+            )
             .layer(
                 ServiceBuilder::new()
                     .layer(RequestDecompressionLayer::new().pass_through_unaccepted(true)),
@@ -1087,7 +1319,7 @@ impl HttpServer {
     }
 
     fn route_sql<S>(api_state: ApiState) -> Router<S> {
-        Router::new()
+        let mut router = Router::new()
             .route("/sql", routing::get(handler::sql).post(handler::sql))
             .route(
                 "/sql/parse",
@@ -1100,8 +1332,16 @@ impl HttpServer {
             .route(
                 "/promql",
                 routing::get(handler::promql).post(handler::promql),
-            )
-            .with_state(api_state)
+            );
+
+        if api_state.experimental_enable_explain_analyze_stream {
+            router = router.route(
+                "/sql/analyze/stream",
+                routing::post(handler::sql_analyze_stream),
+            );
+        }
+
+        router.with_state(api_state)
     }
 
     fn route_logs<S>(log_handler: LogQueryHandlerRef) -> Router<S> {
@@ -1123,6 +1363,7 @@ impl HttpServer {
             .route("/query", routing::post(instant_query).get(instant_query))
             .route("/query_range", routing::post(range_query).get(range_query))
             .route("/labels", routing::post(labels_query).get(labels_query))
+            .route("/metadata", routing::get(metadata_query))
             .route("/series", routing::post(series_query).get(series_query))
             .route("/parse_query", routing::post(parse_query).get(parse_query))
             .route(
@@ -1229,6 +1470,7 @@ impl HttpServer {
 }
 
 pub const HTTP_SERVER: &str = "HTTP_SERVER";
+pub const HTTP_API_SERVER: &str = "HTTP_API_SERVER";
 
 #[async_trait]
 impl Server for HttpServer {
@@ -1239,7 +1481,7 @@ impl Server for HttpServer {
         {
             info!("Receiver dropped, the HTTP server has already exited");
         }
-        info!("Shutdown HTTP server");
+        info!("Shutdown {}", self.kind());
 
         Ok(())
     }
@@ -1250,17 +1492,12 @@ impl Server for HttpServer {
             let mut shutdown_tx = self.shutdown_tx.lock().await;
             ensure!(
                 shutdown_tx.is_none(),
-                AlreadyStartedSnafu { server: "HTTP" }
+                AlreadyStartedSnafu {
+                    server: self.kind()
+                }
             );
 
-            let mut app = self.make_app();
-            if let Some(configurator) = self.plugins.get::<HttpConfiguratorRef<()>>() {
-                app = configurator
-                    .configure_http(app, ())
-                    .await
-                    .context(OtherSnafu)?;
-            }
-            let app = self.build(app)?;
+            let app = self.build(self.make_app())?;
             let listener = tokio::net::TcpListener::bind(listening)
                 .await
                 .context(AddressBindSnafu { addr: listening })?
@@ -1295,7 +1532,7 @@ impl Server for HttpServer {
             serve
         };
         let listening = serve.local_addr().context(InternalIoSnafu)?;
-        info!("HTTP server is bound to {}", listening);
+        info!("{} server is bound to {}", self.kind(), listening);
 
         common_runtime::spawn_global(async move {
             if let Err(e) = serve
@@ -1312,7 +1549,10 @@ impl Server for HttpServer {
     }
 
     fn name(&self) -> &str {
-        HTTP_SERVER
+        match self.kind {
+            HttpServerKind::Api => HTTP_API_SERVER,
+            HttpServerKind::Full => HTTP_SERVER,
+        }
     }
 
     fn bind_addr(&self) -> Option<SocketAddr> {
@@ -1330,12 +1570,11 @@ mod test {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    use arrow_ipc::reader::FileReader;
+    use arrow_ipc::reader::StreamReader;
     use arrow_schema::DataType;
-    use axum::handler::Handler;
     use axum::http::StatusCode;
-    use axum::routing::get;
-    use common_query::Output;
+    use axum::routing::{get, post};
+    use common_query::{Output, OutputData};
     use common_recordbatch::RecordBatches;
     use datafusion_expr::LogicalPlan;
     use datatypes::prelude::*;
@@ -1364,14 +1603,19 @@ mod test {
             unimplemented!()
         }
 
+        async fn do_analyze_stream_query(&self, _: &str, _: QueryContextRef) -> Result<Output> {
+            let stream = common_recordbatch::RecordBatches::empty().as_stream();
+            Ok(Output::new(OutputData::Stream(stream), Default::default()))
+        }
+
         async fn do_promql_query(&self, _: &PromQuery, _: QueryContextRef) -> Vec<Result<Output>> {
             unimplemented!()
         }
 
         async fn do_exec_plan(
             &self,
-            _stmt: Option<Statement>,
             _plan: LogicalPlan,
+            _stmt: Option<Statement>,
             _query_ctx: QueryContextRef,
         ) -> Result<Output> {
             unimplemented!()
@@ -1390,10 +1634,6 @@ mod test {
         }
     }
 
-    fn timeout() -> DynamicTimeoutLayer {
-        DynamicTimeoutLayer::new(Duration::from_millis(10))
-    }
-
     async fn forever() {
         pending().await
     }
@@ -1407,10 +1647,225 @@ mod test {
         let server = HttpServerBuilder::new(options)
             .with_sql_handler(instance.clone())
             .build();
-        server.build(server.make_app()).unwrap().route(
-            "/test/timeout",
-            get(forever.layer(ServiceBuilder::new().layer(timeout()))),
-        )
+        let app = server
+            .make_app()
+            .route("/test/timeout", get(forever))
+            .route("/v1/prometheus/write", post(forever));
+        server.build(app).unwrap()
+    }
+
+    #[tokio::test]
+    pub async fn test_analyze_stream_route_config_gate() {
+        let (tx, _rx) = mpsc::channel(100);
+        let options = HttpOptions {
+            experimental_enable_explain_analyze_stream: false,
+            ..Default::default()
+        };
+        let app = make_test_app_custom(tx, options);
+        let client = TestClient::new(app).await;
+        let res = client
+            .post("/v1/sql/analyze/stream?sql=EXPLAIN%20ANALYZE%20VERBOSE%20SELECT%201")
+            .send()
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let (tx, _rx) = mpsc::channel(100);
+        let app = make_test_app_custom(tx, HttpOptions::default());
+        let client = TestClient::new(app).await;
+        let res = client
+            .post("/v1/sql/analyze/stream?sql=EXPLAIN%20ANALYZE%20VERBOSE%20SELECT%201")
+            .send()
+            .await;
+        assert_ne!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn make_split_builder() -> HttpServerBuilder {
+        let (tx, _rx) = mpsc::channel(100);
+        let instance = Arc::new(DummyInstance { _tx: tx });
+        // Enable the dedicated API server so the split behavior can be exercised.
+        let options = HttpOptions {
+            enable_api_server: true,
+            ..HttpOptions::default()
+        };
+        HttpServerBuilder::new(options)
+            .with_sql_handler(instance)
+            .with_metrics_handler(MetricsHandler)
+            .with_greptime_config_options("dummy = \"value\"".to_string())
+    }
+
+    #[tokio::test]
+    pub async fn test_http_api_options_defaults() {
+        let opts = HttpOptions::default();
+        // The API server is disabled by default.
+        assert!(!opts.enable_api_server);
+        assert_eq!(opts.api_server_addr, "127.0.0.1:4006");
+    }
+
+    #[tokio::test]
+    pub async fn test_build_serves_all_routes() {
+        // The single (internal/full) server built via `build()` keeps serving both
+        // the public v1 interfaces and the internal ones. This is the historical
+        // single-server behavior and must not change.
+        let server = make_split_builder().build();
+        assert_eq!(server.name(), HTTP_SERVER);
+
+        let app = server.build(server.make_app()).unwrap();
+        let client = TestClient::new(app).await;
+
+        for path in ["/v1/health", "/health", "/status", "/metrics", "/config"] {
+            let res = client.get(path).send().await;
+            assert_eq!(
+                res.status(),
+                StatusCode::OK,
+                "internal/full server should serve {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    pub async fn test_build_servers_separates_api_and_internal_routes() {
+        // `build_servers` produces the internal/full server (everything) plus a
+        // dedicated API server that only serves the v1 interfaces (and dashboard).
+        let (internal, api) = make_split_builder().build_servers();
+        let api = api.expect("API server is explicitly enabled in make_split_builder");
+        assert_eq!(internal.name(), HTTP_SERVER);
+        assert_eq!(api.name(), HTTP_API_SERVER);
+
+        let internal_app = internal.build(internal.make_app()).unwrap();
+        let api_app = api.build(api.make_app()).unwrap();
+
+        let internal_client = TestClient::new(internal_app).await;
+        let api_client = TestClient::new(api_app).await;
+
+        // Both servers serve the v1 interfaces (e.g. the v1 health check).
+        assert_eq!(
+            internal_client.get("/v1/health").send().await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            api_client.get("/v1/health").send().await.status(),
+            StatusCode::OK
+        );
+
+        // The internal-only interfaces are served by the internal/full server...
+        for path in ["/health", "/status", "/metrics", "/config"] {
+            assert_eq!(
+                internal_client.get(path).send().await.status(),
+                StatusCode::OK,
+                "internal/full server should serve {path}"
+            );
+            // ...and NOT by the API-only server.
+            assert_eq!(
+                api_client.get(path).send().await.status(),
+                StatusCode::NOT_FOUND,
+                "API server should NOT serve {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_servers_api_inherits_http_options() {
+        // The API server must inherit every `[http]` option except the bound addr.
+        let http_opts = HttpOptions {
+            timeout: Duration::from_secs(42),
+            body_limit: ReadableSize::mb(128),
+            cors_allowed_origins: vec!["https://example.com".to_string()],
+            enable_api_server: true,
+            ..HttpOptions::default()
+        };
+        let (internal, api) = HttpServerBuilder::new(http_opts.clone()).build_servers();
+        let api = api.expect("API server is explicitly enabled");
+
+        // Only the bound address differs.
+        assert_eq!(internal.options.addr, http_opts.addr);
+        assert_eq!(api.options.addr, "127.0.0.1:4006");
+        // Everything else is inherited from `[http]`.
+        assert_eq!(api.options.timeout, http_opts.timeout);
+        assert_eq!(api.options.body_limit, http_opts.body_limit);
+        assert_eq!(
+            api.options.cors_allowed_origins,
+            http_opts.cors_allowed_origins
+        );
+    }
+
+    #[test]
+    fn test_is_api_listener_path() {
+        // `/v1` namespace (exact slash boundary).
+        assert!(is_api_listener_path("/v1"));
+        assert!(is_api_listener_path("/v1/"));
+        assert!(is_api_listener_path("/v1/sql"));
+        assert!(!is_api_listener_path("/v10/sql"));
+        assert!(!is_api_listener_path("/v1-internal"));
+        // `/dashboard` namespace.
+        assert!(is_api_listener_path("/dashboard"));
+        assert!(is_api_listener_path("/dashboard/app.js"));
+        assert!(!is_api_listener_path("/dashboard-admin"));
+        // Operational paths are never API-visible.
+        assert!(!is_api_listener_path("/metrics"));
+        assert!(!is_api_listener_path("/status/plugin"));
+        assert!(!is_api_listener_path("/health"));
+    }
+
+    #[tokio::test]
+    pub async fn test_extra_router_respects_api_surface() {
+        // Downstream routes added through `with_extra_router()` (e.g. enterprise
+        // plugins or the `RouterConfigurator`) are present on the full listener
+        // and on the API listener's router, but the API listener's outer guard
+        // hides every non-`/v1` path automatically. This is what keeps the
+        // feature correct for greptimedb-enterprise with no downstream changes.
+        let (tx, _rx) = mpsc::channel(100);
+        let instance = Arc::new(DummyInstance { _tx: tx });
+        let options = HttpOptions {
+            enable_api_server: true,
+            ..HttpOptions::default()
+        };
+        let builder = HttpServerBuilder::new(options)
+            .with_sql_handler(instance)
+            .with_extra_router(
+                Router::new()
+                    .route("/status/plugin", routing::get(|| async { "ok" }))
+                    .route("/v1/plugin", routing::get(|| async { "ok" })),
+            );
+        let (full, api) = builder.build_servers();
+        let api = api.expect("API server is explicitly enabled");
+
+        let full_client = TestClient::new(full.build(full.make_app()).unwrap()).await;
+        let api_client = TestClient::new(api.build(api.make_app()).unwrap()).await;
+
+        // A non-`/v1` route is reachable on the full listener...
+        assert_eq!(
+            full_client.get("/status/plugin").send().await.status(),
+            StatusCode::OK
+        );
+        // ...and hidden (404) on the API listener, without the caller classifying it.
+        assert_eq!(
+            api_client.get("/status/plugin").send().await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // A `/v1` route is reachable on both.
+        assert_eq!(
+            full_client.get("/v1/plugin").send().await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            api_client.get("/v1/plugin").send().await.status(),
+            StatusCode::OK
+        );
+
+        // Slash-boundary correctness on the API listener.
+        assert_eq!(
+            api_client.get("/v10/plugin").send().await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn test_build_servers_api_disabled_by_default() {
+        // The API server is disabled by default, so `build_servers` returns no
+        // second server unless `enable_api_server` is set.
+        let (_internal, api) = HttpServerBuilder::new(HttpOptions::default()).build_servers();
+        assert!(api.is_none());
     }
 
     #[tokio::test]
@@ -1555,10 +2010,17 @@ mod test {
         common_telemetry::init_default_ut_logging();
 
         let (tx, _rx) = mpsc::channel(100);
-        let app = make_test_app(tx);
+        let options = HttpOptions {
+            timeout: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let app = make_test_app_custom(tx, options);
         let client = TestClient::new(app).await;
         let res = client.get("/test/timeout").send().await;
         assert_eq!(res.status(), StatusCode::REQUEST_TIMEOUT);
+
+        let res = client.post("/v1/prometheus/write").send().await;
+        assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
 
         let now = Instant::now();
         let res = client
@@ -1718,8 +2180,8 @@ mod test {
 
                 HttpResponse::Arrow(resp) => {
                     let output = resp.data;
-                    let mut reader =
-                        FileReader::try_new(Cursor::new(output), None).expect("Arrow reader error");
+                    let mut reader = StreamReader::try_new(Cursor::new(output), None)
+                        .expect("Arrow reader error");
                     let schema = reader.schema();
                     assert_eq!(schema.fields[0].name(), "numbers");
                     assert_eq!(schema.fields[0].data_type(), &DataType::UInt32);

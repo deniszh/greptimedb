@@ -7,7 +7,7 @@ CREATE TABLE input_basic (
     append_mode = 'true'
 );
 
-CREATE FLOW test_wildcard_basic sink TO out_basic AS
+CREATE FLOW test_wildcard_basic sink TO out_basic EVAL INTERVAL '1m' AS
 SELECT
     COUNT(*) as wildcard
 FROM
@@ -39,7 +39,7 @@ CREATE TABLE input_basic (
     TIME INDEX(ts)
 );
 
-CREATE FLOW test_wildcard_basic sink TO out_basic AS
+CREATE FLOW test_wildcard_basic sink TO out_basic EVAL INTERVAL '1m' AS
 SELECT
     COUNT(*) as wildcard
 FROM
@@ -81,7 +81,7 @@ SELECT wildcard FROM out_basic;
 DROP FLOW test_wildcard_basic;
 
 -- recreate flow so that it use new table id
-CREATE FLOW test_wildcard_basic sink TO out_basic AS
+CREATE FLOW test_wildcard_basic sink TO out_basic EVAL INTERVAL '1m' AS
 SELECT
     COUNT(*) as wildcard
 FROM
@@ -113,7 +113,7 @@ CREATE TABLE input_basic (
     TIME INDEX(ts)
 );
 
-CREATE FLOW test_wildcard_basic sink TO out_basic AS
+CREATE FLOW test_wildcard_basic sink TO out_basic EVAL INTERVAL '1m' AS
 SELECT
     COUNT(*) as wildcard
 FROM
@@ -135,7 +135,7 @@ DROP FLOW test_wildcard_basic;
 
 DROP TABLE out_basic;
 
-CREATE FLOW test_wildcard_basic sink TO out_basic AS
+CREATE FLOW test_wildcard_basic sink TO out_basic EVAL INTERVAL '1m' AS
 SELECT
     COUNT(*) as wildcard
 FROM
@@ -151,6 +151,7 @@ VALUES
 -- SQLNESS REPLACE (ADMIN\sFLUSH_FLOW\('\w+'\)\s+\|\n\+-+\+\n\|\s+)[0-9]+\s+\| $1 FLOW_FLUSHED  |
 ADMIN FLUSH_FLOW('test_wildcard_basic');
 
+-- SQLNESS SLEEP 3s
 SELECT wildcard FROM out_basic;
 
 -- test again, this time with db restart
@@ -165,7 +166,7 @@ CREATE TABLE input_basic (
     TIME INDEX(ts)
 );
 
-CREATE FLOW test_wildcard_basic sink TO out_basic AS
+CREATE FLOW test_wildcard_basic sink TO out_basic EVAL INTERVAL '1m' AS
 SELECT
     COUNT(*) as wildcard
 FROM
@@ -203,7 +204,7 @@ CREATE TABLE input_basic (
     TIME INDEX(ts)
 );
 
-CREATE FLOW test_wildcard_basic sink TO out_basic AS
+CREATE FLOW test_wildcard_basic sink TO out_basic EVAL INTERVAL '1m' AS
 SELECT
     COUNT(*) as wildcard
 FROM
@@ -258,7 +259,7 @@ SELECT wildcard FROM out_basic;
 DROP FLOW test_wildcard_basic;
 
 -- recreate flow so that it use new table id
-CREATE FLOW test_wildcard_basic sink TO out_basic AS
+CREATE FLOW test_wildcard_basic sink TO out_basic EVAL INTERVAL '1m' AS
 SELECT
     COUNT(*) as wildcard
 FROM
@@ -295,7 +296,7 @@ CREATE TABLE input_basic (
     TIME INDEX(ts)
 );
 
-CREATE FLOW test_wildcard_basic sink TO out_basic AS
+CREATE FLOW test_wildcard_basic sink TO out_basic EVAL INTERVAL '1m' AS
 SELECT
     COUNT(*) as wildcard
 FROM
@@ -322,7 +323,7 @@ DROP FLOW test_wildcard_basic;
 
 DROP TABLE out_basic;
 
-CREATE FLOW test_wildcard_basic sink TO out_basic AS
+CREATE FLOW test_wildcard_basic sink TO out_basic EVAL INTERVAL '1m' AS
 SELECT
     COUNT(*) as wildcard
 FROM

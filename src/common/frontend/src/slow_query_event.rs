@@ -24,6 +24,7 @@ pub const SLOW_QUERY_TABLE_NAME: &str = "slow_queries";
 pub const SLOW_QUERY_TABLE_COST_COLUMN_NAME: &str = "cost";
 pub const SLOW_QUERY_TABLE_THRESHOLD_COLUMN_NAME: &str = "threshold";
 pub const SLOW_QUERY_TABLE_QUERY_COLUMN_NAME: &str = "query";
+pub const SLOW_QUERY_TABLE_SCHEMA_NAME_COLUMN_NAME: &str = "schema_name";
 pub const SLOW_QUERY_TABLE_TIMESTAMP_COLUMN_NAME: &str = "timestamp";
 pub const SLOW_QUERY_TABLE_IS_PROMQL_COLUMN_NAME: &str = "is_promql";
 pub const SLOW_QUERY_TABLE_PROMQL_START_COLUMN_NAME: &str = "promql_start";
@@ -38,11 +39,13 @@ pub struct SlowQueryEvent {
     pub cost: u64,
     pub threshold: u64,
     pub query: String,
+    pub schema_name: String,
     pub is_promql: bool,
     pub promql_range: Option<u64>,
     pub promql_step: Option<u64>,
     pub promql_start: Option<i64>,
     pub promql_end: Option<i64>,
+    pub payload: serde_json::Value,
 }
 
 impl Event for SlowQueryEvent {
@@ -52,6 +55,10 @@ impl Event for SlowQueryEvent {
 
     fn event_type(&self) -> &str {
         SLOW_QUERY_EVENT_TYPE
+    }
+
+    fn json_payload(&self) -> Result<serde_json::Value> {
+        Ok(self.payload.clone())
     }
 
     fn extra_schema(&self) -> Vec<ColumnSchema> {
@@ -104,6 +111,12 @@ impl Event for SlowQueryEvent {
                 semantic_type: SemanticType::Field.into(),
                 ..Default::default()
             },
+            ColumnSchema {
+                column_name: SLOW_QUERY_TABLE_SCHEMA_NAME_COLUMN_NAME.to_string(),
+                datatype: ColumnDataType::String.into(),
+                semantic_type: SemanticType::Field.into(),
+                ..Default::default()
+            },
         ]
     }
 
@@ -118,11 +131,87 @@ impl Event for SlowQueryEvent {
                 ValueData::U64Value(self.promql_step.unwrap_or(0)).into(),
                 ValueData::TimestampMillisecondValue(self.promql_start.unwrap_or(0)).into(),
                 ValueData::TimestampMillisecondValue(self.promql_end.unwrap_or(0)).into(),
+                ValueData::StringValue(self.schema_name.clone()).into(),
             ],
         }])
     }
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use api::v1::value::ValueData;
+    use common_event_recorder::Event;
+
+    use super::*;
+
+    #[test]
+    fn slow_query_event_includes_schema() {
+        let event = SlowQueryEvent {
+            cost: 100,
+            threshold: 10,
+            query: "SELECT * FROM numbers".to_string(),
+            schema_name: "public".to_string(),
+            is_promql: false,
+            promql_range: None,
+            promql_step: None,
+            promql_start: None,
+            promql_end: None,
+            payload: serde_json::Value::Null,
+        };
+
+        let schema = event.extra_schema();
+        let column_names = schema
+            .iter()
+            .map(|column| column.column_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            column_names,
+            vec![
+                SLOW_QUERY_TABLE_COST_COLUMN_NAME,
+                SLOW_QUERY_TABLE_THRESHOLD_COLUMN_NAME,
+                SLOW_QUERY_TABLE_QUERY_COLUMN_NAME,
+                SLOW_QUERY_TABLE_IS_PROMQL_COLUMN_NAME,
+                SLOW_QUERY_TABLE_PROMQL_RANGE_COLUMN_NAME,
+                SLOW_QUERY_TABLE_PROMQL_STEP_COLUMN_NAME,
+                SLOW_QUERY_TABLE_PROMQL_START_COLUMN_NAME,
+                SLOW_QUERY_TABLE_PROMQL_END_COLUMN_NAME,
+                SLOW_QUERY_TABLE_SCHEMA_NAME_COLUMN_NAME,
+            ]
+        );
+        assert_eq!(schema[8].semantic_type, SemanticType::Field as i32);
+        assert_eq!(event.json_payload().unwrap(), serde_json::Value::Null);
+
+        let rows = event.extra_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values[8].value_data,
+            Some(ValueData::StringValue("public".to_string()))
+        );
+    }
+
+    #[test]
+    fn slow_query_event_includes_timeout_payload() {
+        let payload = serde_json::json!({
+            "timed_out": true,
+            "metrics": [{"stage": 0}],
+        });
+        let event = SlowQueryEvent {
+            cost: 100,
+            threshold: 10,
+            query: "EXPLAIN ANALYZE VERBOSE SELECT 1".to_string(),
+            schema_name: "public".to_string(),
+            is_promql: false,
+            promql_range: None,
+            promql_step: None,
+            promql_start: None,
+            promql_end: None,
+            payload: payload.clone(),
+        };
+
+        assert_eq!(event.json_payload().unwrap(), payload);
     }
 }

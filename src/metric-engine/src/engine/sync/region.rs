@@ -231,9 +231,7 @@ mod tests {
         metric_engine
             .handle_request(
                 source_physical_region_id,
-                RegionRequest::Flush(RegionFlushRequest {
-                    row_group_size: None,
-                }),
+                RegionRequest::Flush(RegionFlushRequest::default()),
             )
             .await
             .unwrap();
@@ -306,7 +304,7 @@ mod tests {
         metric_engine
             .handle_request(
                 target_physical_region_id,
-                RegionRequest::Close(RegionCloseRequest {}),
+                RegionRequest::Close(RegionCloseRequest::default()),
             )
             .await
             .unwrap();
@@ -323,6 +321,7 @@ mod tests {
                     options: physical_region_option,
                     skip_wal_replay: false,
                     checkpoint: None,
+                    requirements: Default::default(),
                 }),
             )
             .await

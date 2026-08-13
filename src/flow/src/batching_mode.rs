@@ -20,12 +20,15 @@ use common_grpc::channel_manager::ClientTlsOption;
 use serde::{Deserialize, Serialize};
 use session::ReadPreference;
 
+mod checkpoint;
 pub(crate) mod engine;
+mod eval_schedule;
 pub(crate) mod frontend_client;
 mod state;
+mod table_creator;
 mod task;
 mod time_window;
-mod utils;
+pub(crate) mod utils;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BatchingModeOptions {
@@ -48,14 +51,14 @@ pub struct BatchingModeOptions {
     /// which prevent flownode from starting
     #[serde(with = "humantime_serde")]
     pub experimental_frontend_scan_timeout: Duration,
-    /// Frontend activity timeout
-    /// if frontend is down(not sending heartbeat) for more than frontend_activity_timeout, it will be removed from the list that flownode use to connect
-    #[serde(with = "humantime_serde")]
-    pub experimental_frontend_activity_timeout: Duration,
     /// Maximum number of filters allowed in a single query
     pub experimental_max_filter_num_per_query: usize,
     /// Time window merge distance
     pub experimental_time_window_merge_threshold: usize,
+    /// Whether to enable experimental flow incremental source reads.
+    ///
+    /// When disabled, batching flows always execute full-snapshot queries.
+    pub experimental_enable_incremental_read: bool,
     /// Read preference of the Frontend client.
     pub read_preference: ReadPreference,
     /// TLS option for client connections to frontends.
@@ -71,9 +74,9 @@ impl Default for BatchingModeOptions {
             grpc_conn_timeout: Duration::from_secs(5),
             experimental_grpc_max_retries: 3,
             experimental_frontend_scan_timeout: Duration::from_secs(30),
-            experimental_frontend_activity_timeout: Duration::from_secs(60),
             experimental_max_filter_num_per_query: 20,
             experimental_time_window_merge_threshold: 3,
+            experimental_enable_incremental_read: false,
             read_preference: Default::default(),
             frontend_tls: None,
         }

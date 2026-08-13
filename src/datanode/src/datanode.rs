@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common_base::Plugins;
+use common_datasource::object_store::LocalFileAccess;
 use common_error::ext::BoxedError;
 use common_greptimedb_telemetry::GreptimeDBTelemetryTask;
 use common_meta::cache::{LayeredCacheRegistry, SchemaCacheRef, TableSchemaCacheRef};
@@ -61,8 +62,8 @@ use tokio::sync::Notify;
 use crate::config::{DatanodeOptions, RegionEngineConfig, StorageConfig};
 use crate::error::{
     self, BuildDatanodeSnafu, BuildMetricEngineSnafu, BuildMitoEngineSnafu, CreateDirSnafu,
-    GetMetadataSnafu, MissingCacheSnafu, MissingNodeIdSnafu, OpenLogStoreSnafu, Result,
-    ShutdownInstanceSnafu, ShutdownServerSnafu, StartServerSnafu,
+    DataFusionSnafu, GetMetadataSnafu, MissingCacheSnafu, MissingNodeIdSnafu, OpenLogStoreSnafu,
+    Result, ShutdownInstanceSnafu, ShutdownServerSnafu, StartServerSnafu,
 };
 use crate::event_listener::{
     NoopRegionServerEventListener, RegionServerEventListenerRef, RegionServerEventReceiver,
@@ -163,6 +164,8 @@ pub struct DatanodeBuilder {
     kv_backend: KvBackendRef,
     cache_registry: Option<Arc<LayeredCacheRegistry>>,
     topic_stats_reporter: Option<Box<dyn TopicStatsReporter>>,
+    open_regions_writable_override: Option<bool>,
+    local_file_access: LocalFileAccess,
     #[cfg(feature = "enterprise")]
     extension_range_provider_factory: Option<mito2::extension::BoxedExtensionRangeProviderFactory>,
 }
@@ -176,6 +179,8 @@ impl DatanodeBuilder {
             meta_client: None,
             kv_backend,
             cache_registry: None,
+            open_regions_writable_override: None,
+            local_file_access: LocalFileAccess::Disabled,
             #[cfg(feature = "enterprise")]
             extension_range_provider_factory: None,
             topic_stats_reporter: None,
@@ -196,12 +201,43 @@ impl DatanodeBuilder {
         self
     }
 
+    pub fn with_local_file_access(&mut self, local_file_access: LocalFileAccess) -> &mut Self {
+        self.local_file_access = local_file_access;
+        self
+    }
+
     pub fn kv_backend(&self) -> &KvBackendRef {
         &self.kv_backend
     }
 
+    pub fn meta_client(&self) -> Option<&MetaClientRef> {
+        self.meta_client.as_ref()
+    }
+
+    pub fn cache_registry(&self) -> Option<&Arc<LayeredCacheRegistry>> {
+        self.cache_registry.as_ref()
+    }
+
+    pub fn set_plugins(&mut self, plugins: Plugins) {
+        self.plugins = plugins;
+    }
+
     pub fn with_table_provider_factory(&mut self, factory: TableProviderFactoryRef) -> &mut Self {
         self.table_provider_factory = Some(factory);
+        self
+    }
+
+    /// Overrides whether regions opened during datanode startup should become writable.
+    ///
+    /// When unset, the builder uses its default writable policy for reopened regions
+    /// (writable only when no metasrv client is configured).
+    ///
+    /// Warning: setting this to `true` on a metasrv-controlled datanode (one built
+    /// with `with_meta_client`) will promote regions to Leader before heartbeat and
+    /// lease coordination begin, bypassing the metasrv safety contract and creating a
+    /// potential split-brain window during startup.
+    pub fn with_open_regions_writable_override(&mut self, writable: bool) -> &mut Self {
+        self.open_regions_writable_override = Some(writable);
         self
     }
 
@@ -274,10 +310,13 @@ impl DatanodeBuilder {
 
         let region_open_requests =
             build_region_open_requests(node_id, self.kv_backend.clone()).await?;
+        let open_with_writable = self
+            .open_regions_writable_override
+            .unwrap_or(!controlled_by_metasrv);
         let open_all_regions = open_all_regions(
             region_server.clone(),
             region_open_requests,
-            !controlled_by_metasrv,
+            open_with_writable,
             self.opts.init_regions_parallelism,
             // Ignore nonexistent regions in recovery mode.
             is_recovery_mode,
@@ -401,7 +440,7 @@ impl DatanodeBuilder {
     ) -> Result<RegionServer> {
         let opts: &DatanodeOptions = &self.opts;
 
-        let query_engine_factory = QueryEngineFactory::new_with_plugins(
+        let query_engine_factory = QueryEngineFactory::try_new_with_plugins(
             // query engine in datanode only executes plan with resolved table source.
             DummyCatalogManager::arc(),
             None,
@@ -412,24 +451,24 @@ impl DatanodeBuilder {
             false,
             self.plugins.clone(),
             opts.query.clone(),
-        );
+        )
+        .context(DataFusionSnafu)?;
         let query_engine = query_engine_factory.query_engine();
 
         let table_provider_factory = self
             .table_provider_factory
             .clone()
             .unwrap_or_else(|| Arc::new(DummyTableProviderFactory));
-
         let mut region_server = RegionServer::with_table_provider(
             query_engine,
             common_runtime::global_runtime(),
             event_listener,
             table_provider_factory,
             opts.max_concurrent_queries,
-            //TODO: revaluate the hardcoded timeout on the next version of datanode concurrency limiter.
-            Duration::from_millis(100),
+            opts.concurrent_query_limiter_timeout,
             opts.grpc.flight_compression,
         );
+        region_server.install_remote_dyn_filter_receiver_injector(&self.plugins);
 
         let object_store_manager = Self::build_object_store_manager(&opts.storage).await?;
         let engines = self
@@ -497,6 +536,7 @@ impl DatanodeBuilder {
         let file_engine = FileRegionEngine::new(
             file_engine_config,
             object_store_manager.default_object_store().clone(), // TODO: implement custom storage for file engine
+            self.local_file_access.clone(),
         );
 
         Ok(vec![

@@ -14,6 +14,7 @@
 
 //! Parquet writer.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
@@ -31,6 +32,7 @@ use datatypes::arrow::array::{
 use datatypes::arrow::compute::{max, min};
 use datatypes::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::extension::json::is_json2_extension_type;
 use object_store::{FuturesAsyncWriter, ObjectStore};
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
@@ -58,6 +60,7 @@ use crate::sst::parquet::format::PrimaryKeyWriteFormat;
 use crate::sst::parquet::{PARQUET_METADATA_KEY, SstInfo, WriteOptions};
 use crate::sst::{
     DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY, FlatSchemaOptions, SeriesEstimator,
+    maybe_wrap_schema,
 };
 
 /// Converts a flat RecordBatch for writing to parquet.
@@ -72,13 +75,6 @@ enum FlatBatchConverter {
 }
 
 impl FlatBatchConverter {
-    fn arrow_schema(&self) -> &SchemaRef {
-        match self {
-            FlatBatchConverter::Flat(f) => f.arrow_schema(),
-            FlatBatchConverter::PrimaryKey { format, .. } => format.arrow_schema(),
-        }
-    }
-
     fn convert_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         match self {
             FlatBatchConverter::Flat(f) => f.convert_batch(batch),
@@ -181,7 +177,9 @@ where
         metrics: &'a mut Metrics,
     ) -> ParquetWriter<'a, F, I, P> {
         let init_file = FileId::random();
-        let indexer = indexer_builder.build(init_file, 0).await;
+        let indexer = indexer_builder
+            .build(RegionFileId::new(metadata.region_id, init_file), 0, None)
+            .await;
 
         ParquetWriter {
             path_provider,
@@ -278,12 +276,21 @@ where
         override_sequence: Option<SequenceNumber>,
         opts: &WriteOptions,
     ) -> Result<SstInfoArray> {
+        let mut options = FlatSchemaOptions::from_encoding(self.metadata.primary_key_encoding);
+
+        if source.schema().fields().iter().any(is_json2_extension_type) {
+            options.concretized_json_types = source
+                .schema()
+                .fields()
+                .iter()
+                .filter(|&field| is_json2_extension_type(field))
+                .map(|field| (field.name().clone(), field.data_type().clone()))
+                .collect::<HashMap<_, _>>();
+        }
+
         let converter = FlatBatchConverter::Flat(
-            FlatWriteFormat::new(
-                self.metadata.clone(),
-                &FlatSchemaOptions::from_encoding(self.metadata.primary_key_encoding),
-            )
-            .with_override_sequence(override_sequence),
+            FlatWriteFormat::new(self.metadata.clone(), &options)
+                .with_override_sequence(override_sequence),
         );
         let res = self.write_all_flat_inner(source, &converter, opts).await;
         if res.is_err() {
@@ -406,7 +413,7 @@ where
         let arrow_batch = converter.convert_batch(&record_batch)?;
 
         let start = Instant::now();
-        self.maybe_init_writer(converter.arrow_schema(), opts)
+        self.maybe_init_writer(arrow_batch.schema_ref(), opts)
             .await?
             .write(&arrow_batch)
             .await
@@ -432,7 +439,7 @@ where
                 .set_key_value_metadata(Some(vec![key_value_meta]))
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
                 .set_encoding(Encoding::PLAIN)
-                .set_max_row_group_size(opts.row_group_size)
+                .set_max_row_group_row_count(Some(opts.row_group_size))
                 .set_column_index_truncate_length(None)
                 .set_statistics_truncate_length(None);
 
@@ -448,11 +455,18 @@ where
                 self.bytes_written.clone(),
             );
             let arrow_writer =
-                AsyncArrowWriter::try_new(writer, schema.clone(), Some(writer_props))
+                AsyncArrowWriter::try_new(writer, maybe_wrap_schema(schema)?, Some(writer_props))
                     .context(WriteParquetSnafu)?;
             self.writer = Some(arrow_writer);
 
-            let indexer = self.indexer_builder.build(self.current_file, 0).await;
+            let indexer = self
+                .indexer_builder
+                .build(
+                    RegionFileId::new(self.metadata.region_id, self.current_file),
+                    0,
+                    Some(opts.row_group_size),
+                )
+                .await;
             self.current_indexer = Some(indexer);
 
             // safety: self.writer is assigned above

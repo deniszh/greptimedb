@@ -75,6 +75,7 @@ use crate::gc::{GcSchedulerOptions, GcTickerRef};
 use crate::handler::{HeartbeatHandlerGroupBuilder, HeartbeatHandlerGroupRef};
 use crate::procedure::ProcedureManagerListenerAdapter;
 use crate::procedure::region_migration::manager::RegionMigrationManagerRef;
+use crate::procedure::repartition::gc_requirement::RepartitionGcRequirementManagerRef;
 use crate::procedure::wal_prune::manager::WalPruneTickerRef;
 use crate::pubsub::{PublisherRef, SubscriptionManagerRef};
 use crate::region::flush_trigger::RegionFlushTickerRef;
@@ -83,6 +84,7 @@ use crate::selector::{RegionStatAwareSelector, Selector, SelectorType};
 use crate::service::mailbox::MailboxRef;
 use crate::service::store::cached_kv::LeaderCachedKvBackend;
 use crate::state::{StateRef, become_follower, become_leader};
+use crate::utils::database::DatabaseOperatorRef;
 
 pub const TABLE_ID_SEQ: &str = "table_id";
 pub const FLOW_ID_SEQ: &str = "flow_id";
@@ -174,6 +176,7 @@ impl From<HeartbeatOptions> for HeartbeatConfig {
         Self {
             heartbeat_interval_ms: opts.interval.as_millis() as u64,
             retry_interval_ms: opts.retry_interval.as_millis() as u64,
+            gc_enabled: false,
         }
     }
 }
@@ -406,7 +409,11 @@ impl Default for MetasrvOptions {
 
 impl Configurable for MetasrvOptions {
     fn env_list_keys() -> Option<&'static [&'static str]> {
-        Some(&["wal.broker_endpoints", "store_addrs"])
+        Some(&[
+            "wal.broker_endpoints",
+            "store_addrs",
+            "event_recorder.event_types",
+        ])
     }
 }
 
@@ -437,6 +444,7 @@ pub struct Context {
     pub leader_region_registry: LeaderRegionRegistryRef,
     pub topic_stats_registry: TopicStatsRegistryRef,
     pub heartbeat_interval: Duration,
+    pub gc_enabled: bool,
     pub is_handshake: bool,
 }
 
@@ -481,6 +489,28 @@ pub struct SelectorContext {
 }
 
 pub type SelectorRef = Arc<dyn Selector<Context = SelectorContext, Output = Vec<Peer>>>;
+
+/// Context passed to a selector factory during metasrv bootstrap.
+///
+/// The factory runs after bootstrap has constructed the selector configured by
+/// [`MetasrvOptions::selector`], so plugins can either decorate `base_selector` or
+/// build a completely different selector using bootstrap-only dependencies like
+/// [`MetaPeerClientRef`].
+pub struct SelectorFactoryContext {
+    pub metasrv_options: MetasrvOptions,
+    pub meta_peer_client: MetaPeerClientRef,
+    pub in_memory: ResettableKvBackendRef,
+    pub election: Option<ElectionRef>,
+    pub base_selector: SelectorRef,
+}
+
+/// Builds the final datanode selector metasrv should use.
+pub trait SelectorFactory: Send + Sync {
+    fn build(&self, ctx: SelectorFactoryContext) -> SelectorRef;
+}
+
+/// Shared selector factory plugin registered through [`common_base::Plugins`].
+pub type SelectorFactoryRef = Arc<dyn SelectorFactory>;
 pub type RegionStatAwareSelectorRef =
     Arc<dyn RegionStatAwareSelector<Context = SelectorContext, Output = Vec<(RegionId, Peer)>>>;
 
@@ -489,7 +519,6 @@ pub struct MetaStateHandler {
     greptimedb_telemetry_task: Arc<GreptimeDBTelemetryTask>,
     leader_cached_kv_backend: Arc<LeaderCachedKvBackend>,
     leadership_change_notifier: LeadershipChangeNotifier,
-    mailbox: MailboxRef,
     state: StateRef,
 }
 
@@ -513,9 +542,6 @@ impl MetaStateHandler {
     pub async fn on_leader_stop(&self) {
         self.state.write().unwrap().next_state(become_follower());
 
-        // Enforces the mailbox to clear all pushers.
-        // The remaining heartbeat connections will be closed by the remote peer or keep-alive detection.
-        self.mailbox.reset().await;
         self.leadership_change_notifier
             .notify_on_leader_stop()
             .await;
@@ -557,6 +583,7 @@ pub struct Metasrv {
     wal_provider: WalProviderRef,
     table_metadata_manager: TableMetadataManagerRef,
     runtime_switch_manager: RuntimeSwitchManagerRef,
+    repartition_gc_requirement_manager: RepartitionGcRequirementManagerRef,
     memory_region_keeper: MemoryRegionKeeperRef,
     greptimedb_telemetry_task: Arc<GreptimeDBTelemetryTask>,
     region_migration_manager: RegionMigrationManagerRef,
@@ -570,12 +597,24 @@ pub struct Metasrv {
     reconciliation_manager: ReconciliationManagerRef,
     resource_stat: ResourceStatRef,
     gc_ticker: Option<GcTickerRef>,
+    database_operator: DatabaseOperatorRef,
 
     plugins: Plugins,
 }
 
 impl Metasrv {
+    pub(crate) async fn ensure_repartition_gc_enabled(&self) -> Result<()> {
+        self.repartition_gc_requirement_manager
+            .ensure_gc_enabled(self.options.gc.enable, &self.procedure_manager)
+            .await
+    }
+
     pub async fn try_start(&self) -> Result<()> {
+        self.ensure_repartition_gc_enabled().await?;
+        self.try_start_after_gc_check().await
+    }
+
+    pub(crate) async fn try_start_after_gc_check(&self) -> Result<()> {
         if self
             .started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -643,7 +682,6 @@ impl Metasrv {
                 state: self.state.clone(),
                 leader_cached_kv_backend: leader_cached_kv_backend.clone(),
                 leadership_change_notifier,
-                mailbox: self.mailbox.clone(),
             };
             let _handle = common_runtime::spawn_global(async move {
                 loop {
@@ -869,6 +907,10 @@ impl Metasrv {
         &self.reconciliation_manager
     }
 
+    pub fn database_operator(&self) -> &DatabaseOperatorRef {
+        &self.database_operator
+    }
+
     pub fn plugins(&self) -> &Plugins {
         &self.plugins
     }
@@ -909,6 +951,7 @@ impl Metasrv {
             leader_region_registry,
             topic_stats_registry,
             heartbeat_interval: self.options().heartbeat_interval,
+            gc_enabled: self.options().gc.enable,
             is_handshake: false,
         }
     }
@@ -916,6 +959,9 @@ impl Metasrv {
 
 #[cfg(test)]
 mod tests {
+    use common_event_recorder::EventTypeFilter;
+
+    use super::*;
     use crate::metasrv::MetasrvNodeInfo;
 
     #[test]
@@ -926,5 +972,21 @@ mod tests {
         assert_eq!(node_info.version, "0.1.0");
         assert_eq!(node_info.git_commit, "1234567890");
         assert_eq!(node_info.start_time_ms, 1715145600);
+    }
+
+    #[test]
+    fn test_metasrv_event_recorder_options_preserve_event_type_filter_semantics() {
+        let all = MetasrvOptions::default().event_recorder;
+        let none: EventRecorderOptions = toml::from_str("ttl = '90d'\nevent_types = []").unwrap();
+        let selected: EventRecorderOptions =
+            toml::from_str("ttl = '90d'\nevent_types = ['create_database']").unwrap();
+
+        assert!(all.event_types.allows("future_event"));
+        assert_eq!(
+            none.event_types.as_ref(),
+            &EventTypeFilter::Only(Default::default())
+        );
+        assert!(selected.event_types.allows("create_database"));
+        assert!(!selected.event_types.allows("drop_database"));
     }
 }

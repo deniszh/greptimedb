@@ -81,10 +81,7 @@ async fn test_catchup_with_last_entry_id(factory: Option<LogStoreFactory>) {
     if let Some(topic) = &topic {
         options.insert(
             WAL_OPTIONS_KEY.to_string(),
-            serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions {
-                topic: topic.clone(),
-            }))
-            .unwrap(),
+            serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions::new(topic.clone()))).unwrap(),
         );
     };
     follower_engine
@@ -97,6 +94,7 @@ async fn test_catchup_with_last_entry_id(factory: Option<LogStoreFactory>) {
                 options,
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -202,10 +200,7 @@ async fn test_catchup_with_incorrect_last_entry_id(factory: Option<LogStoreFacto
     if let Some(topic) = &topic {
         options.insert(
             WAL_OPTIONS_KEY.to_string(),
-            serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions {
-                topic: topic.clone(),
-            }))
-            .unwrap(),
+            serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions::new(topic.clone()))).unwrap(),
         );
     };
     follower_engine
@@ -218,6 +213,7 @@ async fn test_catchup_with_incorrect_last_entry_id(factory: Option<LogStoreFacto
                 options,
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -305,10 +301,7 @@ async fn test_catchup_without_last_entry_id(factory: Option<LogStoreFactory>) {
     if let Some(topic) = &topic {
         options.insert(
             WAL_OPTIONS_KEY.to_string(),
-            serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions {
-                topic: topic.clone(),
-            }))
-            .unwrap(),
+            serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions::new(topic.clone()))).unwrap(),
         );
     };
     follower_engine
@@ -321,6 +314,7 @@ async fn test_catchup_without_last_entry_id(factory: Option<LogStoreFactory>) {
                 options,
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -407,10 +401,7 @@ async fn test_catchup_with_manifest_update(factory: Option<LogStoreFactory>) {
     if let Some(topic) = &topic {
         options.insert(
             WAL_OPTIONS_KEY.to_string(),
-            serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions {
-                topic: topic.clone(),
-            }))
-            .unwrap(),
+            serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions::new(topic.clone()))).unwrap(),
         );
     };
     follower_engine
@@ -423,6 +414,7 @@ async fn test_catchup_with_manifest_update(factory: Option<LogStoreFactory>) {
                 options,
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -506,7 +498,10 @@ async fn test_catchup_with_manifest_update(factory: Option<LogStoreFactory>) {
 
 async fn close_region(engine: &MitoEngine, region_id: RegionId) {
     engine
-        .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Close(RegionCloseRequest::default()),
+        )
         .await
         .unwrap();
 }
@@ -527,6 +522,7 @@ async fn open_region(
                 skip_wal_replay,
                 path_type: PathType::Bare,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -622,6 +618,7 @@ async fn test_local_catchup(factory: Option<LogStoreFactory>) {
                 skip_wal_replay: true,
                 path_type: PathType::Bare,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await

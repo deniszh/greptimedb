@@ -16,11 +16,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use api::v1::SemanticType;
 use common_time::timestamp::TimeUnit;
 use snafu::OptionExt;
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::ColumnMetadata;
-use store_api::storage::{ColumnId, RegionId};
+use store_api::storage::RegionId;
 
 use crate::engine::options::PhysicalRegionOptions;
 use crate::error::{PhysicalRegionNotFoundSnafu, Result};
@@ -29,7 +30,12 @@ use crate::utils::to_data_region_id;
 
 pub struct PhysicalRegionState {
     logical_regions: HashSet<RegionId>,
-    physical_columns: HashMap<String, ColumnId>,
+    physical_columns: HashMap<String, ColumnMetadata>,
+    /// Name of the time index column, cached at region load so that the write
+    /// path doesn't have to scan `physical_columns` for the timestamp on every
+    /// row batch. The time index is fixed at region creation and never
+    /// changes, so this stays in sync with `physical_columns`.
+    time_index_column_name: String,
     primary_key_encoding: PrimaryKeyEncoding,
     options: PhysicalRegionOptions,
     time_index_unit: TimeUnit,
@@ -37,14 +43,23 @@ pub struct PhysicalRegionState {
 
 impl PhysicalRegionState {
     pub fn new(
-        physical_columns: HashMap<String, ColumnId>,
+        physical_columns: HashMap<String, ColumnMetadata>,
         primary_key_encoding: PrimaryKeyEncoding,
         options: PhysicalRegionOptions,
         time_index_unit: TimeUnit,
     ) -> Self {
+        // Safety: a valid physical region always has exactly one time index
+        // column; callers validate this before reaching here (see
+        // `create_data_region_request` and the open path).
+        let time_index_column_name = physical_columns
+            .iter()
+            .find(|(_, meta)| meta.semantic_type == SemanticType::Timestamp)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_default();
         Self {
             logical_regions: HashSet::new(),
             physical_columns,
+            time_index_column_name,
             primary_key_encoding,
             options,
             time_index_unit,
@@ -57,8 +72,13 @@ impl PhysicalRegionState {
     }
 
     /// Returns a reference to the physical columns.
-    pub fn physical_columns(&self) -> &HashMap<String, ColumnId> {
+    pub fn physical_columns(&self) -> &HashMap<String, ColumnMetadata> {
         &self.physical_columns
+    }
+
+    /// Returns the cached name of the time index column.
+    pub fn time_index_column_name(&self) -> &str {
+        &self.time_index_column_name
     }
 
     /// Returns a reference to the physical region options.
@@ -90,7 +110,7 @@ impl MetricEngineState {
     pub fn add_physical_region(
         &mut self,
         physical_region_id: RegionId,
-        physical_columns: HashMap<String, ColumnId>,
+        physical_columns: HashMap<String, ColumnMetadata>,
         primary_key_encoding: PrimaryKeyEncoding,
         options: PhysicalRegionOptions,
         time_index_unit: TimeUnit,
@@ -112,12 +132,19 @@ impl MetricEngineState {
     pub fn add_physical_columns(
         &mut self,
         physical_region_id: RegionId,
-        physical_columns: impl IntoIterator<Item = (String, ColumnId)>,
+        physical_columns: impl IntoIterator<Item = (String, ColumnMetadata)>,
     ) {
         let physical_region_id = to_data_region_id(physical_region_id);
         let state = self.physical_regions.get_mut(&physical_region_id).unwrap();
-        for (col, id) in physical_columns {
-            state.physical_columns.insert(col, id);
+        for (col, meta) in physical_columns {
+            // The time index is fixed at region creation and alter cannot add
+            // a new one; keep the cached name in sync defensively.
+            debug_assert_ne!(
+                meta.semantic_type,
+                SemanticType::Timestamp,
+                "unexpected time index column {col} added to an existing physical region"
+            );
+            state.physical_columns.insert(col, meta);
         }
     }
 

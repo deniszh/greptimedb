@@ -217,7 +217,6 @@ impl WriteCache {
         let indexer = IndexerBuilderImpl {
             build_type: write_request.op_type.into(),
             metadata: write_request.metadata.clone(),
-            row_group_size: write_opts.row_group_size,
             puffin_manager: self
                 .puffin_manager_factory
                 .build(store.clone(), path_provider.clone()),
@@ -638,6 +637,7 @@ mod tests {
                 .write_cache(Some(write_cache.clone()))
                 .build(),
         );
+        assert!(!cache_manager.sst_meta_cache_enabled());
 
         // Create source
         let metadata = Arc::new(sst_region_metadata());
@@ -682,7 +682,7 @@ mod tests {
         let sst_info = sst_infos.remove(0);
         let write_parquet_metadata = sst_info.file_metadata.unwrap();
 
-        // Read metadata from write cache
+        // Read metadata from write cache without preparing an in-memory metadata cache entry.
         let handle = sst_file_handle_with_file_id(sst_info.file_id, 0, 1000);
         let builder = ParquetReaderBuilder::new(
             data_home,
@@ -728,16 +728,19 @@ mod tests {
         let metadata = Arc::new(sst_region_metadata());
 
         // Creates a source that can return an error to abort the writer.
-        let source = FlatSource::Iter(Box::new(
+        let record_batch = new_record_batch_by_range(&["a", "d"], 0, 60);
+        let schema = record_batch.schema();
+        let iter = Box::new(
             [
-                Ok(new_record_batch_by_range(&["a", "d"], 0, 60)),
+                Ok(record_batch),
                 InvalidBatchSnafu {
                     reason: "Abort the writer",
                 }
                 .fail(),
             ]
             .into_iter(),
-        ));
+        );
+        let source = FlatSource::new_iter(schema, iter);
 
         // Write to local cache and upload sst to mock remote store
         let write_request = SstWriteRequest {

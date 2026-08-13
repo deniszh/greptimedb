@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use common_datasource::object_store::build_backend;
+use common_datasource::object_store::{LocalFileAccess, build_backend};
 use common_recordbatch::adapter::RecordBatchMetrics;
 use common_recordbatch::error::{self as recordbatch_error, Result as RecordBatchResult};
 use common_recordbatch::{
@@ -41,10 +41,17 @@ use crate::error::{BuildBackendSnafu, ProjectSchemaSnafu, ProjectionOutOfBoundsS
 use crate::region::FileRegion;
 
 impl FileRegion {
-    pub fn query(&self, request: ScanRequest) -> Result<SendableRecordBatchStream> {
-        let store = build_backend(&self.url, &self.options).context(BuildBackendSnafu)?;
+    pub async fn query(
+        &self,
+        request: ScanRequest,
+        local_file_access: &LocalFileAccess,
+    ) -> Result<SendableRecordBatchStream> {
+        let store = build_backend(&self.url, &self.options, local_file_access)
+            .await
+            .context(BuildBackendSnafu)?;
 
-        let file_projection = self.projection_pushdown_to_file(&request.projection)?;
+        let projection = request.projection.as_deref();
+        let file_projection = self.projection_pushdown_to_file(projection)?;
         let file_filters = self.filters_pushdown_to_file(&request.filters)?;
         let file_schema = Arc::new(Schema::new(self.file_options.file_column_schemas.clone()));
 
@@ -70,7 +77,7 @@ impl FileRegion {
             },
         )?;
 
-        let scan_schema = self.scan_schema(&request.projection)?;
+        let scan_schema = self.scan_schema(projection)?;
 
         Ok(Box::pin(FileToScanRegionStream::new(
             scan_schema,
@@ -81,9 +88,9 @@ impl FileRegion {
 
     fn projection_pushdown_to_file(
         &self,
-        req_projection: &Option<Vec<usize>>,
+        req_projection: Option<&[usize]>,
     ) -> Result<Option<Vec<usize>>> {
-        let Some(scan_projection) = req_projection.as_ref() else {
+        let Some(scan_projection) = req_projection else {
             return Ok(None);
         };
 
@@ -136,7 +143,7 @@ impl FileRegion {
         Ok(file_filters)
     }
 
-    fn scan_schema(&self, req_projection: &Option<Vec<usize>>) -> Result<SchemaRef> {
+    fn scan_schema(&self, req_projection: Option<&[usize]>) -> Result<SchemaRef> {
         let schema = if let Some(indices) = req_projection {
             Arc::new(
                 self.metadata

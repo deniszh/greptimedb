@@ -38,7 +38,6 @@ use datafusion::execution::memory_pool::{
     GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
     TrackConsumersPool,
 };
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_optimizer::sanity_checker::SanityCheckPlan;
@@ -50,20 +49,27 @@ use datafusion_optimizer::analyzer::function_rewrite::ApplyFunctionRewrites;
 use datafusion_optimizer::optimizer::Optimizer;
 use partition::manager::PartitionRuleManagerRef;
 use promql::extension_plan::PromExtensionPlanner;
+use session::context::QueryContextRef;
 use table::TableRef;
 use table::table::adapter::DfTableProviderAdapter;
 
 use crate::QueryEngineContext;
 use crate::dist_plan::{
-    DistExtensionPlanner, DistPlannerAnalyzer, DistPlannerOptions, MergeSortExtensionPlanner,
+    DistExtensionPlanner, DistPlannerAnalyzer, DistPlannerOptions, DynFilterRegistryManager,
+    MergeSortExtensionPlanner, RemoteDynFilterReceiverExtensionPlanner,
+    RemoteDynFilterRegistryLease,
 };
 use crate::metrics::{QUERY_MEMORY_POOL_REJECTED_TOTAL, QUERY_MEMORY_POOL_USAGE_BYTES};
 use crate::optimizer::ExtensionAnalyzerRule;
+use crate::optimizer::const_normalization::ConstNormalizationRule;
 use crate::optimizer::constant_term::MatchesConstantTermOptimizer;
 use crate::optimizer::count_nest_aggr::CountNestAggrRule;
 use crate::optimizer::count_wildcard::CountWildcardToTimeIndexRule;
+use crate::optimizer::global_limit::EnsureGlobalLimitForFetch;
+use crate::optimizer::json_type_concretize::JsonTypeConcretizeRule;
 use crate::optimizer::parallelize_scan::ParallelizeScan;
 use crate::optimizer::pass_distribution::PassDistribution;
+use crate::optimizer::promql_tsid_narrow_join::PromqlTsidNarrowJoin;
 use crate::optimizer::remove_duplicate::RemoveDuplicate;
 use crate::optimizer::scan_hint::ScanHintRule;
 use crate::optimizer::string_normalization::StringNormalizationRule;
@@ -73,6 +79,9 @@ use crate::optimizer::windowed_sort::WindowedSortPhysicalRule;
 use crate::options::QueryOptions as QueryOptionsNew;
 use crate::query_engine::DefaultSerializer;
 use crate::query_engine::options::QueryOptions;
+use crate::query_engine::runtime::{
+    DefaultQueryRuntimeProvider, QueryRuntimeContext, QueryRuntimeProviderRef,
+};
 use crate::range_select::planner::RangeSelectPlanner;
 use crate::region_query::RegionQueryHandlerRef;
 
@@ -81,6 +90,7 @@ use crate::region_query::RegionQueryHandlerRef;
 pub struct QueryEngineState {
     df_context: SessionContext,
     catalog_manager: CatalogManagerRef,
+    dyn_filter_registry_manager: Arc<DynFilterRegistryManager>,
     function_state: Arc<FunctionState>,
     scalar_functions: Arc<RwLock<HashMap<String, ScalarFunctionFactory>>>,
     aggr_functions: Arc<RwLock<HashMap<String, AggregateUDF>>>,
@@ -110,18 +120,37 @@ impl QueryEngineState {
         plugins: Plugins,
         options: QueryOptionsNew,
     ) -> Self {
+        Self::try_new(
+            catalog_list,
+            partition_rule_manager,
+            region_query_handler,
+            table_mutation_handler,
+            procedure_service_handler,
+            flow_service_handler,
+            with_dist_planner,
+            plugins,
+            options,
+        )
+        .expect("Failed to build query engine state")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        catalog_list: CatalogManagerRef,
+        partition_rule_manager: Option<PartitionRuleManagerRef>,
+        region_query_handler: Option<RegionQueryHandlerRef>,
+        table_mutation_handler: Option<TableMutationHandlerRef>,
+        procedure_service_handler: Option<ProcedureServiceHandlerRef>,
+        flow_service_handler: Option<FlowServiceHandlerRef>,
+        with_dist_planner: bool,
+        plugins: Plugins,
+        options: QueryOptionsNew,
+    ) -> DfResult<Self> {
         let total_memory = get_total_memory_bytes().max(0) as u64;
         let memory_pool_size = options.memory_pool_size.resolve(total_memory) as usize;
-        let runtime_env = if memory_pool_size > 0 {
-            Arc::new(
-                RuntimeEnvBuilder::new()
-                    .with_memory_pool(Arc::new(MetricsMemoryPool::new(memory_pool_size)))
-                    .build()
-                    .expect("Failed to build RuntimeEnv"),
-            )
-        } else {
-            Arc::new(RuntimeEnv::default())
-        };
+        let runtime_provider = plugins
+            .get::<QueryRuntimeProviderRef>()
+            .unwrap_or_else(|| Arc::new(DefaultQueryRuntimeProvider));
         let mut session_config = SessionConfig::new().with_create_default_catalog_and_schema(false);
         if options.parallelism > 0 {
             session_config = session_config.with_target_partitions(options.parallelism);
@@ -142,6 +171,11 @@ impl QueryEngineState {
             .execution
             .skip_physical_aggregate_schema_check = true;
 
+        let runtime_context = QueryRuntimeContext::new(&options, memory_pool_size);
+        runtime_provider.configure_session_config(runtime_context, &mut session_config);
+        let runtime_builder = DefaultQueryRuntimeProvider::runtime_env_builder(runtime_context);
+        let runtime_env = runtime_provider.build_runtime_env(runtime_context, runtime_builder)?;
+
         // Apply extension rules
         let mut extension_rules = Vec::new();
 
@@ -156,6 +190,7 @@ impl QueryEngineState {
         analyzer
             .rules
             .insert(0, Arc::new(CountWildcardToTimeIndexRule));
+        analyzer.rules.push(Arc::new(ConstNormalizationRule));
 
         // Add ApplyFunctionRewrites rule,
         // Note we cannot use `analyzer.add_function_rewrite`
@@ -174,6 +209,7 @@ impl QueryEngineState {
 
         let mut optimizer = Optimizer::new();
         optimizer.rules.push(Arc::new(ScanHintRule));
+        optimizer.rules.push(Arc::new(JsonTypeConcretizeRule));
 
         // add physical optimizer
         let mut physical_optimizer = PhysicalOptimizer::new();
@@ -185,9 +221,13 @@ impl QueryEngineState {
         physical_optimizer
             .rules
             .insert(6, Arc::new(PassDistribution));
+        // Prefer collecting narrow PromQL build sides over repartitioning wide label streams.
+        physical_optimizer
+            .rules
+            .insert(7, Arc::new(PromqlTsidNarrowJoin));
         // Enforce sorting AFTER custom rules that modify the plan structure
         physical_optimizer.rules.insert(
-            7,
+            8,
             Arc::new(datafusion::physical_optimizer::enforce_sorting::EnforceSorting {}),
         );
         // Add rule for windowed sort
@@ -201,6 +241,9 @@ impl QueryEngineState {
         physical_optimizer
             .rules
             .push(Arc::new(MatchesConstantTermOptimizer));
+        physical_optimizer
+            .rules
+            .push(Arc::new(EnsureGlobalLimitForFetch));
         // Add rule to remove duplicate nodes generated by other rules. Run this in the last.
         physical_optimizer.rules.push(Arc::new(RemoveDuplicate));
         // Place SanityCheckPlan at the end of the list to ensure that it runs after all other rules.
@@ -219,7 +262,8 @@ impl QueryEngineState {
             .with_query_planner(Arc::new(DfQueryPlanner::new(
                 catalog_list.clone(),
                 partition_rule_manager,
-                region_query_handler,
+                region_query_handler.clone(),
+                options.enable_per_region_metrics,
             )))
             .with_optimizer_rules(optimizer.rules)
             .with_physical_optimizer_rules(physical_optimizer.rules)
@@ -228,9 +272,10 @@ impl QueryEngineState {
         let df_context = SessionContext::new_with_state(session_state);
         register_function_aliases(&df_context);
 
-        Self {
+        Ok(Self {
             df_context,
             catalog_manager: catalog_list,
+            dyn_filter_registry_manager: Arc::new(DynFilterRegistryManager::default()),
             function_state: Arc::new(FunctionState {
                 table_mutation_handler,
                 procedure_service_handler,
@@ -241,7 +286,7 @@ impl QueryEngineState {
             extension_rules,
             plugins,
             scalar_functions: Arc::new(RwLock::new(HashMap::new())),
-        }
+        })
     }
 
     fn remove_physical_optimizer_rule(
@@ -387,6 +432,22 @@ impl QueryEngineState {
         &self.catalog_manager
     }
 
+    pub fn dyn_filter_registry_manager(&self) -> Arc<DynFilterRegistryManager> {
+        self.dyn_filter_registry_manager.clone()
+    }
+
+    pub fn acquire_remote_dyn_filter_registry_lease(
+        &self,
+        query_ctx: &QueryContextRef,
+    ) -> Option<RemoteDynFilterRegistryLease> {
+        let query_id = query_ctx.remote_query_id_value()?;
+        Some(
+            self.dyn_filter_registry_manager
+                .clone()
+                .acquire_lease(query_id),
+        )
+    }
+
     pub fn function_state(&self) -> Arc<FunctionState> {
         self.function_state.clone()
     }
@@ -481,9 +542,13 @@ impl DfQueryPlanner {
         catalog_manager: CatalogManagerRef,
         partition_rule_manager: Option<PartitionRuleManagerRef>,
         region_query_handler: Option<RegionQueryHandlerRef>,
+        enable_per_region_metrics: bool,
     ) -> Self {
-        let mut planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
-            vec![Arc::new(PromExtensionPlanner), Arc::new(RangeSelectPlanner)];
+        let mut planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
+            Arc::new(PromExtensionPlanner),
+            Arc::new(RangeSelectPlanner),
+            Arc::new(RemoteDynFilterReceiverExtensionPlanner),
+        ];
         if let (Some(region_query_handler), Some(partition_rule_manager)) =
             (region_query_handler, partition_rule_manager)
         {
@@ -491,6 +556,7 @@ impl DfQueryPlanner {
                 catalog_manager,
                 partition_rule_manager,
                 region_query_handler,
+                enable_per_region_metrics,
             )));
             planners.push(Arc::new(MergeSortExtensionPlanner {}));
         }
@@ -505,7 +571,7 @@ impl DfQueryPlanner {
 /// This wrapper intercepts all memory pool operations and updates
 /// Prometheus metrics for monitoring query memory usage and rejections.
 #[derive(Debug)]
-struct MetricsMemoryPool {
+pub(super) struct MetricsMemoryPool {
     inner: Arc<TrackConsumersPool<GreedyMemoryPool>>,
 }
 
@@ -513,7 +579,7 @@ impl MetricsMemoryPool {
     // Number of top memory consumers to report in OOM error messages
     const TOP_CONSUMERS_TO_REPORT: usize = 5;
 
-    fn new(limit: usize) -> Self {
+    pub(super) fn new(limit: usize) -> Self {
         Self {
             inner: Arc::new(TrackConsumersPool::new(
                 GreedyMemoryPool::new(limit),
@@ -566,5 +632,240 @@ impl MemoryPool for MetricsMemoryPool {
 
     fn memory_limit(&self) -> MemoryLimit {
         self.inner.memory_limit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use common_base::Plugins;
+    use common_base::memory_limit::MemoryLimit;
+    use common_base::readable_size::ReadableSize;
+    use datafusion::error::DataFusionError;
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryLimit as DfMemoryLimit};
+    use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+    use session::context::QueryContext;
+
+    use super::*;
+    use crate::options::QueryOptions;
+    use crate::query_engine::runtime::{QueryRuntimeProvider, QueryRuntimeProviderRef};
+
+    fn new_query_engine_state() -> QueryEngineState {
+        new_query_engine_state_with(Plugins::default(), QueryOptions::default())
+    }
+
+    fn new_query_engine_state_with(plugins: Plugins, options: QueryOptions) -> QueryEngineState {
+        QueryEngineState::new(
+            catalog::memory::new_memory_catalog_manager().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            plugins,
+            options,
+        )
+    }
+
+    struct TestRuntimeProvider {
+        build_called: AtomicBool,
+        configure_called: AtomicBool,
+    }
+
+    impl TestRuntimeProvider {
+        fn new() -> Self {
+            Self {
+                build_called: AtomicBool::new(false),
+                configure_called: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl QueryRuntimeProvider for TestRuntimeProvider {
+        fn configure_session_config(
+            &self,
+            ctx: QueryRuntimeContext<'_>,
+            config: &mut SessionConfig,
+        ) {
+            assert_eq!(ctx.resolved_memory_pool_size, 1024);
+            self.configure_called.store(true, Ordering::SeqCst);
+            *config = config.clone().with_target_partitions(7);
+        }
+
+        fn build_runtime_env(
+            &self,
+            ctx: QueryRuntimeContext<'_>,
+            builder: RuntimeEnvBuilder,
+        ) -> DfResult<Arc<RuntimeEnv>> {
+            assert_eq!(ctx.resolved_memory_pool_size, 1024);
+            self.build_called.store(true, Ordering::SeqCst);
+            builder
+                .with_memory_pool(Arc::new(GreedyMemoryPool::new(2048)))
+                .build()
+                .map(Arc::new)
+        }
+    }
+
+    struct ErrorRuntimeProvider;
+
+    impl QueryRuntimeProvider for ErrorRuntimeProvider {
+        fn build_runtime_env(
+            &self,
+            _ctx: QueryRuntimeContext<'_>,
+            _builder: RuntimeEnvBuilder,
+        ) -> DfResult<Arc<RuntimeEnv>> {
+            Err(DataFusionError::Execution("runtime provider error".into()))
+        }
+    }
+
+    #[test]
+    fn query_runtime_default_provider_keeps_bounded_memory_pool() {
+        let state = new_query_engine_state_with(
+            Plugins::default(),
+            QueryOptions {
+                memory_pool_size: MemoryLimit::Size(ReadableSize(1024)),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(
+            state
+                .session_state()
+                .runtime_env()
+                .memory_pool
+                .memory_limit(),
+            DfMemoryLimit::Finite(1024)
+        ));
+    }
+
+    #[test]
+    fn query_runtime_provider_from_plugins_builds_runtime_env() {
+        let plugins = Plugins::default();
+        let provider = Arc::new(TestRuntimeProvider::new());
+        plugins.insert::<QueryRuntimeProviderRef>(provider.clone());
+
+        let state = new_query_engine_state_with(
+            plugins,
+            QueryOptions {
+                memory_pool_size: MemoryLimit::Size(ReadableSize(1024)),
+                ..Default::default()
+            },
+        );
+
+        assert!(provider.build_called.load(Ordering::SeqCst));
+        assert!(matches!(
+            state
+                .session_state()
+                .runtime_env()
+                .memory_pool
+                .memory_limit(),
+            DfMemoryLimit::Finite(2048)
+        ));
+    }
+
+    #[test]
+    fn query_runtime_provider_from_plugins_configures_session_config() {
+        let plugins = Plugins::default();
+        let provider = Arc::new(TestRuntimeProvider::new());
+        plugins.insert::<QueryRuntimeProviderRef>(provider.clone());
+
+        let state = new_query_engine_state_with(
+            plugins,
+            QueryOptions {
+                memory_pool_size: MemoryLimit::Size(ReadableSize(1024)),
+                ..Default::default()
+            },
+        );
+
+        assert!(provider.configure_called.load(Ordering::SeqCst));
+        assert_eq!(7, state.session_state().config().target_partitions());
+    }
+
+    #[test]
+    fn query_runtime_provider_error_is_returned_by_try_new() {
+        let plugins = Plugins::default();
+        plugins.insert::<QueryRuntimeProviderRef>(Arc::new(ErrorRuntimeProvider));
+
+        let err = QueryEngineState::try_new(
+            catalog::memory::new_memory_catalog_manager().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            plugins,
+            QueryOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DataFusionError::Execution(message) if message == "runtime provider error")
+        );
+    }
+
+    #[test]
+    fn query_engine_state_reuses_query_scoped_dyn_filter_registry_lease() {
+        let state = new_query_engine_state();
+        let query_ctx = QueryContext::arc();
+
+        let first = state
+            .acquire_remote_dyn_filter_registry_lease(&query_ctx)
+            .unwrap();
+        let second = state
+            .acquire_remote_dyn_filter_registry_lease(&query_ctx)
+            .unwrap();
+
+        assert!(first.ptr_eq(&second));
+        assert_eq!(state.dyn_filter_registry_manager().registry_count(), 1);
+        assert_eq!(
+            first.registry().query_id(),
+            query_ctx.remote_query_id_value().unwrap()
+        );
+    }
+
+    #[test]
+    fn query_engine_state_relies_on_query_context_remote_query_id_contract() {
+        let state = new_query_engine_state();
+        let query_ctx = QueryContext::arc();
+
+        assert!(query_ctx.remote_query_id_value().is_some());
+
+        let lease = state
+            .acquire_remote_dyn_filter_registry_lease(&query_ctx)
+            .unwrap();
+
+        assert_eq!(
+            lease.registry().query_id(),
+            query_ctx.remote_query_id_value().unwrap()
+        );
+        assert_eq!(state.dyn_filter_registry_manager().registry_count(), 1);
+    }
+
+    #[test]
+    fn query_engine_state_separates_registries_for_different_query_contexts() {
+        let state = new_query_engine_state();
+        let first_query_ctx = QueryContext::arc();
+        let second_query_ctx = QueryContext::arc();
+
+        let first = state
+            .acquire_remote_dyn_filter_registry_lease(&first_query_ctx)
+            .unwrap();
+        let second = state
+            .acquire_remote_dyn_filter_registry_lease(&second_query_ctx)
+            .unwrap();
+
+        assert!(!first.ptr_eq(&second));
+        assert_eq!(state.dyn_filter_registry_manager().registry_count(), 2);
+        assert_eq!(
+            first.registry().query_id(),
+            first_query_ctx.remote_query_id_value().unwrap()
+        );
+        assert_eq!(
+            second.registry().query_id(),
+            second_query_ctx.remote_query_id_value().unwrap()
+        );
     }
 }

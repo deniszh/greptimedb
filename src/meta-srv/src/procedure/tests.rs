@@ -160,6 +160,7 @@ fn test_region_request_builder() {
         path: String::new(),
         options: HashMap::new(),
         partition: None,
+        requirements: None,
     };
     assert_eq!(template.template(), &expected);
 }
@@ -219,7 +220,7 @@ async fn test_on_datanode_create_regions() {
         }
     });
 
-    let status = procedure.on_datanode_create_regions().await.unwrap();
+    let status = procedure.on_datanode_create_regions(false).await.unwrap();
     assert!(matches!(
         status,
         Status::Executing {

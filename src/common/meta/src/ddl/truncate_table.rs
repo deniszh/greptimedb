@@ -20,7 +20,8 @@ use api::v1::region::{
 use async_trait::async_trait;
 use common_procedure::error::{FromJsonSnafu, ToJsonSnafu};
 use common_procedure::{
-    Context as ProcedureContext, LockKey, Procedure, Result as ProcedureResult, Status,
+    Context as ProcedureContext, EventContext, EventTrigger, LockKey, Procedure,
+    Result as ProcedureResult, Status,
 };
 use common_telemetry::debug;
 use common_telemetry::tracing_context::TracingContext;
@@ -34,6 +35,7 @@ use table::table_name::TableName;
 use table::table_reference::TableReference;
 
 use crate::ddl::DdlContext;
+use crate::ddl::event::table::{TableDdlEvent, TableDdlEventType, TableDdlLocator};
 use crate::ddl::utils::{add_peer_context_if_needed, map_to_procedure_error};
 use crate::error::{ConvertTimeRangesSnafu, Result, TableNotFoundSnafu};
 use crate::key::DeserializedValueWithBytes;
@@ -42,7 +44,7 @@ use crate::key::table_name::TableNameKey;
 use crate::lock_key::{CatalogLock, SchemaLock, TableLock};
 use crate::metrics;
 use crate::rpc::ddl::TruncateTableTask;
-use crate::rpc::router::{RegionRoute, find_leader_regions, find_leaders};
+use crate::rpc::router::{find_leader_regions, find_leaders};
 
 pub struct TruncateTableProcedure {
     context: DdlContext,
@@ -86,6 +88,26 @@ impl Procedure for TruncateTableProcedure {
 
         LockKey::new(lock_key)
     }
+
+    fn event(&self, ctx: &EventContext<'_>) -> Option<Box<dyn common_event_recorder::Event>> {
+        if !ctx
+            .event_type_filter
+            .allows(TableDdlEventType::TruncateTable.as_str())
+        {
+            return None;
+        }
+        let task = &self.data.task;
+        let locator = TableDdlLocator::new(&task.catalog, &task.schema, &task.table)
+            .with_table_id(task.table_id);
+        let event = match &ctx.trigger {
+            EventTrigger::Submitted => {
+                TableDdlEvent::truncate_table_submitted(locator, task.time_ranges.len())
+            }
+            _ => TableDdlEvent::lifecycle(TableDdlEventType::TruncateTable, [locator]),
+        };
+
+        Some(Box::new(event))
+    }
 }
 
 impl TruncateTableProcedure {
@@ -94,12 +116,11 @@ impl TruncateTableProcedure {
     pub(crate) fn new(
         task: TruncateTableTask,
         table_info_value: DeserializedValueWithBytes<TableInfoValue>,
-        region_routes: Vec<RegionRoute>,
         context: DdlContext,
     ) -> Self {
         Self {
             context,
-            data: TruncateTableData::new(task, table_info_value, region_routes),
+            data: TruncateTableData::new(task, table_info_value),
         }
     }
 
@@ -138,13 +159,18 @@ impl TruncateTableProcedure {
     async fn on_datanode_truncate_regions(&mut self) -> Result<Status> {
         let table_id = self.data.table_id();
 
-        let region_routes = &self.data.region_routes;
-        let leaders = find_leaders(region_routes);
+        let (_, physical_table_route) = self
+            .context
+            .table_metadata_manager
+            .table_route_manager()
+            .get_physical_table_route(table_id)
+            .await?;
+        let leaders = find_leaders(&physical_table_route.region_routes);
         let mut truncate_region_tasks = Vec::with_capacity(leaders.len());
 
         for datanode in leaders {
             let requester = self.context.node_manager.datanode(&datanode).await;
-            let regions = find_leader_regions(region_routes, &datanode);
+            let regions = find_leader_regions(&physical_table_route.region_routes, &datanode);
 
             for region in regions {
                 let region_id = RegionId::new(table_id, region);
@@ -201,20 +227,17 @@ pub struct TruncateTableData {
     state: TruncateTableState,
     task: TruncateTableTask,
     table_info_value: DeserializedValueWithBytes<TableInfoValue>,
-    region_routes: Vec<RegionRoute>,
 }
 
 impl TruncateTableData {
     pub fn new(
         task: TruncateTableTask,
         table_info_value: DeserializedValueWithBytes<TableInfoValue>,
-        region_routes: Vec<RegionRoute>,
     ) -> Self {
         Self {
             state: TruncateTableState::Prepare,
             task,
             table_info_value,
-            region_routes,
         }
     }
 

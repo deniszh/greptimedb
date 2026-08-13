@@ -131,6 +131,8 @@ use common_wal::options::WalOptions;
 use datanode_table::{DatanodeTableKey, DatanodeTableManager, DatanodeTableValue};
 use flow::flow_route::FlowRouteValue;
 use flow::table_flow::TableFlowValue;
+use futures_util::TryStreamExt;
+use futures_util::stream::BoxStream;
 use lazy_static::lazy_static;
 use regex::Regex;
 pub use schema_metadata_manager::{SchemaMetadataManager, SchemaMetadataManagerRef};
@@ -163,13 +165,16 @@ use crate::key::topic_region::TopicRegionValue;
 use crate::key::txn_helper::TxnOpGetResponseSet;
 use crate::kv_backend::KvBackendRef;
 use crate::kv_backend::txn::{Txn, TxnOp};
+use crate::rpc::KeyValue;
 use crate::rpc::router::{LeaderState, RegionRoute, region_distribution};
-use crate::rpc::store::BatchDeleteRequest;
+use crate::rpc::store::{BatchDeleteRequest, PutRequest};
 use crate::state_store::PoisonValue;
+use crate::wal_provider::RegionWalOptions;
 
 pub const TOPIC_NAME_PATTERN: &str = r"[a-zA-Z0-9_:-][a-zA-Z0-9_:\-\.@#]*";
 pub const LEGACY_MAINTENANCE_KEY: &str = "__maintenance";
 pub const MAINTENANCE_KEY: &str = "__switches/maintenance";
+pub const REPARTITION_GC_REQUIRED_KEY: &str = "__requirements/gc/repartition";
 pub const PAUSE_PROCEDURE_KEY: &str = "__switches/pause_procedure";
 pub const RECOVERY_MODE_KEY: &str = "__switches/recovery";
 
@@ -432,6 +437,70 @@ pub struct DeserializedValueWithBytes<T: DeserializeOwned + Serialize> {
     inner: T,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedTableName {
+    /// Table id stored in the tombstoned table-name mapping.
+    pub table_id: TableId,
+    /// Original fully qualified table name.
+    pub table_name: TableName,
+    /// Unix timestamp in milliseconds when this table was soft-dropped.
+    pub dropped_at: Option<i64>,
+    /// Fixed automatic-GC deadline in Unix milliseconds.
+    pub retention_expires_at: Option<i64>,
+    /// Unique identity of this soft-drop generation.
+    pub drop_generation: Option<String>,
+    /// Whether an automatic purge has durably claimed this dropped table.
+    pub purging: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DroppedTableMetadata {
+    /// Table id of the dropped table.
+    pub table_id: TableId,
+    /// Original fully qualified table name.
+    pub table_name: TableName,
+    /// Tombstoned table info value.
+    pub table_info_value: TableInfoValue,
+    /// Tombstoned table route value.
+    pub table_route_value: TableRouteValue,
+    /// Per-region WAL options recovered from tombstoned datanode metadata.
+    pub region_wal_options: HashMap<RegionNumber, WalOptions>,
+    /// Unix timestamp in milliseconds when this table was soft-dropped.
+    pub dropped_at: Option<i64>,
+    /// Fixed automatic-GC deadline in Unix milliseconds.
+    pub retention_expires_at: Option<i64>,
+    /// Unique identity of this soft-drop generation.
+    pub drop_generation: Option<String>,
+}
+
+/// Lifecycle markers stored with a logically deleted table.
+pub struct DroppedTableLifecycle<'a> {
+    pub dropped_at: Option<i64>,
+    pub retention_expires_at: Option<i64>,
+    pub drop_generation: Option<&'a str>,
+}
+
+const DROPPED_AT_KEY_PREFIX: &str = "__dropped_at";
+const RETENTION_EXPIRES_AT_KEY_PREFIX: &str = "__retention_expires_at";
+const DROP_GENERATION_KEY_PREFIX: &str = "__drop_generation";
+const PURGING_KEY_PREFIX: &str = "__purging";
+
+pub(crate) fn dropped_at_key(table_id: TableId) -> Vec<u8> {
+    format!("{DROPPED_AT_KEY_PREFIX}/{table_id}").into_bytes()
+}
+
+pub(crate) fn retention_expires_at_key(table_id: TableId) -> Vec<u8> {
+    format!("{RETENTION_EXPIRES_AT_KEY_PREFIX}/{table_id}").into_bytes()
+}
+
+pub(crate) fn drop_generation_key(table_id: TableId) -> Vec<u8> {
+    format!("{DROP_GENERATION_KEY_PREFIX}/{table_id}").into_bytes()
+}
+
+pub(crate) fn purging_key(table_id: TableId) -> Vec<u8> {
+    format!("{PURGING_KEY_PREFIX}/{table_id}").into_bytes()
+}
+
 impl<T: DeserializeOwned + Serialize> Deref for DeserializedValueWithBytes<T> {
     type Target = T;
 
@@ -663,7 +732,7 @@ impl TableMetadataManager {
         if let Some(table_route_value) = &mut table_route_value {
             self.table_route_manager()
                 .table_route_storage()
-                .remap_route_address(table_route_value)
+                .remap_table_route(table_route_value)
                 .await?;
         }
         Ok((table_info_value, table_route_value))
@@ -755,7 +824,7 @@ impl TableMetadataManager {
         &self,
         table_info: TableInfo,
         table_route_value: TableRouteValue,
-        region_wal_options: HashMap<RegionNumber, String>,
+        region_wal_options: RegionWalOptions,
     ) -> Result<()> {
         let table_id = table_info.ident.table_id;
         let engine = table_info.meta.engine.clone();
@@ -974,10 +1043,208 @@ impl TableMetadataManager {
         table_name: &TableName,
         table_route_value: &TableRouteValue,
         region_wal_options: &HashMap<RegionNumber, WalOptions>,
+        dropped_at: Option<i64>,
+    ) -> Result<()> {
+        self.delete_table_metadata_with_retention(
+            table_id,
+            table_name,
+            table_route_value,
+            region_wal_options,
+            dropped_at,
+            None,
+        )
+        .await
+    }
+
+    /// Deletes metadata logically and stores fixed soft-drop lifecycle markers.
+    pub async fn delete_table_metadata_with_retention(
+        &self,
+        table_id: TableId,
+        table_name: &TableName,
+        table_route_value: &TableRouteValue,
+        region_wal_options: &HashMap<RegionNumber, WalOptions>,
+        dropped_at: Option<i64>,
+        retention_expires_at: Option<i64>,
+    ) -> Result<()> {
+        self.delete_table_metadata_with_retention_and_generation(
+            table_id,
+            table_name,
+            table_route_value,
+            region_wal_options,
+            DroppedTableLifecycle {
+                dropped_at,
+                retention_expires_at,
+                drop_generation: None,
+            },
+        )
+        .await
+    }
+
+    /// Deletes metadata logically and stores fixed soft-drop lifecycle markers.
+    pub async fn delete_table_metadata_with_retention_and_generation(
+        &self,
+        table_id: TableId,
+        table_name: &TableName,
+        table_route_value: &TableRouteValue,
+        region_wal_options: &HashMap<RegionNumber, WalOptions>,
+        lifecycle: DroppedTableLifecycle<'_>,
     ) -> Result<()> {
         let keys =
             self.table_metadata_keys(table_id, table_name, table_route_value, region_wal_options)?;
-        self.tombstone_manager.create(keys).await.map(|_| ())
+        if let Some(dropped_at) = lifecycle.dropped_at {
+            let mut markers = vec![(
+                dropped_at_key(table_id),
+                dropped_at.to_string().into_bytes(),
+            )];
+            if let Some(retention_expires_at) = lifecycle.retention_expires_at {
+                markers.push((
+                    retention_expires_at_key(table_id),
+                    retention_expires_at.to_string().into_bytes(),
+                ));
+            }
+            if let Some(drop_generation) = lifecycle.drop_generation {
+                markers.push((
+                    drop_generation_key(table_id),
+                    drop_generation.as_bytes().to_vec(),
+                ));
+            }
+            self.tombstone_manager
+                .create_with_markers(keys, markers)
+                .await
+                .map(|_| ())
+        } else {
+            self.tombstone_manager.create(keys).await.map(|_| ())
+        }
+    }
+
+    /// Lists dropped tables from tombstoned table-name entries.
+    pub async fn list_dropped_tables(&self) -> Result<Vec<DroppedTableName>> {
+        self.collect_dropped_tables(self.tombstone_manager.tombstoned_table_names())
+            .await
+    }
+
+    /// Lists dropped tables from tombstoned table-name entries in the provided catalog.
+    pub async fn list_dropped_tables_by_catalog(
+        &self,
+        catalog: &str,
+    ) -> Result<Vec<DroppedTableName>> {
+        self.collect_dropped_tables(
+            self.tombstone_manager
+                .tombstoned_table_names_by_catalog(catalog),
+        )
+        .await
+    }
+
+    async fn collect_dropped_tables(
+        &self,
+        mut stream: BoxStream<'static, Result<KeyValue>>,
+    ) -> Result<Vec<DroppedTableName>> {
+        let mut dropped_tables = Vec::new();
+
+        while let Some(kv) = stream.try_next().await? {
+            let raw_key = self.tombstone_manager.strip_tombstone_prefix(&kv.key)?;
+            let table_name = TableNameKey::from_bytes(raw_key)?.into();
+            let table_id = TableNameValue::try_from_raw_value(&kv.value)?.table_id();
+            dropped_tables.push(DroppedTableName {
+                table_id,
+                table_name,
+                dropped_at: None,
+                retention_expires_at: None,
+                drop_generation: None,
+                purging: false,
+            });
+        }
+        if dropped_tables.is_empty() {
+            return Ok(dropped_tables);
+        }
+
+        let marker_keys = dropped_tables
+            .iter()
+            .flat_map(|table| {
+                vec![
+                    dropped_at_key(table.table_id),
+                    retention_expires_at_key(table.table_id),
+                    drop_generation_key(table.table_id),
+                    purging_key(table.table_id),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let marker_values = self.tombstone_manager.batch_get(&marker_keys).await?;
+        for table in &mut dropped_tables {
+            table.dropped_at = Self::parse_dropped_at(
+                table.table_id,
+                marker_values.get(&dropped_at_key(table.table_id)),
+            )?;
+            table.retention_expires_at = Self::parse_retention_expires_at(
+                table.table_id,
+                marker_values.get(&retention_expires_at_key(table.table_id)),
+            )?;
+            table.drop_generation = Self::parse_drop_generation(
+                marker_values.get(&drop_generation_key(table.table_id)),
+            );
+            table.purging = marker_values.contains_key(&purging_key(table.table_id));
+        }
+
+        Ok(dropped_tables)
+    }
+
+    /// Gets dropped table metadata by its original full table name.
+    pub async fn get_dropped_table(
+        &self,
+        table_name: &TableName,
+    ) -> Result<Option<DroppedTableMetadata>> {
+        let table_name_key = TableNameKey::from(table_name);
+        let Some(kv) = self
+            .tombstone_manager
+            .get(&table_name_key.to_bytes())
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let table_id = TableNameValue::try_from_raw_value(&kv.value)?.table_id();
+        self.get_dropped_table_metadata(table_id, table_name.clone())
+            .await
+    }
+
+    /// Gets dropped table metadata by table id.
+    pub async fn get_dropped_table_by_id(
+        &self,
+        table_id: TableId,
+    ) -> Result<Option<DroppedTableMetadata>> {
+        self.get_dropped_table_metadata(table_id, None).await
+    }
+
+    /// Returns whether an automatic purge has durably claimed the dropped table.
+    pub async fn is_dropped_table_purging(&self, table_id: TableId) -> Result<bool> {
+        self.dropped_table_purge_claim(table_id)
+            .await
+            .map(|claim| claim.is_some())
+    }
+
+    /// Returns the soft-drop generation claimed by an automatic purge.
+    pub async fn dropped_table_purge_claim(&self, table_id: TableId) -> Result<Option<String>> {
+        self.tombstone_manager
+            .get(&purging_key(table_id))
+            .await
+            .map(|marker| marker.map(|marker| String::from_utf8_lossy(&marker.value).into_owned()))
+    }
+
+    /// Durably claims a dropped table before automatic purge starts cleaning its regions.
+    /// The caller MUST hold the table lock and revalidate the tombstone before calling this.
+    pub async fn mark_dropped_table_purging(
+        &self,
+        table_id: TableId,
+        drop_generation: Option<&str>,
+    ) -> Result<()> {
+        self.kv_backend
+            .put(
+                PutRequest::new()
+                    .with_key(self.tombstone_manager.to_tombstone(&purging_key(table_id)))
+                    .with_value(drop_generation.unwrap_or_default()),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Deletes metadata tombstone for table **permanently**.
@@ -992,7 +1259,15 @@ impl TableMetadataManager {
         let table_metadata_keys =
             self.table_metadata_keys(table_id, table_name, table_route_value, region_wal_options)?;
         self.tombstone_manager
-            .delete(table_metadata_keys)
+            .delete_with_markers(
+                table_metadata_keys,
+                vec![
+                    dropped_at_key(table_id),
+                    retention_expires_at_key(table_id),
+                    drop_generation_key(table_id),
+                    purging_key(table_id),
+                ],
+            )
             .await
             .map(|_| ())
     }
@@ -1008,7 +1283,17 @@ impl TableMetadataManager {
     ) -> Result<()> {
         let keys =
             self.table_metadata_keys(table_id, table_name, table_route_value, region_wal_options)?;
-        self.tombstone_manager.restore(keys).await.map(|_| ())
+        self.tombstone_manager
+            .restore_with_markers(
+                keys,
+                vec![
+                    dropped_at_key(table_id),
+                    retention_expires_at_key(table_id),
+                    drop_generation_key(table_id),
+                ],
+            )
+            .await
+            .map(|_| ())
     }
 
     /// Deletes metadata for table **permanently**.
@@ -1027,6 +1312,143 @@ impl TableMetadataManager {
             .batch_delete(BatchDeleteRequest::new().with_keys(keys))
             .await?;
         Ok(())
+    }
+
+    /// Rebuilds dropped table metadata from tombstoned keys.
+    async fn get_dropped_table_metadata<T>(
+        &self,
+        table_id: TableId,
+        table_name: T,
+    ) -> Result<Option<DroppedTableMetadata>>
+    where
+        T: Into<Option<TableName>>,
+    {
+        let table_info_key = TableInfoKey::new(table_id);
+        let Some(table_info_kv) = self
+            .tombstone_manager
+            .get(&table_info_key.to_bytes())
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let table_info_value = TableInfoValue::try_from_raw_value(&table_info_kv.value)?;
+        let table_name = table_name
+            .into()
+            .unwrap_or_else(|| table_info_value.table_name());
+
+        let table_route_key = TableRouteKey::new(table_id);
+        let table_route_kv = self
+            .tombstone_manager
+            .get(&table_route_key.to_bytes())
+            .await?
+            .with_context(|| error::UnexpectedSnafu {
+                err_msg: format!("Missing tombstoned table route metadata for table id {table_id}"),
+            })?;
+        let mut table_route_value = TableRouteValue::try_from_raw_value(&table_route_kv.value)?;
+        self.table_route_manager
+            .table_route_storage()
+            .remap_table_route(&mut table_route_value)
+            .await?;
+
+        let region_wal_options = self
+            .dropped_region_wal_options(table_id, &table_route_value)
+            .await?;
+        let dropped_at_key = dropped_at_key(table_id);
+        let retention_expires_at_key = retention_expires_at_key(table_id);
+        let drop_generation_key = drop_generation_key(table_id);
+        let marker_values = self
+            .tombstone_manager
+            .batch_get(&[
+                dropped_at_key.clone(),
+                retention_expires_at_key.clone(),
+                drop_generation_key.clone(),
+            ])
+            .await?;
+        let dropped_at = Self::parse_dropped_at(table_id, marker_values.get(&dropped_at_key))?;
+        let retention_expires_at = Self::parse_retention_expires_at(
+            table_id,
+            marker_values.get(&retention_expires_at_key),
+        )?;
+        let drop_generation = Self::parse_drop_generation(marker_values.get(&drop_generation_key));
+
+        Ok(Some(DroppedTableMetadata {
+            table_id,
+            table_name,
+            table_info_value,
+            table_route_value,
+            region_wal_options,
+            dropped_at,
+            retention_expires_at,
+            drop_generation,
+        }))
+    }
+
+    fn parse_dropped_at(table_id: TableId, kv: Option<&KeyValue>) -> Result<Option<i64>> {
+        Self::parse_timestamp_marker(table_id, "dropped timestamp", kv)
+    }
+
+    fn parse_retention_expires_at(table_id: TableId, kv: Option<&KeyValue>) -> Result<Option<i64>> {
+        Self::parse_timestamp_marker(table_id, "retention deadline", kv)
+    }
+
+    fn parse_drop_generation(kv: Option<&KeyValue>) -> Option<String> {
+        kv.map(|kv| String::from_utf8_lossy(&kv.value).into_owned())
+    }
+
+    fn parse_timestamp_marker(
+        table_id: TableId,
+        description: &str,
+        kv: Option<&KeyValue>,
+    ) -> Result<Option<i64>> {
+        let Some(kv) = kv else {
+            return Ok(None);
+        };
+        let value = String::from_utf8_lossy(&kv.value);
+        value.parse().map(Some).map_err(|err| {
+            error::UnexpectedSnafu {
+                err_msg: format!("Invalid {description} '{value}' for table id {table_id}: {err}"),
+            }
+            .build()
+        })
+    }
+
+    /// Rebuilds region WAL options from tombstoned datanode-table entries.
+    async fn dropped_region_wal_options(
+        &self,
+        table_id: TableId,
+        table_route_value: &TableRouteValue,
+    ) -> Result<HashMap<RegionNumber, WalOptions>> {
+        let mut region_wal_options = HashMap::new();
+        let Some(region_routes) = table_route_value.region_routes().ok() else {
+            return Ok(region_wal_options);
+        };
+        let datanode_table_keys = region_distribution(region_routes)
+            .into_keys()
+            .map(|datanode_id| DatanodeTableKey::new(datanode_id, table_id))
+            .collect::<Vec<_>>();
+        let datanode_table_key_bytes = datanode_table_keys
+            .iter()
+            .map(|key| key.to_bytes())
+            .collect::<Vec<_>>();
+        let datanode_table_values = self
+            .tombstone_manager
+            .batch_get(&datanode_table_key_bytes)
+            .await?;
+
+        for datanode_table_key in datanode_table_keys {
+            let Some(kv) = datanode_table_values.get(&datanode_table_key.to_bytes()) else {
+                continue;
+            };
+
+            let datanode_table_value = DatanodeTableValue::try_from_raw_value(&kv.value)?;
+            for (region_number, wal_options) in &datanode_table_value.region_info.region_wal_options
+            {
+                region_wal_options.insert(*region_number, wal_options.clone());
+            }
+        }
+
+        Ok(region_wal_options)
     }
 
     fn view_info_keys(&self, view_id: TableId, view_name: &TableName) -> Result<Vec<Vec<u8>>> {
@@ -1279,7 +1701,7 @@ impl TableMetadataManager {
         current_table_route_value: &DeserializedValueWithBytes<TableRouteValue>,
         new_region_routes: Vec<RegionRoute>,
         new_region_options: &HashMap<String, String>,
-        new_region_wal_options: &HashMap<RegionNumber, String>,
+        new_region_wal_options: &RegionWalOptions,
     ) -> Result<()> {
         // Updates the datanode table key value pairs.
         let current_region_distribution =
@@ -1476,6 +1898,7 @@ impl_optional_metadata_value! {
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
@@ -1483,7 +1906,7 @@ mod tests {
     use common_wal::options::{KafkaWalOptions, WalOptions};
     use futures::TryStreamExt;
     use store_api::storage::{RegionId, RegionNumber};
-    use table::metadata::TableInfo;
+    use table::metadata::{TableId, TableInfo};
     use table::table_name::TableName;
 
     use super::datanode_table::DatanodeTableKey;
@@ -1491,7 +1914,7 @@ mod tests {
     use crate::ddl::allocator::wal_options::WalOptionsAllocator;
     use crate::ddl::test_util::create_table::test_create_table_task;
     use crate::ddl::utils::region_storage_path;
-    use crate::error::Result;
+    use crate::error::{Error, Result};
     use crate::key::datanode_table::RegionInfo;
     use crate::key::node_address::{NodeAddressKey, NodeAddressValue};
     use crate::key::table_info::TableInfoValue;
@@ -1499,15 +1922,17 @@ mod tests {
     use crate::key::table_route::TableRouteValue;
     use crate::key::topic_region::TopicRegionKey;
     use crate::key::{
-        DeserializedValueWithBytes, MetadataValue, RegionDistribution, RegionRoleSet,
-        TOPIC_REGION_PREFIX, TableMetadataManager, ViewInfoValue,
+        DeserializedValueWithBytes, DroppedTableMetadata, MetadataValue, RegionDistribution,
+        RegionRoleSet, TOPIC_REGION_PREFIX, TableMetadataManager, ViewInfoValue,
     };
     use crate::kv_backend::KvBackend;
     use crate::kv_backend::memory::MemoryKvBackend;
+    use crate::kv_backend::read_only::ReadOnlyKvBackend;
+    use crate::kv_backend::test_util::MockKvBackend;
     use crate::peer::Peer;
     use crate::rpc::router::{LeaderState, Region, RegionRoute, region_distribution};
-    use crate::rpc::store::{PutRequest, RangeRequest};
-    use crate::wal_provider::WalProvider;
+    use crate::rpc::store::{BatchGetResponse, PutRequest, RangeRequest, RangeResponse};
+    use crate::wal_provider::{RegionWalOptions, WalProvider};
 
     #[test]
     fn test_deserialized_value_with_bytes() {
@@ -1580,7 +2005,7 @@ mod tests {
         table_metadata_manager: &TableMetadataManager,
         table_info: TableInfo,
         region_routes: Vec<RegionRoute>,
-        region_wal_options: HashMap<RegionNumber, String>,
+        region_wal_options: RegionWalOptions,
     ) -> Result<()> {
         table_metadata_manager
             .create_table_metadata(
@@ -1597,17 +2022,119 @@ mod tests {
             .collect::<Vec<_>>();
         let wal_options = topics
             .iter()
-            .map(|topic| {
-                WalOptions::Kafka(KafkaWalOptions {
-                    topic: topic.clone(),
-                })
-            })
+            .map(|topic| WalOptions::Kafka(KafkaWalOptions::new(topic.clone())))
             .collect::<Vec<_>>();
 
         (0..16)
             .enumerate()
             .map(|(i, region_number)| (region_number, wal_options[i % wal_options.len()].clone()))
             .collect()
+    }
+
+    fn create_mixed_region_wal_options() -> HashMap<RegionNumber, WalOptions> {
+        HashMap::from([
+            (
+                0,
+                WalOptions::Kafka(KafkaWalOptions::new("greptimedb_topic0".to_string())),
+            ),
+            (1, WalOptions::RaftEngine),
+            (2, WalOptions::Noop),
+            (
+                3,
+                WalOptions::Kafka(KafkaWalOptions::new("greptimedb_topic1".to_string())),
+            ),
+        ])
+    }
+
+    fn test_physical_region_route(
+        table_id: TableId,
+        region_number: RegionNumber,
+        leader_peer: u64,
+        follower_peers: Vec<u64>,
+    ) -> RegionRoute {
+        RegionRoute {
+            region: Region::new_test(RegionId::new(table_id, region_number)),
+            leader_peer: Some(Peer::empty(leader_peer)),
+            follower_peers: follower_peers.into_iter().map(Peer::empty).collect(),
+            leader_state: None,
+            leader_down_since: None,
+            write_route_policy: None,
+        }
+    }
+
+    async fn create_dropped_physical_table_metadata(
+        table_id: TableId,
+        table_name: &str,
+        region_routes: Vec<RegionRoute>,
+        region_wal_options: HashMap<RegionNumber, WalOptions>,
+    ) -> (
+        Arc<MemoryKvBackend<Error>>,
+        TableMetadataManager,
+        TableName,
+        TableInfo,
+        Vec<RegionRoute>,
+        HashMap<RegionNumber, WalOptions>,
+    ) {
+        let mem_kv = Arc::new(MemoryKvBackend::default());
+        let table_metadata_manager = TableMetadataManager::new(mem_kv.clone());
+        let task = test_create_table_task(table_name, table_id);
+        let table_info = task.table_info.clone();
+        table_metadata_manager
+            .create_table_metadata(
+                table_info.clone(),
+                TableRouteValue::physical(region_routes),
+                region_wal_options.clone(),
+            )
+            .await
+            .unwrap();
+
+        let table_route_value = table_metadata_manager
+            .table_route_manager
+            .table_route_storage()
+            .get_with_raw_bytes(table_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let region_routes = table_route_value.region_routes().unwrap().clone();
+        let table_name = TableName::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, table_name);
+        let table_route_value = TableRouteValue::physical(region_routes.clone());
+        table_metadata_manager
+            .delete_table_metadata(
+                table_id,
+                &table_name,
+                &table_route_value,
+                &region_wal_options,
+                None,
+            )
+            .await
+            .unwrap();
+
+        (
+            mem_kv,
+            table_metadata_manager,
+            table_name,
+            table_info,
+            region_routes,
+            region_wal_options,
+        )
+    }
+
+    fn assert_dropped_table_metadata(
+        dropped_table: &DroppedTableMetadata,
+        table_id: TableId,
+        table_name: &TableName,
+        table_info: &TableInfo,
+        region_routes: &[RegionRoute],
+        region_wal_options: &HashMap<RegionNumber, WalOptions>,
+    ) {
+        assert_eq!(dropped_table.table_id, table_id);
+        assert_eq!(&dropped_table.table_name, table_name);
+        assert_eq!(&dropped_table.table_info_value.table_info, table_info);
+        assert_eq!(
+            dropped_table.table_route_value.region_routes().unwrap(),
+            region_routes
+        );
+        assert_eq!(&dropped_table.region_wal_options, region_wal_options);
     }
 
     #[tokio::test]
@@ -1643,10 +2170,7 @@ mod tests {
         let region_route = new_test_region_route();
         let region_routes = &vec![region_route.clone()];
         let table_info = new_test_table_info();
-        let region_wal_options = create_mock_region_wal_options()
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::to_string(&v).unwrap()))
-            .collect::<HashMap<_, _>>();
+        let region_wal_options = create_mock_region_wal_options();
 
         // creates metadata.
         create_physical_table_metadata(
@@ -1774,6 +2298,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_full_table_info_with_read_only_kv_backend() {
+        let mem_kv = Arc::new(MemoryKvBackend::default());
+        let writable_manager = TableMetadataManager::new(mem_kv.clone());
+
+        let region_routes = vec![new_test_region_route()];
+        let table_info = new_test_table_info();
+        let table_id = table_info.ident.table_id;
+
+        create_physical_table_metadata(
+            &writable_manager,
+            table_info.clone(),
+            region_routes.clone(),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let read_only_kv = Arc::new(ReadOnlyKvBackend::new(mem_kv));
+        let read_only_manager = TableMetadataManager::new(read_only_kv);
+
+        let (remote_table_info, remote_table_route) = read_only_manager
+            .get_full_table_info(table_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            remote_table_info.unwrap().into_inner().table_info,
+            table_info
+        );
+        assert_eq!(
+            remote_table_route
+                .unwrap()
+                .into_inner()
+                .region_routes()
+                .unwrap(),
+            &region_routes
+        );
+    }
+
+    #[tokio::test]
     async fn test_create_logic_tables_metadata() {
         let mem_kv = Arc::new(MemoryKvBackend::default());
         let table_metadata_manager = TableMetadataManager::new(mem_kv);
@@ -1867,10 +2431,7 @@ mod tests {
         let table_id = table_info.ident.table_id;
         let datanode_id = 2;
         let region_wal_options = create_mock_region_wal_options();
-        let serialized_region_wal_options = region_wal_options
-            .iter()
-            .map(|(k, v)| (*k, serde_json::to_string(v).unwrap()))
-            .collect::<HashMap<_, _>>();
+        let serialized_region_wal_options = region_wal_options.clone();
 
         // creates metadata.
         create_physical_table_metadata(
@@ -1895,6 +2456,7 @@ mod tests {
                 &table_name,
                 table_route_value,
                 &region_wal_options,
+                None,
             )
             .await
             .unwrap();
@@ -1905,6 +2467,7 @@ mod tests {
                 &table_name,
                 table_route_value,
                 &region_wal_options,
+                None,
             )
             .await
             .unwrap();
@@ -2345,20 +2908,14 @@ mod tests {
             region_storage_path(&table_info.catalog_name, &table_info.schema_name);
 
         // Create initial metadata with Kafka WAL options
-        let old_region_wal_options: HashMap<RegionNumber, String> = vec![
+        let old_region_wal_options: RegionWalOptions = vec![
             (
                 1,
-                serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions {
-                    topic: "topic_1".to_string(),
-                }))
-                .unwrap(),
+                WalOptions::Kafka(KafkaWalOptions::new("topic_1".to_string())),
             ),
             (
                 2,
-                serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions {
-                    topic: "topic_2".to_string(),
-                }))
-                .unwrap(),
+                WalOptions::Kafka(KafkaWalOptions::new("topic_2".to_string())),
             ),
         ]
         .into_iter()
@@ -2405,27 +2962,18 @@ mod tests {
             new_region_route(2, 2),
             new_region_route(3, 3), // New region
         ];
-        let new_region_wal_options: HashMap<RegionNumber, String> = vec![
+        let new_region_wal_options: RegionWalOptions = vec![
             (
                 1,
-                serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions {
-                    topic: "topic_1".to_string(), // Unchanged
-                }))
-                .unwrap(),
+                WalOptions::Kafka(KafkaWalOptions::new("topic_1".to_string())), // Unchanged
             ),
             (
                 2,
-                serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions {
-                    topic: "topic_2".to_string(), // Unchanged
-                }))
-                .unwrap(),
+                WalOptions::Kafka(KafkaWalOptions::new("topic_2".to_string())), // Unchanged
             ),
             (
                 3,
-                serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions {
-                    topic: "topic_3".to_string(), // New topic
-                }))
-                .unwrap(),
+                WalOptions::Kafka(KafkaWalOptions::new("topic_3".to_string())), // New topic
             ),
         ]
         .into_iter()
@@ -2469,20 +3017,14 @@ mod tests {
             // Region 2 removed
             // Region 3 now has different topic
         ];
-        let newer_region_wal_options: HashMap<RegionNumber, String> = vec![
+        let newer_region_wal_options: RegionWalOptions = vec![
             (
                 1,
-                serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions {
-                    topic: "topic_1".to_string(), // Unchanged
-                }))
-                .unwrap(),
+                WalOptions::Kafka(KafkaWalOptions::new("topic_1".to_string())), // Unchanged
             ),
             (
                 3,
-                serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions {
-                    topic: "topic_3_new".to_string(), // Changed topic
-                }))
-                .unwrap(),
+                WalOptions::Kafka(KafkaWalOptions::new("topic_3_new".to_string())), // Changed topic
             ),
         ]
         .into_iter()
@@ -2551,11 +3093,8 @@ mod tests {
         let table_id = 1025;
         let table_name = "foo";
         let task = test_create_table_task(table_name, table_id);
-        let options = create_mock_region_wal_options();
-        let serialized_options = options
-            .iter()
-            .map(|(k, v)| (*k, serde_json::to_string(v).unwrap()))
-            .collect::<HashMap<_, _>>();
+        let options = create_mixed_region_wal_options();
+        let serialized_options = options.clone();
         table_metadata_manager
             .create_table_metadata(
                 task.table_info,
@@ -2611,11 +3150,8 @@ mod tests {
         let table_id = 1025;
         let table_name = "foo";
         let task = test_create_table_task(table_name, table_id);
-        let options = create_mock_region_wal_options();
-        let serialized_options = options
-            .iter()
-            .map(|(k, v)| (*k, serde_json::to_string(v).unwrap()))
-            .collect::<HashMap<_, _>>();
+        let options = create_mixed_region_wal_options();
+        let serialized_options = options.clone();
         table_metadata_manager
             .create_table_metadata(
                 task.table_info,
@@ -2661,7 +3197,7 @@ mod tests {
         let table_name = TableName::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, table_name);
         let table_route_value = TableRouteValue::physical(region_routes.clone());
         table_metadata_manager
-            .delete_table_metadata(table_id, &table_name, &table_route_value, &options)
+            .delete_table_metadata(table_id, &table_name, &table_route_value, &options, None)
             .await
             .unwrap();
         table_metadata_manager
@@ -2677,6 +3213,309 @@ mod tests {
             .unwrap();
         let kvs = mem_kv.dump();
         assert_eq!(kvs, expected_result);
+    }
+
+    #[tokio::test]
+    async fn test_dropped_table_metadata_enumeration_and_lookup() {
+        let table_id = 1025;
+        let table_name = "foo";
+        let (_, table_metadata_manager, table_name, table_info, region_routes, options) =
+            create_dropped_physical_table_metadata(
+                table_id,
+                table_name,
+                vec![
+                    test_physical_region_route(table_id, 1, 1, vec![5]),
+                    test_physical_region_route(table_id, 2, 2, vec![4]),
+                    test_physical_region_route(table_id, 3, 3, vec![]),
+                ],
+                create_mixed_region_wal_options(),
+            )
+            .await;
+
+        let dropped_tables = table_metadata_manager.list_dropped_tables().await.unwrap();
+        assert_eq!(dropped_tables.len(), 1);
+        assert_eq!(dropped_tables[0].table_id, table_id);
+        assert_eq!(dropped_tables[0].table_name, table_name);
+
+        let dropped_table = table_metadata_manager
+            .get_dropped_table(&table_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_dropped_table_metadata(
+            &dropped_table,
+            table_id,
+            &table_name,
+            &table_info,
+            &region_routes,
+            &options,
+        );
+
+        let dropped_table_by_id = table_metadata_manager
+            .get_dropped_table_by_id(table_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_dropped_table_metadata(
+            &dropped_table_by_id,
+            table_id,
+            &table_name,
+            &table_info,
+            &region_routes,
+            &options,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_dropped_tables_batches_timestamp_lookup() {
+        let mem_kv = Arc::new(MemoryKvBackend::default());
+        let table_metadata_manager = TableMetadataManager::new(mem_kv.clone());
+        for (table_id, table_name, dropped_at) in
+            [(1025, "legacy", None), (1026, "marked", Some(1234))]
+        {
+            let task = test_create_table_task(table_name, table_id);
+            let table_name = task.table_name();
+            let table_route = TableRouteValue::physical(vec![]);
+            table_metadata_manager
+                .create_table_metadata(task.table_info, table_route.clone(), HashMap::new())
+                .await
+                .unwrap();
+            table_metadata_manager
+                .delete_table_metadata(
+                    table_id,
+                    &table_name,
+                    &table_route,
+                    &HashMap::new(),
+                    dropped_at,
+                )
+                .await
+                .unwrap();
+        }
+        let all_tombstones = mem_kv
+            .range(RangeRequest::new().with_prefix("__tombstone/"))
+            .await
+            .unwrap()
+            .kvs;
+        let range_calls = Arc::new(AtomicUsize::new(0));
+        let batch_get_calls = Arc::new(AtomicUsize::new(0));
+        let mock = MockKvBackend {
+            range_fn: Some({
+                let all_tombstones = all_tombstones.clone();
+                let range_calls = range_calls.clone();
+                Arc::new(move |req| {
+                    range_calls.fetch_add(1, Ordering::Relaxed);
+                    let kvs = all_tombstones
+                        .iter()
+                        .filter(|kv| {
+                            if req.range_end.is_empty() {
+                                kv.key == req.key
+                            } else {
+                                kv.key >= req.key && kv.key < req.range_end
+                            }
+                        })
+                        .cloned()
+                        .collect();
+                    Ok(RangeResponse { kvs, more: false })
+                })
+            }),
+            batch_get_fn: Some({
+                let batch_get_calls = batch_get_calls.clone();
+                Arc::new(move |req| {
+                    batch_get_calls.fetch_add(1, Ordering::Relaxed);
+                    let kvs = all_tombstones
+                        .iter()
+                        .filter(|kv| req.keys.contains(&kv.key))
+                        .cloned()
+                        .collect();
+                    Ok(BatchGetResponse { kvs })
+                })
+            }),
+            put_fn: None,
+            batch_put_fn: None,
+            delete_range_fn: None,
+            batch_delete_fn: None,
+            txn: None,
+            max_txn_ops: None,
+        };
+        let table_metadata_manager = TableMetadataManager::new(Arc::new(mock));
+
+        let dropped_tables = table_metadata_manager.list_dropped_tables().await.unwrap();
+
+        assert_eq!(
+            dropped_tables
+                .iter()
+                .map(|table| (table.table_id, table.dropped_at))
+                .collect::<Vec<_>>(),
+            vec![(1025, None), (1026, Some(1234))]
+        );
+        assert_eq!(range_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(batch_get_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dropped_table_lookup_survives_live_name_recreation() {
+        let dropped_table_id = 1025;
+        let recreated_table_id = 1026;
+        let table_name = "foo";
+        let (
+            _,
+            table_metadata_manager,
+            dropped_table_name,
+            dropped_table_info,
+            region_routes,
+            options,
+        ) = create_dropped_physical_table_metadata(
+            dropped_table_id,
+            table_name,
+            vec![
+                test_physical_region_route(dropped_table_id, 1, 1, vec![5]),
+                test_physical_region_route(dropped_table_id, 2, 2, vec![4]),
+            ],
+            create_mock_region_wal_options(),
+        )
+        .await;
+
+        let recreated_task = test_create_table_task(table_name, recreated_table_id);
+        table_metadata_manager
+            .create_table_metadata(
+                recreated_task.table_info,
+                TableRouteValue::physical(vec![test_physical_region_route(
+                    recreated_table_id,
+                    1,
+                    4,
+                    vec![],
+                )]),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            table_metadata_manager
+                .table_name_manager()
+                .get(TableNameKey::from(&dropped_table_name))
+                .await
+                .unwrap()
+                .unwrap()
+                .table_id(),
+            recreated_table_id
+        );
+
+        let dropped_table = table_metadata_manager
+            .get_dropped_table(&dropped_table_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_dropped_table_metadata(
+            &dropped_table,
+            dropped_table_id,
+            &dropped_table_name,
+            &dropped_table_info,
+            &region_routes,
+            &options,
+        );
+
+        let dropped_tables = table_metadata_manager.list_dropped_tables().await.unwrap();
+        assert_eq!(dropped_tables.len(), 1);
+        assert_eq!(dropped_tables[0].table_id, dropped_table_id);
+        assert_eq!(dropped_tables[0].table_name, dropped_table_name);
+    }
+
+    #[tokio::test]
+    async fn test_dropped_table_exact_lookup_ignores_unrelated_malformed_table_name_tombstone() {
+        let table_id = 1025;
+        let table_name = "foo";
+        let (mem_kv, table_metadata_manager, table_name, table_info, region_routes, options) =
+            create_dropped_physical_table_metadata(
+                table_id,
+                table_name,
+                vec![
+                    test_physical_region_route(table_id, 1, 1, vec![5]),
+                    test_physical_region_route(table_id, 2, 2, vec![4]),
+                ],
+                create_mixed_region_wal_options(),
+            )
+            .await;
+
+        mem_kv
+            .put(
+                PutRequest::new()
+                    .with_key("__tombstone/__table_name/not-a-table-name-key")
+                    .with_value("malformed"),
+            )
+            .await
+            .unwrap();
+
+        let dropped_table = table_metadata_manager
+            .get_dropped_table(&table_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_dropped_table_metadata(
+            &dropped_table,
+            table_id,
+            &table_name,
+            &table_info,
+            &region_routes,
+            &options,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dropped_table_exact_lookup_tracks_reused_name_after_purge() {
+        let old_table_id = 1025;
+        let new_table_id = 1026;
+        let (_, manager, table_name, _, old_routes, old_options) =
+            create_dropped_physical_table_metadata(
+                old_table_id,
+                "foo",
+                vec![test_physical_region_route(old_table_id, 1, 1, vec![])],
+                HashMap::new(),
+            )
+            .await;
+
+        manager
+            .delete_table_metadata_tombstone(
+                old_table_id,
+                &table_name,
+                &TableRouteValue::physical(old_routes),
+                &old_options,
+            )
+            .await
+            .unwrap();
+        let new_task = test_create_table_task("foo", new_table_id);
+        let new_info = new_task.table_info.clone();
+        let new_route =
+            TableRouteValue::physical(vec![test_physical_region_route(new_table_id, 1, 1, vec![])]);
+        manager
+            .create_table_metadata(new_task.table_info, new_route.clone(), HashMap::new())
+            .await
+            .unwrap();
+        manager
+            .delete_table_metadata(new_table_id, &table_name, &new_route, &HashMap::new(), None)
+            .await
+            .unwrap();
+
+        let dropped = manager
+            .get_dropped_table(&table_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_table_id, dropped.table_id);
+        assert_eq!(new_info, dropped.table_info_value.table_info);
+    }
+
+    #[tokio::test]
+    async fn test_dropped_table_exact_lookup_missing() {
+        let manager = TableMetadataManager::new(Arc::new(MemoryKvBackend::default()));
+
+        assert!(
+            manager
+                .get_dropped_table(&TableName::new("greptime", "public", "missing"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

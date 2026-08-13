@@ -18,6 +18,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use common_base::readable_size::ReadableSize;
@@ -51,6 +52,8 @@ use crate::{
     DfRecordBatch, DfSendableRecordBatchStream, OrderOption, RecordBatch, RecordBatchStream,
     SendableRecordBatchStream, Stream,
 };
+
+const REGION_SCAN_EXEC_NAME: &str = "RegionScanExec";
 
 type FutureStream =
     Pin<Box<dyn std::future::Future<Output = Result<SendableRecordBatchStream>> + Send>>;
@@ -217,9 +220,20 @@ pub struct RecordBatchStreamAdapter {
     metrics: Option<BaselineMetrics>,
     /// Aggregated plan-level metrics. Resolved after an [ExecutionPlan] is finished.
     metrics_2: Metrics,
+    query_load_region_id: Option<u64>,
+    query_stat_counters: Option<RegionQueryStatCounters>,
     /// Display plan and metrics in verbose mode.
     explain_verbose: bool,
     span: Span,
+}
+
+/// Query statistic counters owned by a region.
+#[derive(Debug, Clone)]
+pub struct RegionQueryStatCounters {
+    /// The total query CPU time in nanoseconds.
+    pub query_cpu_time: Arc<AtomicU64>,
+    /// The total scanned bytes.
+    pub query_scanned_bytes: Arc<AtomicU64>,
 }
 
 /// Json encoded metrics. Contains metric from a whole plan tree.
@@ -239,6 +253,8 @@ impl RecordBatchStreamAdapter {
             stream,
             metrics: None,
             metrics_2: Metrics::Unavailable,
+            query_load_region_id: None,
+            query_stat_counters: None,
             explain_verbose: false,
             span: Span::current(),
         })
@@ -253,6 +269,8 @@ impl RecordBatchStreamAdapter {
             stream,
             metrics: None,
             metrics_2: Metrics::Unavailable,
+            query_load_region_id: None,
+            query_stat_counters: None,
             explain_verbose: false,
             span: subspan,
         })
@@ -262,9 +280,189 @@ impl RecordBatchStreamAdapter {
         self.metrics_2 = Metrics::Unresolved(plan)
     }
 
+    fn record_query_stats_on_drop(&self) {
+        let Some(counters) = &self.query_stat_counters else {
+            return;
+        };
+
+        match &self.metrics_2 {
+            Metrics::Unresolved(df_plan) => {
+                let metrics = collect_lightweight_query_load_metrics(
+                    df_plan.as_ref(),
+                    self.query_load_region_id,
+                );
+                record_query_stats(counters, &metrics);
+            }
+            Metrics::PartialResolved(_, metrics) | Metrics::Resolved(metrics) => {
+                record_query_stats(counters, metrics);
+            }
+            Metrics::Unavailable => {}
+        }
+    }
+
+    pub fn set_query_load_region_id(&mut self, region_id: Option<u64>) {
+        self.query_load_region_id = region_id;
+    }
+
+    pub fn set_query_stat_counters(&mut self, counters: Option<RegionQueryStatCounters>) {
+        self.query_stat_counters = counters;
+    }
+
     /// Set the verbose mode for displaying plan and metrics.
     pub fn set_explain_verbose(&mut self, verbose: bool) {
         self.explain_verbose = verbose;
+    }
+
+    fn collect_plan_metrics(&self, df_plan: &Arc<dyn ExecutionPlan>) -> RecordBatchMetrics {
+        collect_full_metrics(
+            df_plan.as_ref(),
+            self.explain_verbose,
+            self.query_load_region_id,
+        )
+    }
+
+    fn collect_partial_metrics(
+        df_plan: &dyn ExecutionPlan,
+        explain_verbose: bool,
+        query_load_region_id: Option<u64>,
+    ) -> RecordBatchMetrics {
+        if explain_verbose {
+            collect_full_metrics(df_plan, explain_verbose, query_load_region_id)
+        } else {
+            collect_lightweight_query_load_metrics(df_plan, query_load_region_id)
+        }
+    }
+
+    fn update_plan_metrics(&mut self, final_metrics: bool) {
+        if final_metrics {
+            let df_plan = match &self.metrics_2 {
+                Metrics::Unresolved(df_plan) | Metrics::PartialResolved(df_plan, _) => {
+                    df_plan.clone()
+                }
+                Metrics::Unavailable | Metrics::Resolved(_) => return,
+            };
+            let metrics = self.collect_plan_metrics(&df_plan);
+            self.metrics_2 = Metrics::Resolved(metrics);
+        } else {
+            let explain_verbose = self.explain_verbose;
+            let query_load_region_id = self.query_load_region_id;
+            match &mut self.metrics_2 {
+                Metrics::Unresolved(df_plan) => {
+                    let df_plan = df_plan.clone();
+                    let metrics = Self::collect_partial_metrics(
+                        df_plan.as_ref(),
+                        explain_verbose,
+                        query_load_region_id,
+                    );
+                    self.metrics_2 = Metrics::PartialResolved(df_plan, metrics);
+                }
+                Metrics::PartialResolved(df_plan, metrics) => {
+                    *metrics = Self::collect_partial_metrics(
+                        df_plan.as_ref(),
+                        explain_verbose,
+                        query_load_region_id,
+                    );
+                }
+                Metrics::Unavailable | Metrics::Resolved(_) => {}
+            }
+        }
+    }
+}
+
+/// Extracts total `output_bytes` from region scan plan nodes.
+pub fn region_scan_output_bytes(metrics: &RecordBatchMetrics) -> usize {
+    metrics
+        .plan_metrics
+        .iter()
+        .filter(|pm| pm.plan_name == REGION_SCAN_EXEC_NAME)
+        .flat_map(|pm| &pm.metrics)
+        .filter_map(|(name, value)| (name == "output_bytes").then_some(*value))
+        .sum()
+}
+
+fn record_query_stats(counters: &RegionQueryStatCounters, metrics: &RecordBatchMetrics) {
+    counters
+        .query_cpu_time
+        .fetch_add(metrics.elapsed_compute as u64, Ordering::Relaxed);
+    counters
+        .query_scanned_bytes
+        .fetch_add(region_scan_output_bytes(metrics) as u64, Ordering::Relaxed);
+}
+
+/// Collects the complete plan metrics used by terminal metrics and verbose analyze output.
+fn collect_full_metrics(
+    df_plan: &dyn ExecutionPlan,
+    explain_verbose: bool,
+    query_load_region_id: Option<u64>,
+) -> RecordBatchMetrics {
+    let mut metric_collector = MetricCollector::new(explain_verbose);
+    accept(df_plan, &mut metric_collector).unwrap();
+    metric_collector.record_batch_metrics.query_load_region_id = query_load_region_id;
+    metric_collector.record_batch_metrics
+}
+
+/// Collects the minimal metrics needed for query-load reporting before EOF.
+///
+/// This intentionally avoids [`MetricCollector`]'s full per-plan aggregation,
+/// sorting, and plan formatting work on the normal query hot path. The result
+/// is still enough for early-stop/cancellation paths to report per-region CPU
+/// time, scanned bytes, and physical-region attribution.
+fn collect_lightweight_query_load_metrics(
+    df_plan: &dyn ExecutionPlan,
+    query_load_region_id: Option<u64>,
+) -> RecordBatchMetrics {
+    let mut metrics = RecordBatchMetrics {
+        query_load_region_id,
+        ..Default::default()
+    };
+    collect_lightweight_query_load_metrics_inner(df_plan, 0, &mut metrics);
+    metrics
+}
+
+/// Recursively walks the physical plan and reads raw metric values without
+/// formatting plan nodes.
+fn collect_lightweight_query_load_metrics_inner(
+    df_plan: &dyn ExecutionPlan,
+    level: usize,
+    record_batch_metrics: &mut RecordBatchMetrics,
+) {
+    let is_region_scan = df_plan.name() == REGION_SCAN_EXEC_NAME;
+    let mut region_scan_output_bytes = None;
+
+    if let Some(metrics) = df_plan.metrics() {
+        for metric in metrics.iter() {
+            let value = metric.value();
+            match value {
+                MetricValue::ElapsedCompute(elapsed_compute) => {
+                    record_batch_metrics.elapsed_compute += elapsed_compute.value();
+                }
+                MetricValue::CurrentMemoryUsage(memory_usage) => {
+                    record_batch_metrics.memory_usage += memory_usage.value();
+                }
+                _ => {}
+            }
+
+            if is_region_scan && value.name() == "output_bytes" {
+                *region_scan_output_bytes.get_or_insert(0) += value.as_usize();
+            }
+        }
+    }
+
+    if let Some(output_bytes) = region_scan_output_bytes {
+        record_batch_metrics.plan_metrics.push(PlanMetrics {
+            plan: df_plan.name().to_string(),
+            plan_name: df_plan.name().to_string(),
+            level,
+            metrics: vec![("output_bytes".to_string(), output_bytes)],
+        });
+    }
+
+    for child in df_plan.children() {
+        collect_lightweight_query_load_metrics_inner(
+            child.as_ref(),
+            level + 1,
+            record_batch_metrics,
+        );
     }
 }
 
@@ -279,10 +477,20 @@ impl RecordBatchStream for RecordBatchStreamAdapter {
 
     fn metrics(&self) -> Option<RecordBatchMetrics> {
         match &self.metrics_2 {
-            Metrics::Resolved(metrics) | Metrics::PartialResolved(_, metrics) => {
-                Some(metrics.clone())
+            Metrics::Unresolved(df_plan) => {
+                if self.explain_verbose {
+                    Some(self.collect_plan_metrics(df_plan))
+                } else {
+                    None
+                }
             }
-            Metrics::Unavailable | Metrics::Unresolved(_) => None,
+            Metrics::PartialResolved(df_plan, metrics) => Some(if self.explain_verbose {
+                self.collect_plan_metrics(df_plan)
+            } else {
+                metrics.clone()
+            }),
+            Metrics::Resolved(metrics) => Some(metrics.clone()),
+            Metrics::Unavailable => None,
         }
     }
 
@@ -307,29 +515,14 @@ impl Stream for RecordBatchStreamAdapter {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(df_record_batch)) => {
                 let df_record_batch = df_record_batch?;
-                if let Metrics::Unresolved(df_plan) | Metrics::PartialResolved(df_plan, _) =
-                    &self.metrics_2
-                {
-                    let mut metric_collector = MetricCollector::new(self.explain_verbose);
-                    accept(df_plan.as_ref(), &mut metric_collector).unwrap();
-                    self.metrics_2 = Metrics::PartialResolved(
-                        df_plan.clone(),
-                        metric_collector.record_batch_metrics,
-                    );
-                }
+                self.update_plan_metrics(false);
                 Poll::Ready(Some(Ok(RecordBatch::from_df_record_batch(
                     self.schema(),
                     df_record_batch,
                 ))))
             }
             Poll::Ready(None) => {
-                if let Metrics::Unresolved(df_plan) | Metrics::PartialResolved(df_plan, _) =
-                    &self.metrics_2
-                {
-                    let mut metric_collector = MetricCollector::new(self.explain_verbose);
-                    accept(df_plan.as_ref(), &mut metric_collector).unwrap();
-                    self.metrics_2 = Metrics::Resolved(metric_collector.record_batch_metrics);
-                }
+                self.update_plan_metrics(true);
                 Poll::Ready(None)
             }
         }
@@ -338,6 +531,12 @@ impl Stream for RecordBatchStreamAdapter {
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.stream.size_hint()
+    }
+}
+
+impl Drop for RecordBatchStreamAdapter {
+    fn drop(&mut self) {
+        self.record_query_stats_on_drop();
     }
 }
 
@@ -366,6 +565,7 @@ impl ExecutionPlanVisitor for MetricCollector {
         let Some(metric) = plan.metrics() else {
             self.record_batch_metrics.plan_metrics.push(PlanMetrics {
                 plan: plan.name().to_string(),
+                plan_name: plan.name().to_string(),
                 level: self.current_level,
                 metrics: vec![],
             });
@@ -380,6 +580,7 @@ impl ExecutionPlanVisitor for MetricCollector {
             .timestamps_removed();
         let mut plan_metric = PlanMetrics {
             plan: one_line(plan, self.verbose).to_string(),
+            plan_name: plan.name().to_string(),
             level: self.current_level,
             metrics: Vec::with_capacity(metric.iter().size_hint().0),
         };
@@ -446,6 +647,30 @@ pub struct RecordBatchMetrics {
     // Detailed per-plan metrics
     /// An ordered list of plan metrics, from top to bottom in post-order.
     pub plan_metrics: Vec<PlanMetrics>,
+    /// Region id that should receive query-load metrics for this scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_load_region_id: Option<u64>,
+    /// Per-region watermark for incremental-read checkpoint advancement.
+    ///
+    /// The watermark is the latest sequence (`seq`) this query round safely read
+    /// for each participating region. Flow uses it to decide where the next
+    /// incremental round can resume.
+    ///
+    /// - `Some(seq)`: the query proved it safely read up to `seq`; downstream
+    ///   may advance the checkpoint to this value.
+    /// - `None`: the region participated but the query could not prove a safe
+    ///   read upper-bound, so the checkpoint must not advance for this region.
+    ///
+    /// Omitted when empty for backward compatibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub region_watermarks: Vec<RegionWatermarkEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RegionWatermarkEntry {
+    pub region_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<u64>,
 }
 
 /// Determines if a metric name represents a time measurement that should be formatted.
@@ -498,6 +723,9 @@ impl Display for RecordBatchMetrics {
 pub struct PlanMetrics {
     /// The plan name
     pub plan: String,
+    /// The stable execution plan name.
+    #[serde(default)]
+    pub plan_name: String,
     /// The level of the plan, starts from 0
     pub level: usize,
     /// An ordered key-value list of metrics.
@@ -697,20 +925,220 @@ fn convert_map_to_json_binary(
 
 #[cfg(test)]
 mod test {
+    use std::any::Any;
+    use std::time::Duration;
+
     use common_error::ext::BoxedError;
     use common_error::mock::MockError;
     use common_error::status_code::StatusCode;
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+    use datafusion::physical_plan::{DisplayAs, PlanProperties};
     use datatypes::arrow::array::{ArrayRef, MapArray, StringArray, StructArray};
     use datatypes::arrow::buffer::OffsetBuffer;
     use datatypes::arrow::datatypes::Field;
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::ColumnSchema;
     use datatypes::vectors::Int32Vector;
+    use futures::StreamExt;
+    use serde_json::json;
     use snafu::IntoError;
 
     use super::*;
     use crate::RecordBatches;
     use crate::error::Error;
+
+    #[derive(Debug)]
+    struct TestMetricsExec {
+        properties: Arc<PlanProperties>,
+        metrics: ExecutionPlanMetricsSet,
+    }
+
+    impl TestMetricsExec {
+        fn new(schema: DfSchemaRef) -> Self {
+            Self::with_output_bytes(schema, &[24])
+        }
+
+        fn with_output_bytes(schema: DfSchemaRef, output_bytes_by_partition: &[usize]) -> Self {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let elapsed_compute = MetricBuilder::new(&metrics).elapsed_compute(0);
+            elapsed_compute.add_duration(Duration::from_nanos(42));
+            for (partition, output_bytes) in output_bytes_by_partition.iter().copied().enumerate() {
+                let metric = MetricBuilder::new(&metrics).output_bytes(partition);
+                metric.add(output_bytes);
+            }
+
+            Self {
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(schema),
+                    Partitioning::UnknownPartitioning(output_bytes_by_partition.len().max(1)),
+                    EmissionType::Incremental,
+                    Boundedness::Bounded,
+                )),
+                metrics,
+            }
+        }
+    }
+
+    impl DisplayAs for TestMetricsExec {
+        fn fmt_as(&self, _t: DisplayFormatType, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            panic!("non-verbose lightweight partial metrics must not format the plan")
+        }
+    }
+
+    impl ExecutionPlan for TestMetricsExec {
+        fn name(&self) -> &str {
+            REGION_SCAN_EXEC_NAME
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> datafusion_common::Result<DfSendableRecordBatchStream> {
+            unreachable!("the test passes a separate stream to RecordBatchStreamAdapter")
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            Some(self.metrics.clone_inner())
+        }
+    }
+
+    #[test]
+    fn test_lightweight_query_load_metrics_sums_region_scan_output_bytes() {
+        let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
+            "a",
+            ConcreteDataType::int32_datatype(),
+            false,
+        )]));
+        let plan = TestMetricsExec::with_output_bytes(schema.arrow_schema().clone(), &[24, 18]);
+
+        let metrics = collect_lightweight_query_load_metrics(&plan, Some(42));
+
+        assert_eq!(metrics.query_load_region_id, Some(42));
+        assert_eq!(region_scan_output_bytes(&metrics), 42);
+        assert_eq!(metrics.plan_metrics.len(), 1);
+        assert_eq!(
+            metrics.plan_metrics[0].metrics,
+            vec![("output_bytes".to_string(), 42)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_batch_stream_adapter_collects_lightweight_partial_metrics() {
+        let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
+            "a",
+            ConcreteDataType::int32_datatype(),
+            false,
+        )]));
+        let batch1 = RecordBatch::new(
+            schema.clone(),
+            vec![Arc::new(Int32Vector::from_slice([1])) as _],
+        )
+        .unwrap()
+        .into_df_record_batch();
+        let batch2 = RecordBatch::new(
+            schema.clone(),
+            vec![Arc::new(Int32Vector::from_slice([2])) as _],
+        )
+        .unwrap()
+        .into_df_record_batch();
+        let df_stream = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema.arrow_schema().clone(),
+                futures::stream::iter(vec![Ok(batch1), Ok(batch2)]),
+            ),
+        );
+        let plan = Arc::new(TestMetricsExec::new(schema.arrow_schema().clone()));
+
+        let mut adapter = RecordBatchStreamAdapter::try_new(df_stream).unwrap();
+        adapter.set_metrics2(plan);
+        adapter.set_query_load_region_id(Some(42));
+
+        assert!(adapter.metrics().is_none());
+        assert!(adapter.next().await.unwrap().is_ok());
+        let metrics = adapter
+            .metrics()
+            .expect("non-verbose queries need partial query-load metrics before EOF");
+        assert_eq!(metrics.elapsed_compute, 42);
+        assert_eq!(metrics.query_load_region_id, Some(42));
+        assert_eq!(region_scan_output_bytes(&metrics), 24);
+        assert_eq!(metrics.plan_metrics.len(), 1);
+        assert_eq!(metrics.plan_metrics[0].plan, REGION_SCAN_EXEC_NAME);
+        assert_eq!(metrics.plan_metrics[0].plan_name, REGION_SCAN_EXEC_NAME);
+        assert_eq!(
+            metrics.plan_metrics[0].metrics,
+            vec![("output_bytes".to_string(), 24)]
+        );
+    }
+
+    #[test]
+    fn test_record_batch_stream_adapter_reuses_partial_query_stats_on_drop() {
+        let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
+            "a",
+            ConcreteDataType::int32_datatype(),
+            false,
+        )]));
+        let df_stream = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema.arrow_schema().clone(),
+                futures::stream::empty::<datafusion::error::Result<DfRecordBatch>>(),
+            ),
+        );
+        let counters = RegionQueryStatCounters {
+            query_cpu_time: Arc::new(AtomicU64::new(10)),
+            query_scanned_bytes: Arc::new(AtomicU64::new(20)),
+        };
+        let stale_metrics = RecordBatchMetrics {
+            elapsed_compute: 1,
+            plan_metrics: vec![PlanMetrics {
+                plan: REGION_SCAN_EXEC_NAME.to_string(),
+                plan_name: REGION_SCAN_EXEC_NAME.to_string(),
+                level: 0,
+                metrics: vec![("output_bytes".to_string(), 2)],
+            }],
+            ..Default::default()
+        };
+        let adapter = RecordBatchStreamAdapter {
+            schema: schema.clone(),
+            stream: df_stream,
+            metrics: None,
+            metrics_2: Metrics::PartialResolved(
+                Arc::new(TestMetricsExec::new(schema.arrow_schema().clone())),
+                stale_metrics,
+            ),
+            query_load_region_id: None,
+            query_stat_counters: Some(counters.clone()),
+            explain_verbose: false,
+            span: Span::current(),
+        };
+
+        drop(adapter);
+
+        assert_eq!(counters.query_cpu_time.load(Ordering::Relaxed), 11);
+        assert_eq!(counters.query_scanned_bytes.load(Ordering::Relaxed), 22);
+    }
 
     #[tokio::test]
     async fn test_async_recordbatch_stream_adaptor() {
@@ -878,5 +1306,137 @@ mod test {
                 assert!(binary_array_json.is_null(i));
             }
         }
+    }
+
+    #[test]
+    fn test_record_query_stats_updates_region_counters() {
+        let counters = RegionQueryStatCounters {
+            query_cpu_time: Arc::new(AtomicU64::new(10)),
+            query_scanned_bytes: Arc::new(AtomicU64::new(20)),
+        };
+        let metrics = RecordBatchMetrics {
+            elapsed_compute: 2_000_000,
+            plan_metrics: vec![PlanMetrics {
+                plan: "RegionScanExec: region=1".to_string(),
+                plan_name: REGION_SCAN_EXEC_NAME.to_string(),
+                level: 0,
+                metrics: vec![("output_bytes".to_string(), 42)],
+            }],
+            ..Default::default()
+        };
+
+        record_query_stats(&counters, &metrics);
+
+        assert_eq!(counters.query_cpu_time.load(Ordering::Relaxed), 2_000_010);
+        assert_eq!(counters.query_scanned_bytes.load(Ordering::Relaxed), 62);
+    }
+
+    #[test]
+    fn test_record_batch_stream_adapter_records_query_stats_on_drop() {
+        let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
+            "a",
+            ConcreteDataType::int32_datatype(),
+            false,
+        )]));
+        let df_stream = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema.arrow_schema().clone(),
+                futures::stream::empty::<datafusion::error::Result<DfRecordBatch>>(),
+            ),
+        );
+        let counters = RegionQueryStatCounters {
+            query_cpu_time: Arc::new(AtomicU64::new(10)),
+            query_scanned_bytes: Arc::new(AtomicU64::new(20)),
+        };
+        let metrics = RecordBatchMetrics {
+            elapsed_compute: 2_000_000,
+            plan_metrics: vec![PlanMetrics {
+                plan: "RegionScanExec: region=1".to_string(),
+                plan_name: REGION_SCAN_EXEC_NAME.to_string(),
+                level: 0,
+                metrics: vec![("output_bytes".to_string(), 42)],
+            }],
+            ..Default::default()
+        };
+        let adapter = RecordBatchStreamAdapter {
+            schema,
+            stream: df_stream,
+            metrics: None,
+            metrics_2: Metrics::Resolved(metrics),
+            query_load_region_id: None,
+            query_stat_counters: Some(counters.clone()),
+            explain_verbose: false,
+            span: Span::current(),
+        };
+
+        drop(adapter);
+
+        assert_eq!(counters.query_cpu_time.load(Ordering::Relaxed), 2_000_010);
+        assert_eq!(counters.query_scanned_bytes.load(Ordering::Relaxed), 62);
+    }
+
+    #[test]
+    fn test_recordbatch_metrics_deserializes_without_region_watermarks() {
+        let metrics: RecordBatchMetrics = serde_json::from_value(json!({
+            "elapsed_compute": 12,
+            "memory_usage": 34,
+            "plan_metrics": []
+        }))
+        .unwrap();
+
+        assert!(metrics.region_watermarks.is_empty());
+        assert_eq!(metrics.elapsed_compute, 12);
+        assert_eq!(metrics.memory_usage, 34);
+    }
+
+    #[test]
+    fn test_plan_metrics_deserializes_without_plan_name() {
+        let metrics: RecordBatchMetrics = serde_json::from_value(json!({
+            "elapsed_compute": 12,
+            "memory_usage": 34,
+            "plan_metrics": [{
+                "plan": "SeqScan: region=1",
+                "level": 0,
+                "metrics": []
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(metrics.plan_metrics[0].plan_name, "");
+    }
+
+    #[test]
+    fn test_recordbatch_metrics_region_watermarks_serde_roundtrip() {
+        let metrics = RecordBatchMetrics {
+            region_watermarks: vec![
+                RegionWatermarkEntry {
+                    region_id: 1,
+                    watermark: Some(100),
+                },
+                RegionWatermarkEntry {
+                    region_id: 2,
+                    watermark: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&metrics).unwrap();
+        assert_eq!(
+            value.get("region_watermarks").unwrap(),
+            &json!([
+                { "region_id": 1, "watermark": 100 },
+                { "region_id": 2 }
+            ])
+        );
+
+        let decoded: RecordBatchMetrics = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.region_watermarks, metrics.region_watermarks);
+    }
+
+    #[test]
+    fn test_recordbatch_metrics_skips_empty_region_watermarks_on_serialize() {
+        let value = serde_json::to_value(RecordBatchMetrics::default()).unwrap();
+        assert!(value.get("region_watermarks").is_none());
     }
 }

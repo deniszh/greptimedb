@@ -14,6 +14,7 @@
 
 pub mod builder;
 mod dashboard;
+mod entity_graph;
 mod grpc;
 mod influxdb;
 mod jaeger;
@@ -24,8 +25,8 @@ mod otlp;
 pub mod prom_store;
 mod promql;
 mod region_query;
-pub mod standalone;
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, atomic};
@@ -33,16 +34,20 @@ use std::time::{Duration, SystemTime};
 
 use async_stream::stream;
 use async_trait::async_trait;
-use auth::{PermissionChecker, PermissionCheckerRef, PermissionReq};
+use auth::{
+    PROMQL_QUERY, PermissionChecker, PermissionCheckerRef, PermissionReq, PermissionTableTarget,
+    PermissionTableTargets,
+};
 use catalog::CatalogManagerRef;
 use catalog::process_manager::{
-    ProcessManagerRef, QueryStatement as CatalogQueryStatement, SlowQueryTimer,
+    ProcessManagerRef, QueryStatement as CatalogQueryStatement, SlowQueryRecorder, SlowQueryTimer,
 };
 use client::OutputData;
 use common_base::Plugins;
 use common_base::cancellation::CancellableFuture;
 use common_error::ext::{BoxedError, ErrorExt};
 use common_event_recorder::EventRecorderRef;
+use common_meta::cache::TableFlownodeSetCacheRef;
 use common_meta::cache_invalidator::CacheInvalidatorRef;
 use common_meta::key::TableMetadataManagerRef;
 use common_meta::key::table_name::TableNameKey;
@@ -54,8 +59,9 @@ use common_recordbatch::error::StreamTimeoutSnafu;
 use common_telemetry::logging::SlowQueryOptions;
 use common_telemetry::{debug, error, tracing};
 use dashmap::DashMap;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion_expr::LogicalPlan;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, future};
 use lazy_static::lazy_static;
 use operator::delete::DeleterRef;
 use operator::insert::InserterRef;
@@ -66,18 +72,20 @@ use prometheus::HistogramTimer;
 use promql_parser::label::Matcher;
 use query::QueryEngineRef;
 use query::metrics::OnDone;
-use query::parser::{PromQuery, QueryLanguageParser, QueryStatement};
+use query::parser::{PromQuery, QueryStatement};
 use query::query_engine::DescribeResult;
 use query::query_engine::options::{QueryOptions, validate_catalog_and_schema};
 use servers::error::{
     self as server_error, AuthSnafu, CommonMetaSnafu, ExecuteQuerySnafu,
-    OtlpMetricModeIncompatibleSnafu, ParsePromQLSnafu, UnexpectedResultSnafu,
+    OtlpMetricModeIncompatibleSnafu, UnexpectedResultSnafu,
 };
 use servers::interceptor::{
     PromQueryInterceptor, PromQueryInterceptorRef, SqlQueryInterceptor, SqlQueryInterceptorRef,
 };
 use servers::otlp::metrics::legacy_normalize_otlp_name;
-use servers::prometheus_handler::PrometheusHandler;
+use servers::prometheus_handler::{
+    ParsedPromQuery, PrometheusHandler, resolve_schema_from_matchers,
+};
 use servers::query_handler::sql::SqlQueryHandler;
 use session::context::{Channel, QueryContextRef};
 use session::table_name::table_idents_to_full_name;
@@ -89,16 +97,17 @@ use sql::statements::comment::CommentObject;
 use sql::statements::copy::{CopyDatabase, CopyTable};
 use sql::statements::statement::Statement;
 use sql::statements::tql::Tql;
-use sqlparser::ast::ObjectName;
-pub use standalone::StandaloneDatanodeManager;
+use sql::util::{extract_tables_from_prom_expr_checked, extract_tables_from_statement_checked};
+use sqlparser::ast::{AnalyzeFormat, ObjectName};
 use table::requests::{OTLP_METRIC_COMPAT_KEY, OTLP_METRIC_COMPAT_PROM};
 use tracing::Span;
 
 use crate::error::{
-    self, Error, ExecLogicalPlanSnafu, ExecutePromqlSnafu, ExternalSnafu, InvalidSqlSnafu,
-    ParseSqlSnafu, PermissionSnafu, PlanStatementSnafu, Result, SqlExecInterceptedSnafu,
-    StatementTimeoutSnafu, TableOperationSnafu,
+    self, CollectRecordbatchSnafu, Error, ExecLogicalPlanSnafu, ExecutePromqlSnafu, ExternalSnafu,
+    InvalidSqlSnafu, ParseSqlSnafu, PermissionSnafu, PlanStatementSnafu, Result,
+    SqlExecInterceptedSnafu, StatementTimeoutSnafu, TableOperationSnafu,
 };
+use crate::service_config::InfluxdbMergeMode;
 use crate::stream_wrapper::CancellableStreamWrapper;
 
 lazy_static! {
@@ -110,6 +119,7 @@ lazy_static! {
 /// [`servers::query_handler::sql::SqlQueryHandler`], etc.
 #[derive(Clone)]
 pub struct Instance {
+    frontend_peer_addr: String,
     catalog_manager: CatalogManagerRef,
     pipeline_operator: Arc<PipelineOperator>,
     statement_executor: Arc<StatementExecutor>,
@@ -118,9 +128,12 @@ pub struct Instance {
     inserter: InserterRef,
     deleter: DeleterRef,
     table_metadata_manager: TableMetadataManagerRef,
-    event_recorder: Option<EventRecorderRef>,
+    event_recorder: EventRecorderRef,
+    slow_query_recorder: EventRecorderRef,
     process_manager: ProcessManagerRef,
     slow_query_options: SlowQueryOptions,
+    influxdb_default_merge_mode: InfluxdbMergeMode,
+    trace_ingest_chunk_size: usize,
     suspend: Arc<AtomicBool>,
 
     // cache for otlp metrics
@@ -131,6 +144,10 @@ pub struct Instance {
 }
 
 impl Instance {
+    pub fn frontend_peer_addr(&self) -> &str {
+        &self.frontend_peer_addr
+    }
+
     pub fn catalog_manager(&self) -> &CatalogManagerRef {
         &self.catalog_manager
     }
@@ -141,6 +158,19 @@ impl Instance {
 
     pub fn plugins(&self) -> &Plugins {
         &self.plugins
+    }
+
+    fn check_permission(
+        &self,
+        ctx: &QueryContextRef,
+        req: PermissionReq<'_>,
+    ) -> server_error::Result<()> {
+        self.plugins
+            .get::<PermissionCheckerRef>()
+            .as_ref()
+            .check_permission(ctx.current_user(), req)
+            .context(AuthSnafu)?;
+        Ok(())
     }
 
     pub fn statement_executor(&self) -> &StatementExecutorRef {
@@ -159,12 +189,21 @@ impl Instance {
         &self.process_manager
     }
 
+    /// Returns the event recorder configured for this frontend instance.
+    pub fn event_recorder(&self) -> EventRecorderRef {
+        self.event_recorder.clone()
+    }
+
     pub fn node_manager(&self) -> &NodeManagerRef {
         self.inserter.node_manager()
     }
 
     pub fn partition_manager(&self) -> &PartitionRuleManagerRef {
         self.inserter.partition_manager()
+    }
+
+    pub fn table_flownode_set_cache(&self) -> &TableFlownodeSetCacheRef {
+        self.inserter.table_flownode_set_cache()
     }
 
     pub fn cache_invalidator(&self) -> &CacheInvalidatorRef {
@@ -188,39 +227,87 @@ fn parse_stmt(sql: &str, dialect: &(dyn Dialect + Send + Sync)) -> Result<Vec<St
     ParserContext::create_with_dialect(sql, dialect, ParseOptions::default()).context(ParseSqlSnafu)
 }
 
+fn is_explain_analyze_verbose(stmt: &Statement) -> bool {
+    matches!(stmt, Statement::Explain(explain) if explain.analyze && explain.verbose)
+}
+
+fn validate_analyze_stream_statement(stmt: &mut Statement) -> Result<()> {
+    let Statement::Explain(explain) = stmt else {
+        return InvalidSqlSnafu {
+            err_msg: "only EXPLAIN ANALYZE VERBOSE statement is supported",
+        }
+        .fail();
+    };
+    ensure!(
+        explain.analyze && explain.verbose,
+        InvalidSqlSnafu {
+            err_msg: "statement must be EXPLAIN ANALYZE VERBOSE"
+        }
+    );
+    match explain.format {
+        None | Some(AnalyzeFormat::JSON) => {
+            // Keep explicit FORMAT JSON accepted, but pass JSON through
+            // QueryContext.explain_format instead of the statement to avoid the
+            // planner's current `EXPLAIN VERBOSE with FORMAT` limitation.
+            explain.format = None;
+            Ok(())
+        }
+        Some(_) => InvalidSqlSnafu {
+            err_msg: "only FORMAT JSON is supported for analyze stream",
+        }
+        .fail(),
+    }
+}
+
 impl Instance {
+    fn statement_slow_query_timer(
+        &self,
+        stmt: &Statement,
+        schema_name: String,
+    ) -> Option<SlowQueryTimer> {
+        if !stmt.is_readonly() || !self.slow_query_options.enable {
+            return None;
+        }
+
+        Some(SlowQueryTimer::new(
+            CatalogQueryStatement::Sql(stmt.clone()),
+            schema_name,
+            self.slow_query_options.threshold,
+            self.slow_query_options.sample_ratio,
+            self.slow_query_options.record_type,
+            self.slow_query_recorder.clone(),
+        ))
+    }
+
     async fn query_statement(&self, stmt: Statement, query_ctx: QueryContextRef) -> Result<Output> {
         check_permission(self.plugins.clone(), &stmt, &query_ctx)?;
 
         let query_interceptor = self.plugins.get::<SqlQueryInterceptorRef<Error>>();
         let query_interceptor = query_interceptor.as_ref();
 
-        if should_capture_statement(Some(&stmt)) {
-            let slow_query_timer = self
-                .slow_query_options
-                .enable
-                .then(|| self.event_recorder.clone())
-                .flatten()
-                .map(|event_recorder| {
-                    SlowQueryTimer::new(
-                        CatalogQueryStatement::Sql(stmt.clone()),
-                        self.slow_query_options.threshold,
-                        self.slow_query_options.sample_ratio,
-                        self.slow_query_options.record_type,
-                        event_recorder,
-                    )
-                });
+        if should_track_statement_process(&stmt) {
+            let catalog_name = query_ctx.current_catalog().to_string();
+            let schema_name = query_ctx.current_schema();
+            let slow_query_timer = self.statement_slow_query_timer(&stmt, schema_name.clone());
+            let timeout_recorder = is_explain_analyze_verbose(&stmt)
+                .then(|| slow_query_timer.as_ref().map(SlowQueryTimer::recorder))
+                .flatten();
 
             let ticket = self.process_manager.register_query(
-                query_ctx.current_catalog().to_string(),
-                vec![query_ctx.current_schema()],
+                catalog_name,
+                vec![schema_name],
                 stmt.to_string(),
                 query_ctx.conn_info().to_string(),
                 Some(query_ctx.process_id()),
                 slow_query_timer,
             );
 
-            let query_fut = self.exec_statement_with_timeout(stmt, query_ctx, query_interceptor);
+            let query_fut = self.exec_statement_with_timeout(
+                stmt,
+                query_ctx,
+                query_interceptor,
+                timeout_recorder,
+            );
 
             CancellableFuture::new(query_fut, ticket.cancellation_handle.clone())
                 .await
@@ -237,7 +324,7 @@ impl Instance {
                     Output { data, meta }
                 })
         } else {
-            self.exec_statement_with_timeout(stmt, query_ctx, query_interceptor)
+            self.exec_statement_with_timeout(stmt, query_ctx, query_interceptor, None)
                 .await
         }
     }
@@ -247,6 +334,7 @@ impl Instance {
         stmt: Statement,
         query_ctx: QueryContextRef,
         query_interceptor: Option<&SqlQueryInterceptorRef<Error>>,
+        timeout_recorder: Option<SlowQueryRecorder>,
     ) -> Result<Output> {
         let timeout = derive_timeout(&stmt, &query_ctx);
         match timeout {
@@ -258,14 +346,15 @@ impl Instance {
                 )
                 .await
                 .map_err(|_| StatementTimeoutSnafu.build())??;
+                let output = map_query_output(output)?;
                 // compute remaining timeout
                 let remaining_timeout = timeout.checked_sub(start.elapsed()).unwrap_or_default();
-                attach_timeout(output, remaining_timeout)
+                attach_timeout(output, remaining_timeout, timeout_recorder)
             }
-            None => {
-                self.exec_statement(stmt, query_ctx, query_interceptor)
-                    .await
-            }
+            None => self
+                .exec_statement(stmt, query_ctx, query_interceptor)
+                .await
+                .and_then(map_query_output),
         }
     }
 
@@ -292,7 +381,7 @@ impl Instance {
                     .await
             }
             _ => {
-                query_interceptor.pre_execute(&stmt, None, query_ctx.clone())?;
+                query_interceptor.pre_execute(Some(&stmt), None, query_ctx.clone())?;
                 self.statement_executor
                     .execute_sql(stmt, query_ctx)
                     .await
@@ -315,7 +404,7 @@ impl Instance {
         let QueryStatement::Sql(stmt) = stmt else {
             unreachable!()
         };
-        query_interceptor.pre_execute(&stmt, Some(&plan), query_ctx.clone())?;
+        query_interceptor.pre_execute(Some(&stmt), Some(&plan), query_ctx.clone())?;
 
         self.statement_executor
             .exec_plan(plan, query_ctx.clone())
@@ -333,7 +422,11 @@ impl Instance {
             .statement_executor
             .plan_tql(tql.clone(), query_ctx)
             .await?;
-        query_interceptor.pre_execute(&Statement::Tql(tql), Some(&plan), query_ctx.clone())?;
+        query_interceptor.pre_execute(
+            Some(&Statement::Tql(tql)),
+            Some(&plan),
+            query_ctx.clone(),
+        )?;
         self.statement_executor
             .exec_plan(plan, query_ctx.clone())
             .await
@@ -342,8 +435,8 @@ impl Instance {
 
     async fn check_otlp_legacy(
         &self,
-        names: &[&String],
-        ctx: QueryContextRef,
+        names: &[String],
+        ctx: &QueryContextRef,
     ) -> server_error::Result<bool> {
         let db_string = ctx.get_db_string();
         // fast cache check
@@ -382,13 +475,6 @@ impl Instance {
 
         // means no existing table is found, use new mode
         if table_ids.is_empty() {
-            let cache = self
-                .otlp_metrics_table_legacy_cache
-                .entry(db_string)
-                .or_default();
-            names.iter().for_each(|name| {
-                cache.insert((*name).clone(), false);
-            });
             return Ok(false);
         }
 
@@ -410,10 +496,6 @@ impl Instance {
                     .unwrap_or(&OTLP_LEGACY_DEFAULT_VALUE)
             })
             .collect::<Vec<_>>();
-        let cache = self
-            .otlp_metrics_table_legacy_cache
-            .entry(db_string)
-            .or_default();
         if !options.is_empty() {
             // check value consistency
             let has_prom = options.iter().any(|opt| *opt == OTLP_METRIC_COMPAT_PROM);
@@ -421,28 +503,34 @@ impl Instance {
                 .iter()
                 .any(|opt| *opt == OTLP_LEGACY_DEFAULT_VALUE.as_str());
             ensure!(!(has_prom && has_legacy), OtlpMetricModeIncompatibleSnafu);
-            let flag = has_legacy;
-            names.iter().for_each(|name| {
-                cache.insert((*name).clone(), flag);
-            });
-            Ok(flag)
+            Ok(has_legacy)
         } else {
             // no table info, use new mode
-            names.iter().for_each(|name| {
-                cache.insert((*name).clone(), false);
-            });
             Ok(false)
         }
+    }
+
+    fn cache_otlp_legacy(
+        &self,
+        names: &[String],
+        ctx: &QueryContextRef,
+        is_legacy: bool,
+    ) -> server_error::Result<()> {
+        let cache = self
+            .otlp_metrics_table_legacy_cache
+            .entry(ctx.get_db_string())
+            .or_default();
+        cache_legacy_mode(&cache, names, is_legacy)
     }
 }
 
 fn fast_legacy_check(
     cache: &DashMap<String, bool>,
-    names: &[&String],
+    names: &[String],
 ) -> server_error::Result<Option<bool>> {
     let hit_cache = names
         .iter()
-        .filter_map(|name| cache.get(*name))
+        .filter_map(|name| cache.get(name))
         .collect::<Vec<_>>();
     if !hit_cache.is_empty() {
         let hit_legacy = hit_cache.iter().any(|en| *en.value());
@@ -453,20 +541,22 @@ fn fast_legacy_check(
         // add doc links in err msg later
         ensure!(!(hit_legacy && hit_prom), OtlpMetricModeIncompatibleSnafu);
 
-        let flag = hit_legacy;
-        // drop hit_cache to release references before inserting to avoid deadlock
-        drop(hit_cache);
-
-        // set cache for all names
-        names.iter().for_each(|name| {
-            if !cache.contains_key(*name) {
-                cache.insert((*name).clone(), flag);
-            }
-        });
-        Ok(Some(flag))
+        Ok(Some(hit_legacy))
     } else {
         Ok(None)
     }
+}
+
+fn cache_legacy_mode(
+    cache: &DashMap<String, bool>,
+    names: &[String],
+    is_legacy: bool,
+) -> server_error::Result<()> {
+    for name in names {
+        let cached = cache.entry(name.clone()).or_insert(is_legacy);
+        ensure!(*cached == is_legacy, OtlpMetricModeIncompatibleSnafu);
+    }
+    Ok(())
 }
 
 /// If the relevant variables are set, the timeout is enforced for all PostgreSQL statements.
@@ -483,18 +573,57 @@ fn derive_timeout(stmt: &Statement, query_ctx: &QueryContextRef) -> Option<Durat
     }
 }
 
-fn attach_timeout(output: Output, mut timeout: Duration) -> Result<Output> {
+/// Derives timeout for plan execution.
+fn derive_timeout_for_plan(plan: &LogicalPlan, query_ctx: &QueryContextRef) -> Option<Duration> {
+    let query_timeout = query_ctx.query_timeout()?;
+    if query_timeout.is_zero() {
+        return None;
+    }
+    match query_ctx.channel() {
+        Channel::Mysql if is_readonly_plan(plan) => Some(query_timeout),
+        Channel::Postgres => Some(query_timeout),
+        _ => None,
+    }
+}
+
+fn record_explain_analyze_timeout(
+    recorder: Option<&SlowQueryRecorder>,
+    plan: Option<&Arc<dyn ExecutionPlan>>,
+) {
+    let Some(recorder) = recorder else {
+        return;
+    };
+    let metrics = plan
+        .and_then(|plan| query::analyze_plan_metrics_to_json_value(plan, true).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
+    recorder.force_record_with_payload(serde_json::json!({
+        "timed_out": true,
+        "metrics": metrics,
+    }));
+}
+
+fn attach_timeout(
+    output: Output,
+    mut timeout: Duration,
+    timeout_recorder: Option<SlowQueryRecorder>,
+) -> Result<Output> {
     if timeout.is_zero() {
         return StatementTimeoutSnafu.fail();
     }
 
+    let plan = timeout_recorder
+        .as_ref()
+        .and_then(|_| output.meta.plan.clone());
     let output = match output.data {
         OutputData::AffectedRows(_) | OutputData::RecordBatches(_) => output,
         OutputData::Stream(mut stream) => {
             let schema = stream.schema();
             let s = Box::pin(stream! {
                 let mut start = tokio::time::Instant::now();
-                while let Some(item) = tokio::time::timeout(timeout, stream.next()).await.map_err(|_| StreamTimeoutSnafu.build())? {
+                while let Some(item) = tokio::time::timeout(timeout, stream.next()).await.map_err(|_| {
+                    record_explain_analyze_timeout(timeout_recorder.as_ref(), plan.as_ref());
+                    StreamTimeoutSnafu.build()
+                })? {
                     yield item;
 
                     let now = tokio::time::Instant::now();
@@ -502,6 +631,7 @@ fn attach_timeout(output: Output, mut timeout: Duration) -> Result<Output> {
                     start = now;
                     // tokio::time::timeout may not return an error immediately when timeout is 0.
                     if timeout.is_zero() {
+                        record_explain_analyze_timeout(timeout_recorder.as_ref(), plan.as_ref());
                         StreamTimeoutSnafu.fail()?;
                     }
                 }
@@ -521,6 +651,99 @@ fn attach_timeout(output: Output, mut timeout: Duration) -> Result<Output> {
 }
 
 impl Instance {
+    async fn check_sql_permission(
+        &self,
+        stmt: &Statement,
+        query_ctx: &QueryContextRef,
+    ) -> Result<()> {
+        self.plugins
+            .get::<PermissionCheckerRef>()
+            .as_ref()
+            .check_permission_with_context(
+                query_ctx.current_user(),
+                PermissionReq::SqlStatement(stmt),
+                Some(&query_ctx.current_schema()),
+            )
+            .context(PermissionSnafu)?;
+
+        let targets = match extract_tables_from_statement_checked(stmt) {
+            Some(tables) => PermissionTableTargets::resolved(
+                tables
+                    .map(|name| {
+                        table_idents_to_full_name(&name, query_ctx).map(
+                            |(catalog, schema, table)| {
+                                PermissionTableTarget::new(catalog, schema, table)
+                            },
+                        )
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(BoxedError::new)
+                    .context(ExternalSnafu)?,
+            ),
+            None => PermissionTableTargets::Unresolved,
+        };
+        let targets = self
+            .resolve_query_permission_targets(targets, query_ctx)
+            .await
+            .map_err(BoxedError::new)
+            .context(ExternalSnafu)?;
+        self.check_table_permission(query_ctx, PermissionReq::SqlStatement(stmt), targets)
+            .context(PermissionSnafu)?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all, name = "SqlQueryHandler::do_analyze_stream_query")]
+    async fn do_analyze_stream_query_inner(
+        &self,
+        query: &str,
+        query_ctx: QueryContextRef,
+    ) -> Result<Output> {
+        ensure!(!self.is_suspended(), error::SuspendedSnafu);
+
+        let query_interceptor_opt = self.plugins.get::<SqlQueryInterceptorRef<Error>>();
+        let query_interceptor = query_interceptor_opt.as_ref();
+        let query = query_interceptor.pre_parsing(query, query_ctx.clone())?;
+        let mut stmts = parse_stmt(query.as_ref(), query_ctx.sql_dialect())
+            .and_then(|stmts| query_interceptor.post_parsing(stmts, query_ctx.clone()))?;
+
+        ensure!(
+            stmts.len() == 1,
+            InvalidSqlSnafu {
+                err_msg: "only single EXPLAIN ANALYZE VERBOSE statement is supported"
+            }
+        );
+        let mut stmt = stmts.remove(0);
+        validate_analyze_stream_statement(&mut stmt)?;
+        query_ctx.set_explain_format(AnalyzeFormat::JSON.to_string());
+
+        self.check_sql_permission(&stmt, &query_ctx).await?;
+        check_permission(self.plugins.clone(), &stmt, &query_ctx)?;
+        let catalog_name = query_ctx.current_catalog().to_string();
+        let schema_name = query_ctx.current_schema();
+        let slow_query_timer = self.statement_slow_query_timer(&stmt, schema_name.clone());
+        let ticket = self.process_manager.register_query(
+            catalog_name,
+            vec![schema_name],
+            stmt.to_string(),
+            query_ctx.conn_info().to_string(),
+            Some(query_ctx.process_id()),
+            slow_query_timer,
+        );
+        let query_fut =
+            self.exec_statement_with_timeout(stmt, query_ctx.clone(), query_interceptor, None);
+        let output = CancellableFuture::new(query_fut, ticket.cancellation_handle.clone())
+            .await
+            .map_err(|_| error::CancelledSnafu.build())??;
+        let Output { meta, data } = output;
+        let data = match data {
+            OutputData::Stream(stream) => OutputData::Stream(Box::pin(
+                CancellableStreamWrapper::new_cancel_on_drop(stream, ticket),
+            )),
+            other => other,
+        };
+        query_interceptor.post_execute(Output { data, meta }, query_ctx)
+    }
+
     #[tracing::instrument(skip_all, name = "SqlQueryHandler::do_query")]
     async fn do_query_inner(&self, query: &str, query_ctx: QueryContextRef) -> Vec<Result<Output>> {
         if self.is_suspended() {
@@ -533,9 +756,6 @@ impl Instance {
             Ok(q) => q,
             Err(e) => return vec![Err(e)],
         };
-
-        let checker_ref = self.plugins.get::<PermissionCheckerRef>();
-        let checker = checker_ref.as_ref();
 
         match parse_stmt(query.as_ref(), query_ctx.sql_dialect())
             .and_then(|stmts| query_interceptor.post_parsing(stmts, query_ctx.clone()))
@@ -552,13 +772,7 @@ impl Instance {
 
                 let mut results = Vec::with_capacity(stmts.len());
                 for stmt in stmts {
-                    if let Err(e) = checker
-                        .check_permission(
-                            query_ctx.current_user(),
-                            PermissionReq::SqlStatement(&stmt),
-                        )
-                        .context(PermissionSnafu)
-                    {
+                    if let Err(e) = self.check_sql_permission(&stmt, &query_ctx).await {
                         results.push(Err(e));
                         break;
                     }
@@ -588,43 +802,89 @@ impl Instance {
         }
     }
 
+    async fn exec_plan(&self, plan: LogicalPlan, query_ctx: QueryContextRef) -> Result<Output> {
+        self.query_engine
+            .execute(plan, query_ctx)
+            .await
+            .context(ExecLogicalPlanSnafu)
+    }
+
+    async fn exec_plan_with_timeout(
+        &self,
+        plan: LogicalPlan,
+        query_ctx: QueryContextRef,
+        timeout_recorder: Option<SlowQueryRecorder>,
+    ) -> Result<Output> {
+        let timeout = derive_timeout_for_plan(&plan, &query_ctx);
+        match timeout {
+            Some(timeout) => {
+                let start = tokio::time::Instant::now();
+                let output = tokio::time::timeout(timeout, self.exec_plan(plan, query_ctx))
+                    .await
+                    .map_err(|_| StatementTimeoutSnafu.build())??;
+                let output = map_query_output(output)?;
+                let remaining_timeout = timeout.checked_sub(start.elapsed()).unwrap_or_default();
+                attach_timeout(output, remaining_timeout, timeout_recorder)
+            }
+            None => self
+                .exec_plan(plan, query_ctx)
+                .await
+                .and_then(map_query_output),
+        }
+    }
+
     async fn do_exec_plan_inner(
         &self,
-        stmt: Option<Statement>,
         plan: LogicalPlan,
+        stmt: Option<Statement>,
         query_ctx: QueryContextRef,
     ) -> Result<Output> {
         ensure!(!self.is_suspended(), error::SuspendedSnafu);
 
-        if should_capture_statement(stmt.as_ref()) {
-            // It's safe to unwrap here because we've already checked the type.
-            let stmt = stmt.unwrap();
-            let query = stmt.to_string();
-            let slow_query_timer = self
-                .slow_query_options
-                .enable
-                .then(|| self.event_recorder.clone())
-                .flatten()
-                .map(|event_recorder| {
+        let query_interceptor_opt = self.plugins.get::<SqlQueryInterceptorRef<Error>>();
+        let query_interceptor = query_interceptor_opt.as_ref();
+
+        query_interceptor.pre_execute(stmt.as_ref(), Some(&plan), query_ctx.clone())?;
+
+        let query = stmt
+            .as_ref()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| plan.display_indent().to_string());
+
+        let plan_is_readonly = is_readonly_plan(&plan);
+        let result = if should_track_plan_process(stmt.as_ref(), &plan) {
+            let catalog_name = query_ctx.current_catalog().to_string();
+            let schema_name = query_ctx.current_schema();
+            let slow_query_timer = if plan_is_readonly {
+                self.slow_query_options.enable.then(|| {
                     SlowQueryTimer::new(
-                        CatalogQueryStatement::Sql(stmt.clone()),
+                        CatalogQueryStatement::Plan(query.clone()),
+                        schema_name.clone(),
                         self.slow_query_options.threshold,
                         self.slow_query_options.sample_ratio,
                         self.slow_query_options.record_type,
-                        event_recorder,
+                        self.slow_query_recorder.clone(),
                     )
-                });
+                })
+            } else {
+                None
+            };
 
+            let timeout_recorder = stmt
+                .as_ref()
+                .is_some_and(is_explain_analyze_verbose)
+                .then(|| slow_query_timer.as_ref().map(SlowQueryTimer::recorder))
+                .flatten();
             let ticket = self.process_manager.register_query(
-                query_ctx.current_catalog().to_string(),
-                vec![query_ctx.current_schema()],
+                catalog_name,
+                vec![schema_name],
                 query,
                 query_ctx.conn_info().to_string(),
                 Some(query_ctx.process_id()),
                 slow_query_timer,
             );
 
-            let query_fut = self.query_engine.execute(plan.clone(), query_ctx);
+            let query_fut = self.exec_plan_with_timeout(plan, query_ctx.clone(), timeout_recorder);
 
             CancellableFuture::new(query_fut, ticket.cancellation_handle.clone())
                 .await
@@ -640,15 +900,12 @@ impl Instance {
                     };
                     Output { data, meta }
                 })
-                .context(ExecLogicalPlanSnafu)
         } else {
-            // plan should be prepared before exec
-            // we'll do check there
-            self.query_engine
-                .execute(plan.clone(), query_ctx)
+            self.exec_plan_with_timeout(plan, query_ctx.clone(), None)
                 .await
-                .context(ExecLogicalPlanSnafu)
-        }
+        };
+
+        result.and_then(|output| query_interceptor.post_execute(output, query_ctx))
     }
 
     #[tracing::instrument(skip_all, name = "SqlQueryHandler::do_promql_query")]
@@ -677,15 +934,20 @@ impl Instance {
     ) -> Result<Option<DescribeResult>> {
         ensure!(!self.is_suspended(), error::SuspendedSnafu);
 
-        if matches!(
-            stmt,
-            Statement::Insert(_) | Statement::Query(_) | Statement::Delete(_)
-        ) {
-            self.plugins
-                .get::<PermissionCheckerRef>()
-                .as_ref()
-                .check_permission(query_ctx.current_user(), PermissionReq::SqlStatement(&stmt))
-                .context(PermissionSnafu)?;
+        // EXPLAIN / EXPLAIN ANALYZE wrap an inner statement; describe them when the
+        // wrapped statement is something we already plan (so that bind parameters
+        // in the inner query get their types inferred). See #8029.
+        let is_inner_plannable = |s: &Statement| {
+            matches!(
+                s,
+                Statement::Insert(_) | Statement::Query(_) | Statement::Delete(_)
+            )
+        };
+        let plannable = is_inner_plannable(&stmt)
+            || matches!(&stmt, Statement::Explain(explain) if is_inner_plannable(explain.statement.as_ref()));
+
+        if plannable {
+            self.check_sql_permission(&stmt, &query_ctx).await?;
 
             let plan = self
                 .query_engine
@@ -725,13 +987,24 @@ impl SqlQueryHandler for Instance {
             .collect()
     }
 
-    async fn do_exec_plan(
+    async fn do_analyze_stream_query(
         &self,
-        stmt: Option<Statement>,
-        plan: LogicalPlan,
+        query: &str,
         query_ctx: QueryContextRef,
     ) -> server_error::Result<Output> {
-        self.do_exec_plan_inner(stmt, plan, query_ctx)
+        self.do_analyze_stream_query_inner(query, query_ctx)
+            .await
+            .map_err(BoxedError::new)
+            .context(ExecuteQuerySnafu)
+    }
+
+    async fn do_exec_plan(
+        &self,
+        plan: LogicalPlan,
+        stmt: Option<Statement>,
+        query_ctx: QueryContextRef,
+    ) -> server_error::Result<Output> {
+        self.do_exec_plan_inner(plan, stmt, query_ctx)
             .await
             .map_err(BoxedError::new)
             .context(server_error::ExecutePlanSnafu)
@@ -768,6 +1041,13 @@ impl SqlQueryHandler for Instance {
     }
 }
 
+/// Expands scan-time dictionaries only when a query result leaves the frontend.
+pub(crate) fn map_query_output(output: Output) -> Result<Output> {
+    output
+        .map_dictionary_to_values()
+        .context(CollectRecordbatchSnafu)
+}
+
 /// Attaches a timer to the output and observes it once the output is exhausted.
 pub fn attach_timer(output: Output, timer: HistogramTimer) -> Output {
     match output.data {
@@ -781,6 +1061,137 @@ pub fn attach_timer(output: Output, timer: HistogramTimer) -> Output {
     }
 }
 
+impl Instance {
+    fn check_prom_query_privilege(&self, query_ctx: &QueryContextRef) -> server_error::Result<()> {
+        self.plugins
+            .get::<PermissionCheckerRef>()
+            .as_ref()
+            .check_permission(
+                query_ctx.current_user(),
+                PermissionReq::Action(PROMQL_QUERY),
+            )
+            .context(AuthSnafu)?;
+        Ok(())
+    }
+
+    fn prom_expr_permission_targets(
+        &self,
+        expr: &promql_parser::parser::Expr,
+        query_ctx: &QueryContextRef,
+    ) -> server_error::Result<Option<Vec<PermissionTableTarget>>> {
+        extract_tables_from_prom_expr_checked(expr)
+            .map(|tables| {
+                tables
+                    .map(|name| {
+                        table_idents_to_full_name(&name, query_ctx).map(
+                            |(catalog, schema, table)| {
+                                PermissionTableTarget::new(catalog, schema, table)
+                            },
+                        )
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(BoxedError::new)
+                    .context(ExecuteQuerySnafu)
+            })
+            .transpose()
+    }
+
+    async fn is_physical_query_permission_target(
+        &self,
+        target: &PermissionTableTarget,
+        query_ctx: &QueryContextRef,
+    ) -> server_error::Result<bool> {
+        self.catalog_manager
+            .table(
+                &target.catalog,
+                &target.schema,
+                &target.table,
+                Some(query_ctx),
+            )
+            .await
+            .map(|table| table.is_some_and(|table| table.table_info().is_physical_table()))
+            .map_err(BoxedError::new)
+            .context(ExecuteQuerySnafu)
+    }
+
+    async fn resolve_query_permission_targets(
+        &self,
+        targets: PermissionTableTargets,
+        query_ctx: &QueryContextRef,
+    ) -> server_error::Result<PermissionTableTargets> {
+        const CONCURRENCY: usize = 8;
+
+        let checker = self.plugins.get::<PermissionCheckerRef>();
+        if !checker.as_ref().uses_table_targets() {
+            return Ok(targets);
+        }
+
+        let PermissionTableTargets::Resolved(mut targets) = targets else {
+            return Ok(PermissionTableTargets::Unresolved);
+        };
+        if targets.len() > 1 {
+            let mut seen = HashSet::with_capacity(targets.len());
+            targets.retain(|target| seen.insert(target.clone()));
+        }
+        if let [target] = targets.as_slice() {
+            return if self
+                .is_physical_query_permission_target(target, query_ctx)
+                .await?
+            {
+                Ok(PermissionTableTargets::Unresolved)
+            } else {
+                Ok(PermissionTableTargets::resolved(targets))
+            };
+        }
+
+        // Bound catalog load and inspect results in target order to preserve serial semantics.
+        for chunk in targets.chunks(CONCURRENCY) {
+            let results = future::join_all(
+                chunk
+                    .iter()
+                    .map(|target| self.is_physical_query_permission_target(target, query_ctx)),
+            )
+            .await;
+            for result in results {
+                if result? {
+                    return Ok(PermissionTableTargets::Unresolved);
+                }
+            }
+        }
+
+        Ok(PermissionTableTargets::resolved(targets))
+    }
+
+    fn prom_queries_permission_targets(
+        &self,
+        queries: &[ParsedPromQuery],
+        query_ctx: &QueryContextRef,
+    ) -> server_error::Result<PermissionTableTargets> {
+        let mut targets = Vec::new();
+        let mut resolved = true;
+
+        for query in queries {
+            let QueryStatement::Promql(eval_stmt, _) = query.statement() else {
+                unreachable!("query is parsed from promql");
+            };
+
+            if let Some(query_targets) =
+                self.prom_expr_permission_targets(&eval_stmt.expr, query_ctx)?
+            {
+                targets.extend(query_targets);
+            } else {
+                resolved = false;
+            }
+        }
+
+        Ok(if resolved {
+            PermissionTableTargets::resolved(targets)
+        } else {
+            PermissionTableTargets::Unresolved
+        })
+    }
+}
+
 #[async_trait]
 impl PrometheusHandler for Instance {
     #[tracing::instrument(skip_all)]
@@ -789,21 +1200,32 @@ impl PrometheusHandler for Instance {
         query: &PromQuery,
         query_ctx: QueryContextRef,
     ) -> server_error::Result<Output> {
+        let query = ParsedPromQuery::parse(query.clone(), &query_ctx)?;
+        self.do_query_parsed(query, query_ctx).await
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn do_query_parsed(
+        &self,
+        query: ParsedPromQuery,
+        query_ctx: QueryContextRef,
+    ) -> server_error::Result<Output> {
         let interceptor = self
             .plugins
             .get::<PromQueryInterceptorRef<server_error::Error>>();
 
-        self.plugins
-            .get::<PermissionCheckerRef>()
-            .as_ref()
-            .check_permission(query_ctx.current_user(), PermissionReq::PromQuery)
-            .context(AuthSnafu)?;
+        self.check_prom_query_privilege(&query_ctx)?;
 
-        let stmt = QueryLanguageParser::parse_promql(query, &query_ctx).with_context(|_| {
-            ParsePromQLSnafu {
-                query: query.clone(),
-            }
-        })?;
+        let targets =
+            self.prom_queries_permission_targets(std::slice::from_ref(&query), &query_ctx)?;
+        self.check_query_target_permission(targets, &query_ctx)
+            .await?;
+
+        let (query, stmt) = query.into_parts();
+
+        let QueryStatement::Promql(eval_stmt, _) = &stmt else {
+            unreachable!("query is parsed from promql");
+        };
 
         let plan = self
             .statement_executor
@@ -812,7 +1234,7 @@ impl PrometheusHandler for Instance {
             .map_err(BoxedError::new)
             .context(ExecuteQuerySnafu)?;
 
-        interceptor.pre_execute(query, Some(&plan), query_ctx.clone())?;
+        interceptor.pre_execute(&query, &eval_stmt.expr, Some(&plan), query_ctx.clone())?;
 
         // Take the EvalStmt from the original QueryStatement and use it to create the CatalogQueryStatement.
         let query_statement = if let QueryStatement::Promql(eval_stmt, alias) = stmt {
@@ -824,27 +1246,23 @@ impl PrometheusHandler for Instance {
             }
             .fail();
         };
-        let query = query_statement.to_string();
+        let raw_query = query_statement.to_string();
 
-        let slow_query_timer = self
-            .slow_query_options
-            .enable
-            .then(|| self.event_recorder.clone())
-            .flatten()
-            .map(|event_recorder| {
-                SlowQueryTimer::new(
-                    query_statement,
-                    self.slow_query_options.threshold,
-                    self.slow_query_options.sample_ratio,
-                    self.slow_query_options.record_type,
-                    event_recorder,
-                )
-            });
+        let slow_query_timer = self.slow_query_options.enable.then(|| {
+            SlowQueryTimer::new(
+                query_statement,
+                query_ctx.current_schema(),
+                self.slow_query_options.threshold,
+                self.slow_query_options.sample_ratio,
+                self.slow_query_options.record_type,
+                self.slow_query_recorder.clone(),
+            )
+        });
 
         let ticket = self.process_manager.register_query(
             query_ctx.current_catalog().to_string(),
             vec![query_ctx.current_schema()],
-            query,
+            raw_query,
             query_ctx.conn_info().to_string(),
             Some(query_ctx.process_id()),
             slow_query_timer,
@@ -855,28 +1273,122 @@ impl PrometheusHandler for Instance {
         let output = CancellableFuture::new(query_fut, ticket.cancellation_handle.clone())
             .await
             .map_err(|_| servers::error::CancelledSnafu.build())?
-            .map(|output| {
-                let Output { meta, data } = output;
-                let data = match data {
-                    OutputData::Stream(stream) => {
-                        OutputData::Stream(Box::pin(CancellableStreamWrapper::new(stream, ticket)))
-                    }
-                    other => other,
-                };
-                Output { data, meta }
-            })
             .map_err(BoxedError::new)
             .context(ExecuteQuerySnafu)?;
-
+        let output = map_query_output(output)
+            .map_err(BoxedError::new)
+            .context(ExecuteQuerySnafu)?;
+        let Output { meta, data } = output;
+        let data = match data {
+            OutputData::Stream(stream) => {
+                OutputData::Stream(Box::pin(CancellableStreamWrapper::new(stream, ticket)))
+            }
+            other => other,
+        };
+        let output = Output { data, meta };
         Ok(interceptor.post_execute(output, query_ctx)?)
+    }
+
+    async fn check_query_permission(
+        &self,
+        queries: &[PromQuery],
+        query_ctx: &QueryContextRef,
+    ) -> server_error::Result<()> {
+        let queries = queries
+            .iter()
+            .cloned()
+            .map(|query| ParsedPromQuery::parse(query, query_ctx))
+            .collect::<server_error::Result<Vec<_>>>()?;
+        self.check_query_permission_parsed(&queries, query_ctx)
+            .await
+    }
+
+    async fn check_query_permission_parsed(
+        &self,
+        queries: &[ParsedPromQuery],
+        query_ctx: &QueryContextRef,
+    ) -> server_error::Result<()> {
+        self.check_prom_query_privilege(query_ctx)?;
+        let targets = self.prom_queries_permission_targets(queries, query_ctx)?;
+        self.check_query_target_permission(targets, query_ctx).await
+    }
+
+    async fn check_query_target_permission(
+        &self,
+        targets: PermissionTableTargets,
+        query_ctx: &QueryContextRef,
+    ) -> server_error::Result<()> {
+        let targets = self
+            .resolve_query_permission_targets(targets, query_ctx)
+            .await?;
+        self.check_table_permission(query_ctx, PermissionReq::Action(PROMQL_QUERY), targets)
+            .context(AuthSnafu)?;
+        Ok(())
+    }
+
+    async fn filter_metadata_metric_names(
+        &self,
+        metric_names: Vec<String>,
+        schema: &str,
+        query_ctx: &QueryContextRef,
+    ) -> server_error::Result<Vec<String>> {
+        let checker = self.plugins.get::<PermissionCheckerRef>();
+        if !checker.as_ref().uses_table_targets() {
+            let Some(metric) = metric_names.first() else {
+                return Ok(metric_names);
+            };
+            let target =
+                PermissionTableTarget::new(query_ctx.current_catalog(), schema, metric.as_str());
+            let result = checker
+                .as_ref()
+                .check_permission_with_table_targets(
+                    query_ctx.current_user(),
+                    PermissionReq::Action(PROMQL_QUERY),
+                    PermissionTableTargets::resolved(vec![target]),
+                )
+                .context(AuthSnafu);
+            return match result {
+                Ok(_) => Ok(metric_names),
+                Err(error)
+                    if error.status_code()
+                        == common_error::status_code::StatusCode::PermissionDenied =>
+                {
+                    Ok(Vec::new())
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        let mut allowed = Vec::with_capacity(metric_names.len());
+        for metric in metric_names {
+            let target =
+                PermissionTableTarget::new(query_ctx.current_catalog(), schema, metric.as_str());
+            match checker
+                .as_ref()
+                .check_permission_with_table_targets(
+                    query_ctx.current_user(),
+                    PermissionReq::Action(PROMQL_QUERY),
+                    PermissionTableTargets::resolved(vec![target]),
+                )
+                .context(AuthSnafu)
+            {
+                Ok(_) => allowed.push(metric),
+                Err(error)
+                    if error.status_code()
+                        == common_error::status_code::StatusCode::PermissionDenied => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(allowed)
     }
 
     async fn query_metric_names(
         &self,
         matchers: Vec<Matcher>,
+        schema: &str,
         ctx: &QueryContextRef,
     ) -> server_error::Result<Vec<String>> {
-        self.handle_query_metric_names(matchers, ctx)
+        self.handle_query_metric_names(matchers, schema, ctx)
             .await
             .map_err(BoxedError::new)
             .context(ExecuteQuerySnafu)
@@ -891,7 +1403,16 @@ impl PrometheusHandler for Instance {
         end: SystemTime,
         ctx: &QueryContextRef,
     ) -> server_error::Result<Vec<String>> {
-        self.handle_query_label_values(metric, label_name, matchers, start, end, ctx)
+        let schema =
+            resolve_schema_from_matchers(&matchers)?.unwrap_or_else(|| ctx.current_schema());
+        let target = PermissionTableTarget::new(ctx.current_catalog(), schema.as_str(), &metric);
+        self.check_query_target_permission(
+            PermissionTableTargets::resolved(vec![target.clone()]),
+            ctx,
+        )
+        .await?;
+
+        self.handle_query_label_values(target, label_name, matchers, start, end, ctx)
             .await
             .map_err(BoxedError::new)
             .context(ExecuteQuerySnafu)
@@ -1009,6 +1530,10 @@ pub fn check_permission(
                 validate_param(table_name, query_ctx)?;
             }
         }
+        #[cfg(feature = "enterprise")]
+        Statement::UndropTable(stmt) => {
+            validate_param(stmt.table_name(), query_ctx)?;
+        }
         Statement::DropView(stmt) => {
             validate_param(&stmt.view_name, query_ctx)?;
         }
@@ -1032,6 +1557,11 @@ pub fn check_permission(
         }
         Statement::ShowFlows(stmt) => {
             validate_db_permission!(stmt, query_ctx);
+        }
+        Statement::ShowFlowStatus(_stmt) => {
+            // Flow statistics are organized based on the catalog dimension and
+            // filtered by the current catalog, so there is no need to check the
+            // permission of the database(schema).
         }
         #[cfg(feature = "enterprise")]
         Statement::ShowTriggers(_stmt) => {
@@ -1119,145 +1649,1973 @@ fn validate_database(name: &ObjectName, query_ctx: &QueryContextRef) -> Result<(
         .context(SqlExecInterceptedSnafu)
 }
 
-// Create a query ticket and slow query timer if the statement is a query or readonly statement.
-fn should_capture_statement(stmt: Option<&Statement>) -> bool {
-    if let Some(stmt) = stmt {
-        matches!(stmt, Statement::Query(_)) || stmt.is_readonly()
-    } else {
-        false
-    }
+fn is_readonly_plan(plan: &LogicalPlan) -> bool {
+    !matches!(plan, LogicalPlan::Dml(_) | LogicalPlan::Ddl(_))
+}
+
+fn should_track_statement_process(stmt: &Statement) -> bool {
+    stmt.is_readonly()
+        || matches!(stmt, Statement::Insert(insert) if insert.has_non_values_query_source())
+}
+
+fn should_track_plan_process(stmt: Option<&Statement>, plan: &LogicalPlan) -> bool {
+    is_readonly_plan(plan)
+        || matches!(stmt, Some(Statement::Insert(insert)) if insert.has_non_values_query_source())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier};
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
 
+    use api::prom_store::remote::label_matcher::Type as PromMatcherType;
+    use api::prom_store::remote::{
+        Label, LabelMatcher, Query as RemoteQuery, ReadRequest, ReadResponse, Sample,
+    };
+    use api::v1::greptime_request::Request;
+    use api::v1::meta::{ProcedureDetailResponse, ReconcileRequest, ReconcileResponse};
+    use api::v1::query_request::Query;
+    use auth::{
+        DASHBOARD_DELETE, DASHBOARD_QUERY, DASHBOARD_SAVE, JAEGER_QUERY, PIPELINE_DELETE,
+        PIPELINE_INSERT, PIPELINE_QUERY, PermissionAction, PermissionResp, UserInfo, UserInfoRef,
+    };
+    use catalog::process_manager::{ProcessManager, QueryStatement, SlowQueryTimer};
     use common_base::Plugins;
+    use common_catalog::consts::DEFAULT_PRIVATE_SCHEMA_NAME;
+    use common_error::ext::{BoxedError, ErrorExt, PlainError};
+    use common_error::status_code::StatusCode;
+    use common_event_recorder::{Event, EventRecorder, EventTypeFilter, EventTypeFilterRef};
+    use common_frontend::slow_query_event::SlowQueryEvent;
+    use common_meta::cache::LayeredCacheRegistryBuilder;
+    use common_meta::kv_backend::memory::MemoryKvBackend;
+    use common_meta::procedure_executor::{ExecutorContext, ProcedureExecutor};
+    use common_meta::rpc::ddl::{DdlTask, SubmitDdlTaskRequest, SubmitDdlTaskResponse};
+    use common_meta::rpc::procedure::{
+        MigrateRegionRequest, MigrateRegionResponse, ProcedureStateResponse,
+    };
+    use common_query::prelude::greptime_value;
+    use common_query::{Output, OutputMeta};
+    use common_recordbatch::{
+        OrderOption, RecordBatch, RecordBatchStream, SendableRecordBatchStream,
+    };
+    use common_telemetry::logging::SlowQueriesRecordType;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion_expr::dml::InsertOp;
+    use datafusion_expr::{LogicalPlanBuilder, LogicalTableSource};
+    use datatypes::prelude::ConcreteDataType;
+    use datatypes::schema::{ColumnSchema, Schema as GtSchema, SchemaRef as GtSchemaRef};
+    use datatypes::vectors::{
+        Float64Vector, StringVector, TimestampMillisecondVector, TimestampNanosecondVector,
+        VectorRef,
+    };
+    use log_query::LogQuery;
+    use prost::Message;
     use query::query_engine::options::QueryOptions;
-    use session::context::QueryContext;
+    use servers::query_handler::{
+        DashboardHandler, JaegerQueryHandler, LogQueryHandler, PipelineHandler, PipelineHandlerRef,
+        PromStoreProtocolHandler,
+    };
+    use session::context::{Channel, ConnInfo, QueryContext, QueryContextBuilder};
+    use snafu::{Location, Snafu};
     use sql::dialect::GreptimeDbDialect;
+    use store_api::data_source::DataSource;
+    use store_api::metric_engine_consts::{
+        LOGICAL_TABLE_METADATA_KEY, METRIC_ENGINE_NAME, PHYSICAL_TABLE_METADATA_KEY,
+    };
+    use store_api::storage::ScanRequest;
     use strfmt::Format;
+    use table::metadata::{
+        FilterPushDownType, TableInfo, TableInfoBuilder, TableMetaBuilder, TableType,
+    };
+    use table::table_name::TableName;
+    use table::test_util::{EmptyTable, MemTable};
+    use table::{Table, TableRef};
+    use tokio::sync::{mpsc, oneshot};
+    use tower::ServiceExt;
 
     use super::*;
+    use crate::frontend::FrontendOptions;
+    use crate::instance::builder::FrontendBuilder;
+
+    fn parse_test_sql(sql: &str) -> Vec<Statement> {
+        parse_stmt(sql, &GreptimeDbDialect {}).unwrap()
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingSlowQueryEventRecorder {
+        payloads: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl EventRecorder for RecordingSlowQueryEventRecorder {
+        fn record(&self, event: Box<dyn Event>) {
+            let event = event
+                .as_any()
+                .downcast_ref::<SlowQueryEvent>()
+                .expect("expected a slow query event");
+            self.payloads.lock().unwrap().push(event.payload.clone());
+        }
+
+        fn event_type_filter(&self) -> EventTypeFilterRef {
+            Arc::new(EventTypeFilter::All)
+        }
+
+        fn close(&self) {}
+    }
 
     #[test]
-    fn test_fast_legacy_check_deadlock_prevention() {
-        // Create a DashMap to simulate the cache
-        let cache = DashMap::new();
+    fn test_validate_analyze_stream_statement_strictness() {
+        for sql in [
+            "select 1",
+            "explain analyze select 1",
+            "explain analyze verbose format text select 1",
+            "explain analyze verbose format graphviz select 1",
+        ] {
+            let mut stmts = parse_test_sql(sql);
+            assert!(
+                validate_analyze_stream_statement(&mut stmts[0]).is_err(),
+                "{sql}"
+            );
+        }
 
-        // Pre-populate cache with some entries
-        cache.insert("metric1".to_string(), true); // legacy mode
-        cache.insert("metric2".to_string(), false); // prom mode
-        cache.insert("metric3".to_string(), true); // legacy mode
+        for sql in [
+            "explain analyze verbose select 1",
+            "explain analyze verbose format json select 1",
+        ] {
+            let mut stmts = parse_test_sql(sql);
+            assert!(
+                validate_analyze_stream_statement(&mut stmts[0]).is_ok(),
+                "{sql}"
+            );
+            let Statement::Explain(explain) = &stmts[0] else {
+                unreachable!();
+            };
+            assert!(explain.format.is_none());
+        }
 
-        // Test case 1: Normal operation with cache hits
-        let metric1 = "metric1".to_string();
-        let metric4 = "metric4".to_string();
-        let names1 = vec![&metric1, &metric4];
-        let result = fast_legacy_check(&cache, &names1);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some(true)); // should return legacy mode
+        assert_eq!(
+            parse_test_sql("explain analyze verbose select 1; select 2").len(),
+            2
+        );
 
-        // Verify that metric4 was added to cache
-        assert!(cache.contains_key("metric4"));
-        assert!(*cache.get("metric4").unwrap().value());
+        assert!(is_explain_analyze_verbose(
+            &parse_test_sql("explain analyze verbose select 1")[0]
+        ));
+        for sql in [
+            "select 1",
+            "explain select 1",
+            "explain analyze select 1",
+            "explain verbose select 1",
+        ] {
+            assert!(
+                !is_explain_analyze_verbose(&parse_test_sql(sql)[0]),
+                "{sql}"
+            );
+        }
+    }
 
-        // Test case 2: No cache hits
-        let metric5 = "metric5".to_string();
-        let metric6 = "metric6".to_string();
-        let names2 = vec![&metric5, &metric6];
-        let result = fast_legacy_check(&cache, &names2);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), None); // should return None as no cache hits
+    #[derive(Debug, Snafu)]
+    enum TestError {
+        #[snafu(display("Failed to build test cache registry"))]
+        BuildCacheRegistry {
+            source: cache::error::Error,
+            #[snafu(implicit)]
+            location: Location,
+        },
 
-        // Test case 3: Incompatible modes should return error
-        let cache_incompatible = DashMap::new();
-        cache_incompatible.insert("metric1".to_string(), true); // legacy
-        cache_incompatible.insert("metric2".to_string(), false); // prom
-        let metric1_test = "metric1".to_string();
-        let metric2_test = "metric2".to_string();
-        let names3 = vec![&metric1_test, &metric2_test];
-        let result = fast_legacy_check(&cache_incompatible, &names3);
-        assert!(result.is_err()); // should error due to incompatible modes
+        #[snafu(display("Failed to build test table meta for table: {table_name}"))]
+        BuildTableMeta {
+            table_name: String,
+            source: table::metadata::TableMetaBuilderError,
+            #[snafu(implicit)]
+            location: Location,
+        },
 
-        // Test case 4: Intensive concurrent access to test deadlock prevention
-        // This test specifically targets the scenario where multiple threads
-        // access the same cache entries simultaneously
-        let cache_concurrent = Arc::new(DashMap::new());
-        cache_concurrent.insert("shared_metric".to_string(), true);
+        #[snafu(display("Failed to build test table info for table: {table_name}"))]
+        BuildTableInfo {
+            table_name: String,
+            source: table::metadata::TableInfoBuilderError,
+            #[snafu(implicit)]
+            location: Location,
+        },
 
-        let num_threads = 8;
-        let operations_per_thread = 100;
-        let barrier = Arc::new(Barrier::new(num_threads));
-        let success_flag = Arc::new(AtomicBool::new(true));
+        #[snafu(display("Failed to register test table: {table_name}"))]
+        RegisterTable {
+            table_name: String,
+            source: catalog::error::Error,
+            #[snafu(implicit)]
+            location: Location,
+        },
 
-        let handles: Vec<_> = (0..num_threads)
-            .map(|thread_id| {
-                let cache_clone = Arc::clone(&cache_concurrent);
-                let barrier_clone = Arc::clone(&barrier);
-                let success_flag_clone = Arc::clone(&success_flag);
+        #[snafu(display("Failed to build test frontend instance"))]
+        BuildFrontend {
+            source: crate::error::Error,
+            #[snafu(implicit)]
+            location: Location,
+        },
 
-                thread::spawn(move || {
-                    // Wait for all threads to be ready
-                    barrier_clone.wait();
+        #[snafu(display("Expected exactly one output for SQL `{sql}`, got {actual}"))]
+        UnexpectedOutputCount {
+            sql: String,
+            actual: usize,
+            #[snafu(implicit)]
+            location: Location,
+        },
 
-                    let start_time = Instant::now();
-                    for i in 0..operations_per_thread {
-                        // Each operation references existing cache entry and adds new ones
-                        let shared_metric = "shared_metric".to_string();
-                        let new_metric = format!("thread_{}_metric_{}", thread_id, i);
-                        let names = vec![&shared_metric, &new_metric];
+        #[snafu(display("Failed to execute SQL `{sql}`"))]
+        ExecuteSql {
+            sql: String,
+            source: crate::error::Error,
+            #[snafu(implicit)]
+            location: Location,
+        },
 
-                        match fast_legacy_check(&cache_clone, &names) {
-                            Ok(_) => {}
-                            Err(_) => {
-                                success_flag_clone.store(false, Ordering::Relaxed);
-                                return;
-                            }
-                        }
+        #[snafu(display("Timed out waiting for insert-select start notification"))]
+        InsertStartTimeout {
+            source: tokio::time::error::Elapsed,
+            #[snafu(implicit)]
+            location: Location,
+        },
 
-                        // If the test takes too long, it likely means deadlock
-                        if start_time.elapsed() > Duration::from_secs(10) {
-                            success_flag_clone.store(false, Ordering::Relaxed);
-                            return;
-                        }
-                    }
-                })
+        #[snafu(display("Insert-select start notification channel closed"))]
+        InsertStartChannelClosed {
+            #[snafu(implicit)]
+            location: Location,
+        },
+
+        #[snafu(display("Failed to release blocking insert-select interceptor"))]
+        ReleaseBlockedInsert {
+            #[snafu(implicit)]
+            location: Location,
+        },
+
+        #[snafu(display("Timed out waiting for insert-select source to be polled"))]
+        SourcePollTimeout {
+            source: tokio::time::error::Elapsed,
+            #[snafu(implicit)]
+            location: Location,
+        },
+
+        #[snafu(display("Insert-select source poll notification channel closed"))]
+        SourcePollChannelClosed {
+            source: oneshot::error::RecvError,
+            #[snafu(implicit)]
+            location: Location,
+        },
+
+        #[snafu(display("Timed out waiting for insert task to finish"))]
+        InsertTaskTimeout {
+            source: tokio::time::error::Elapsed,
+            #[snafu(implicit)]
+            location: Location,
+        },
+
+        #[snafu(display("Insert task panicked"))]
+        InsertTaskPanic {
+            source: tokio::task::JoinError,
+            #[snafu(implicit)]
+            location: Location,
+        },
+
+        #[snafu(display("Expected insert-select to be cancelled"))]
+        InsertSelectNotCancelled {
+            #[snafu(implicit)]
+            location: Location,
+        },
+    }
+
+    type TestResult<T> = std::result::Result<T, TestError>;
+
+    fn parse_one_sql(sql: &str) -> Statement {
+        parse_stmt(sql, &GreptimeDbDialect {}).unwrap().remove(0)
+    }
+
+    fn test_query_ctx(process_id: u32) -> QueryContextRef {
+        Arc::new(
+            QueryContextBuilder::default()
+                .channel(Channel::Mysql)
+                .conn_info(ConnInfo::new(None, Channel::Mysql))
+                .process_id(process_id)
+                .build(),
+        )
+    }
+
+    #[derive(Debug)]
+    struct AdminUserInfo;
+
+    impl UserInfo for AdminUserInfo {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn username(&self) -> &str {
+            "admin"
+        }
+
+        fn is_admin(&self) -> bool {
+            true
+        }
+    }
+
+    struct RejectUnresolvedPermissionChecker;
+
+    impl PermissionChecker for RejectUnresolvedPermissionChecker {
+        fn check_permission(
+            &self,
+            _user_info: UserInfoRef,
+            _req: PermissionReq,
+        ) -> auth::error::Result<PermissionResp> {
+            Ok(PermissionResp::Allow)
+        }
+
+        fn check_permission_with_table_targets(
+            &self,
+            _user_info: UserInfoRef,
+            _req: PermissionReq,
+            targets: PermissionTableTargets,
+        ) -> auth::error::Result<PermissionResp> {
+            let reject = match targets {
+                PermissionTableTargets::Unresolved => true,
+                PermissionTableTargets::Resolved(targets) => {
+                    targets.iter().any(|target| target.table == "denied")
+                }
+            };
+            Ok(if reject {
+                PermissionResp::Reject
+            } else {
+                PermissionResp::Allow
             })
-            .collect();
+        }
+    }
 
-        // Join all threads with timeout
-        let start_time = Instant::now();
-        for (i, handle) in handles.into_iter().enumerate() {
-            let join_result = handle.join();
+    #[derive(Debug, PartialEq, Eq)]
+    struct CheckedAction {
+        action: PermissionAction,
+        targets: Option<PermissionTableTargets>,
+    }
 
-            // Check if we're taking too long (potential deadlock)
-            if start_time.elapsed() > Duration::from_secs(30) {
-                panic!("Test timed out - possible deadlock detected!");
+    #[derive(Default)]
+    struct RejectEndpointPermissionChecker {
+        checks: std::sync::Mutex<Vec<CheckedAction>>,
+    }
+
+    impl RejectEndpointPermissionChecker {
+        fn reject(
+            &self,
+            action: PermissionAction,
+            targets: Option<PermissionTableTargets>,
+        ) -> PermissionResp {
+            self.checks
+                .lock()
+                .unwrap()
+                .push(CheckedAction { action, targets });
+            PermissionResp::Reject
+        }
+
+        fn take_check(&self) -> CheckedAction {
+            let mut checks = self.checks.lock().unwrap();
+            assert_eq!(1, checks.len());
+            checks.pop().unwrap()
+        }
+    }
+
+    impl PermissionChecker for RejectEndpointPermissionChecker {
+        fn check_permission(
+            &self,
+            _user_info: UserInfoRef,
+            req: PermissionReq,
+        ) -> auth::error::Result<PermissionResp> {
+            Ok(match req {
+                PermissionReq::Action(action) => self.reject(action, None),
+                _ => PermissionResp::Allow,
+            })
+        }
+
+        fn check_permission_with_table_targets(
+            &self,
+            _user_info: UserInfoRef,
+            req: PermissionReq,
+            targets: PermissionTableTargets,
+        ) -> auth::error::Result<PermissionResp> {
+            Ok(match req {
+                PermissionReq::Action(action) => self.reject(action, Some(targets)),
+                _ => PermissionResp::Allow,
+            })
+        }
+    }
+
+    struct WriteOnlyPermissionChecker;
+
+    impl PermissionChecker for WriteOnlyPermissionChecker {
+        fn check_permission(
+            &self,
+            _user_info: UserInfoRef,
+            req: PermissionReq,
+        ) -> auth::error::Result<PermissionResp> {
+            Ok(if req.is_readonly() {
+                PermissionResp::Reject
+            } else {
+                PermissionResp::Allow
+            })
+        }
+
+        fn check_permission_with_table_targets(
+            &self,
+            user_info: UserInfoRef,
+            req: PermissionReq,
+            _targets: PermissionTableTargets,
+        ) -> auth::error::Result<PermissionResp> {
+            self.check_permission(user_info, req)
+        }
+    }
+
+    #[derive(Default)]
+    struct TargetIndependentPermissionChecker {
+        checks: atomic::AtomicUsize,
+    }
+
+    impl PermissionChecker for TargetIndependentPermissionChecker {
+        fn check_permission(
+            &self,
+            _user_info: UserInfoRef,
+            _req: PermissionReq,
+        ) -> auth::error::Result<PermissionResp> {
+            self.checks.fetch_add(1, atomic::Ordering::Relaxed);
+            Ok(PermissionResp::Allow)
+        }
+
+        fn uses_table_targets(&self) -> bool {
+            false
+        }
+
+        fn check_permission_with_table_targets(
+            &self,
+            user_info: UserInfoRef,
+            req: PermissionReq,
+            _targets: PermissionTableTargets,
+        ) -> auth::error::Result<PermissionResp> {
+            self.check_permission(user_info, req)
+        }
+    }
+
+    struct BlockingInsertSelectInterceptor {
+        started_tx: mpsc::UnboundedSender<()>,
+        finish_rx: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    impl BlockingInsertSelectInterceptor {
+        fn new(started_tx: mpsc::UnboundedSender<()>, finish_rx: oneshot::Receiver<()>) -> Self {
+            Self {
+                started_tx,
+                finish_rx: std::sync::Mutex::new(Some(finish_rx)),
+            }
+        }
+    }
+
+    impl SqlQueryInterceptor for BlockingInsertSelectInterceptor {
+        type Error = Error;
+
+        fn pre_execute(
+            &self,
+            statement: Option<&Statement>,
+            _plan: Option<&LogicalPlan>,
+            _query_ctx: QueryContextRef,
+        ) -> Result<()> {
+            let Some(Statement::Insert(insert)) = statement else {
+                return Ok(());
+            };
+            if !insert.has_non_values_query_source() {
+                return Ok(());
             }
 
-            if join_result.is_err() {
-                panic!("Thread {} panicked during execution", i);
+            let finish_rx = self.finish_rx.lock().unwrap().take().unwrap();
+            let _ = self.started_tx.send(());
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(finish_rx)
+                    .unwrap();
+            });
+            Ok(())
+        }
+    }
+
+    struct PendingRecordBatchStream {
+        schema: GtSchemaRef,
+        polled_tx: Option<oneshot::Sender<()>>,
+        _finish_tx: oneshot::Sender<()>,
+        finish_rx: Pin<Box<oneshot::Receiver<()>>>,
+    }
+
+    impl RecordBatchStream for PendingRecordBatchStream {
+        fn schema(&self) -> GtSchemaRef {
+            self.schema.clone()
+        }
+
+        fn output_ordering(&self) -> Option<&[OrderOption]> {
+            None
+        }
+
+        fn metrics(&self) -> Option<common_recordbatch::adapter::RecordBatchMetrics> {
+            None
+        }
+    }
+
+    impl Stream for PendingRecordBatchStream {
+        type Item = common_recordbatch::error::Result<RecordBatch>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(polled_tx) = self.polled_tx.take() {
+                let _ = polled_tx.send(());
+            }
+
+            match self.finish_rx.as_mut().poll(cx) {
+                Poll::Ready(_) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl Unpin for PendingRecordBatchStream {}
+
+    #[test]
+    fn test_record_explain_analyze_timeout_uses_empty_metrics_without_plan() {
+        let event_recorder = Arc::new(RecordingSlowQueryEventRecorder::default());
+        let timer = SlowQueryTimer::new(
+            QueryStatement::Plan("EXPLAIN ANALYZE VERBOSE SELECT 1".to_string()),
+            "public".to_string(),
+            Duration::from_secs(3600),
+            0.0,
+            SlowQueriesRecordType::SystemTable,
+            event_recorder.clone(),
+        );
+        let timeout_recorder = timer.recorder();
+
+        record_explain_analyze_timeout(Some(&timeout_recorder), None);
+        drop(timer);
+
+        let payloads = event_recorder.payloads.lock().unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["timed_out"], true);
+        assert_eq!(payloads[0]["metrics"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_attach_timeout_records_explain_analyze_metrics() {
+        let event_recorder = Arc::new(RecordingSlowQueryEventRecorder::default());
+        let timer = SlowQueryTimer::new(
+            QueryStatement::Plan("EXPLAIN ANALYZE VERBOSE SELECT 1".to_string()),
+            "public".to_string(),
+            Duration::from_secs(3600),
+            0.0,
+            SlowQueriesRecordType::SystemTable,
+            event_recorder.clone(),
+        );
+        let timeout_recorder = timer.recorder();
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let stream = PendingRecordBatchStream {
+            schema: Arc::new(GtSchema::new(vec![])),
+            polled_tx: None,
+            _finish_tx: finish_tx,
+            finish_rx: Box::pin(finish_rx),
+        };
+        let output = Output::new(
+            OutputData::Stream(Box::pin(stream)),
+            OutputMeta::new_with_plan(plan),
+        );
+        let output =
+            attach_timeout(output, Duration::from_millis(10), Some(timeout_recorder)).unwrap();
+        let OutputData::Stream(mut stream) = output.data else {
+            unreachable!();
+        };
+
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(err.to_string(), "Stream timeout");
+        drop(stream);
+        drop(timer);
+
+        let payloads = event_recorder.payloads.lock().unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["timed_out"], true);
+        assert!(
+            payloads[0]["metrics"]
+                .as_array()
+                .is_some_and(|metrics| !metrics.is_empty())
+        );
+    }
+
+    struct PendingDataSource {
+        schema: GtSchemaRef,
+        polled_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    impl DataSource for PendingDataSource {
+        fn get_stream(
+            &self,
+            _request: ScanRequest,
+        ) -> std::result::Result<SendableRecordBatchStream, BoxedError> {
+            let (finish_tx, finish_rx) = oneshot::channel();
+            let mut polled_tx = self.polled_tx.lock().map_err(|_| {
+                BoxedError::new(PlainError::new(
+                    "pending data source lock poisoned".to_string(),
+                    StatusCode::Unexpected,
+                ))
+            })?;
+            Ok(Box::pin(PendingRecordBatchStream {
+                schema: self.schema.clone(),
+                polled_tx: polled_tx.take(),
+                _finish_tx: finish_tx,
+                finish_rx: Box::pin(finish_rx),
+            }))
+        }
+    }
+
+    struct NoopProcedureExecutor;
+
+    #[async_trait::async_trait]
+    impl ProcedureExecutor for NoopProcedureExecutor {
+        async fn submit_ddl_task(
+            &self,
+            _ctx: ExecutorContext,
+            _request: SubmitDdlTaskRequest,
+        ) -> common_meta::error::Result<SubmitDdlTaskResponse> {
+            common_meta::error::UnsupportedSnafu {
+                operation: "submit_ddl_task",
+            }
+            .fail()
+        }
+
+        async fn migrate_region(
+            &self,
+            _ctx: &ExecutorContext,
+            _request: MigrateRegionRequest,
+        ) -> common_meta::error::Result<MigrateRegionResponse> {
+            common_meta::error::UnsupportedSnafu {
+                operation: "migrate_region",
+            }
+            .fail()
+        }
+
+        async fn reconcile(
+            &self,
+            _ctx: &ExecutorContext,
+            _request: ReconcileRequest,
+        ) -> common_meta::error::Result<ReconcileResponse> {
+            common_meta::error::UnsupportedSnafu {
+                operation: "reconcile",
+            }
+            .fail()
+        }
+
+        async fn query_procedure_state(
+            &self,
+            _ctx: &ExecutorContext,
+            _pid: &str,
+        ) -> common_meta::error::Result<ProcedureStateResponse> {
+            common_meta::error::UnsupportedSnafu {
+                operation: "query_procedure_state",
+            }
+            .fail()
+        }
+
+        async fn list_procedures(
+            &self,
+            _ctx: &ExecutorContext,
+        ) -> common_meta::error::Result<ProcedureDetailResponse> {
+            common_meta::error::UnsupportedSnafu {
+                operation: "list_procedures",
+            }
+            .fail()
+        }
+    }
+
+    /// A test [`ProcedureExecutor`] that completes create/drop DDL tasks against the
+    /// in-memory catalog, mimicking what the meta DDL procedures do in production.
+    /// This allows happy-path DDL requests (create/drop table/view) to be exercised
+    /// end to end through the gRPC ingress.
+    struct MockProcedureExecutor {
+        catalog_manager: Arc<catalog::memory::MemoryCatalogManager>,
+        next_table_id: std::sync::atomic::AtomicU32,
+        submitted: std::sync::Mutex<Vec<DdlTask>>,
+    }
+
+    impl MockProcedureExecutor {
+        fn new(catalog_manager: Arc<catalog::memory::MemoryCatalogManager>) -> Self {
+            Self {
+                catalog_manager,
+                next_table_id: std::sync::atomic::AtomicU32::new(1026),
+                submitted: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcedureExecutor for MockProcedureExecutor {
+        async fn submit_ddl_task(
+            &self,
+            _ctx: ExecutorContext,
+            request: SubmitDdlTaskRequest,
+        ) -> common_meta::error::Result<SubmitDdlTaskResponse> {
+            self.submitted.lock().unwrap().push(request.task.clone());
+            match request.task {
+                DdlTask::CreateTable(task) => {
+                    let table_id = self
+                        .next_table_id
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut table_info = task.table_info;
+                    table_info.ident.table_id = table_id;
+                    self.catalog_manager
+                        .register_table_sync(catalog::RegisterTableRequest {
+                            catalog: table_info.catalog_name.clone(),
+                            schema: table_info.schema_name.clone(),
+                            table_name: table_info.name.clone(),
+                            table_id,
+                            table: table::dist_table::DistTable::table(Arc::new(table_info)),
+                        })
+                        .map_err(BoxedError::new)
+                        .context(common_meta::error::ExternalSnafu)?;
+                    Ok(SubmitDdlTaskResponse {
+                        key: Vec::new(),
+                        table_ids: vec![table_id],
+                    })
+                }
+                DdlTask::CreateView(task) => {
+                    let view_id = self
+                        .next_table_id
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut view_info = task.view_info;
+                    view_info.ident.table_id = view_id;
+                    self.catalog_manager
+                        .register_table_sync(catalog::RegisterTableRequest {
+                            catalog: task.create_view.catalog_name.clone(),
+                            schema: task.create_view.schema_name.clone(),
+                            table_name: task.create_view.view_name.clone(),
+                            table_id: view_id,
+                            table: table::dist_table::DistTable::table(Arc::new(view_info)),
+                        })
+                        .map_err(BoxedError::new)
+                        .context(common_meta::error::ExternalSnafu)?;
+                    Ok(SubmitDdlTaskResponse {
+                        key: Vec::new(),
+                        table_ids: vec![view_id],
+                    })
+                }
+                DdlTask::DropView(task) => {
+                    self.catalog_manager
+                        .deregister_table_sync(catalog::DeregisterTableRequest {
+                            catalog: task.catalog.clone(),
+                            schema: task.schema.clone(),
+                            table_name: task.view.clone(),
+                        })
+                        .map_err(BoxedError::new)
+                        .context(common_meta::error::ExternalSnafu)?;
+                    Ok(SubmitDdlTaskResponse::default())
+                }
+                other => common_meta::error::UnsupportedSnafu {
+                    operation: format!("mock submit_ddl_task: {other:?}"),
+                }
+                .fail(),
             }
         }
 
-        // Verify all operations completed successfully
-        assert!(
-            success_flag.load(Ordering::Relaxed),
-            "Some operations failed"
+        async fn migrate_region(
+            &self,
+            _ctx: &ExecutorContext,
+            _request: MigrateRegionRequest,
+        ) -> common_meta::error::Result<MigrateRegionResponse> {
+            common_meta::error::UnsupportedSnafu {
+                operation: "migrate_region",
+            }
+            .fail()
+        }
+
+        async fn reconcile(
+            &self,
+            _ctx: &ExecutorContext,
+            _request: ReconcileRequest,
+        ) -> common_meta::error::Result<ReconcileResponse> {
+            common_meta::error::UnsupportedSnafu {
+                operation: "reconcile",
+            }
+            .fail()
+        }
+
+        async fn query_procedure_state(
+            &self,
+            _ctx: &ExecutorContext,
+            _pid: &str,
+        ) -> common_meta::error::Result<ProcedureStateResponse> {
+            common_meta::error::UnsupportedSnafu {
+                operation: "query_procedure_state",
+            }
+            .fail()
+        }
+
+        async fn list_procedures(
+            &self,
+            _ctx: &ExecutorContext,
+        ) -> common_meta::error::Result<ProcedureDetailResponse> {
+            common_meta::error::UnsupportedSnafu {
+                operation: "list_procedures",
+            }
+            .fail()
+        }
+    }
+
+    fn test_cache_registry(
+        kv_backend: common_meta::kv_backend::KvBackendRef,
+    ) -> TestResult<common_meta::cache::LayeredCacheRegistryRef> {
+        Ok(Arc::new(
+            cache::with_default_composite_cache_registry(
+                LayeredCacheRegistryBuilder::default()
+                    .add_cache_registry(cache::build_fundamental_cache_registry(kv_backend)),
+            )
+            .context(BuildCacheRegistrySnafu)?
+            .build(),
+        ))
+    }
+
+    fn test_table_info(table_id: u32, table_name: &str) -> TestResult<TableInfo> {
+        let schema = Arc::new(GtSchema::new(vec![
+            ColumnSchema::new("id", ConcreteDataType::int32_datatype(), false),
+            ColumnSchema::new(
+                "ts",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            )
+            .with_time_index(true),
+        ]));
+        let table_meta = TableMetaBuilder::empty()
+            .schema(schema)
+            .primary_key_indices(vec![0])
+            .value_indices(vec![1])
+            .next_column_id(1024)
+            .build()
+            .with_context(|_| BuildTableMetaSnafu {
+                table_name: table_name.to_string(),
+            })?;
+
+        TableInfoBuilder::new(table_name, table_meta)
+            .table_id(table_id)
+            .build()
+            .with_context(|_| BuildTableInfoSnafu {
+                table_name: table_name.to_string(),
+            })
+    }
+
+    fn test_table(table_id: u32, table_name: &str) -> TestResult<table::TableRef> {
+        let table_info = test_table_info(table_id, table_name)?;
+        Ok(EmptyTable::from_table_info(&table_info))
+    }
+
+    fn test_physical_table(table_id: u32, table_name: &str) -> TestResult<table::TableRef> {
+        let mut table_info = test_table_info(table_id, table_name)?;
+        table_info
+            .meta
+            .options
+            .extra_options
+            .insert(PHYSICAL_TABLE_METADATA_KEY.to_string(), String::new());
+        Ok(EmptyTable::from_table_info(&table_info))
+    }
+
+    fn test_logical_table(table_id: u32, table_name: &str) -> TestResult<table::TableRef> {
+        let mut table_info = test_table_info(table_id, table_name)?;
+        table_info.meta.engine = METRIC_ENGINE_NAME.to_string();
+        table_info.meta.options.extra_options.insert(
+            LOGICAL_TABLE_METADATA_KEY.to_string(),
+            "physical_metric".to_string(),
+        );
+        Ok(EmptyTable::from_table_info(&table_info))
+    }
+
+    fn test_metric_names_table() -> TableRef {
+        let schema = Arc::new(GtSchema::new(vec![
+            ColumnSchema::new("table_catalog", ConcreteDataType::string_datatype(), false),
+            ColumnSchema::new("table_schema", ConcreteDataType::string_datatype(), false),
+            ColumnSchema::new("table_name", ConcreteDataType::string_datatype(), false),
+            ColumnSchema::new("engine", ConcreteDataType::string_datatype(), false),
+            ColumnSchema::new("create_options", ConcreteDataType::string_datatype(), false),
+        ]));
+        let columns: Vec<VectorRef> = vec![
+            Arc::new(StringVector::from(vec!["greptime", "greptime"])),
+            Arc::new(StringVector::from(vec!["public", "public"])),
+            Arc::new(StringVector::from(vec!["denied", "target"])),
+            Arc::new(StringVector::from(vec!["metric", "metric"])),
+            Arc::new(StringVector::from(vec![
+                "on_physical_table=physical_metric",
+                "on_physical_table=physical_metric",
+            ])),
+        ];
+        let record_batch = RecordBatch::new(schema, columns).unwrap();
+        MemTable::new_with_catalog(
+            "tables",
+            record_batch,
+            2048,
+            "greptime".to_string(),
+            "information_schema".to_string(),
+        )
+    }
+
+    fn test_pipeline_table() -> TableRef {
+        let schema = Arc::new(GtSchema::new(vec![
+            ColumnSchema::new("name", ConcreteDataType::string_datatype(), false),
+            ColumnSchema::new("schema", ConcreteDataType::string_datatype(), false),
+            ColumnSchema::new("content_type", ConcreteDataType::string_datatype(), false),
+            ColumnSchema::new("pipeline", ConcreteDataType::string_datatype(), false),
+            ColumnSchema::new(
+                "created_at",
+                ConcreteDataType::timestamp_nanosecond_datatype(),
+                false,
+            )
+            .with_time_index(true),
+        ]));
+        let columns: Vec<VectorRef> = vec![
+            Arc::new(StringVector::from(vec!["pipeline"])),
+            Arc::new(StringVector::from(vec!["public"])),
+            Arc::new(StringVector::from(vec!["application/yaml"])),
+            Arc::new(StringVector::from(vec![
+                "transform:\n- field: ts\n  type: timestamp, ns\n  index: time\n",
+            ])),
+            Arc::new(TimestampNanosecondVector::from_values([1])),
+        ];
+        let record_batch = RecordBatch::new(schema, columns).unwrap();
+        MemTable::new_with_catalog(
+            "pipelines",
+            record_batch,
+            2049,
+            "greptime".to_string(),
+            DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+        )
+    }
+
+    fn pending_table(
+        table_id: u32,
+        table_name: &str,
+        polled_tx: oneshot::Sender<()>,
+    ) -> TestResult<table::TableRef> {
+        let table_info = test_table_info(table_id, table_name)?;
+        let data_source = Arc::new(PendingDataSource {
+            schema: table_info.meta.schema.clone(),
+            polled_tx: std::sync::Mutex::new(Some(polled_tx)),
+        });
+
+        Ok(Arc::new(Table::new(
+            Arc::new(table_info),
+            FilterPushDownType::Unsupported,
+            data_source,
+        )))
+    }
+
+    async fn test_instance_with_tables(
+        source_table: TableRef,
+        target_table: TableRef,
+    ) -> TestResult<Instance> {
+        test_instance_with_plugins(source_table, target_table, Plugins::new()).await
+    }
+
+    async fn test_instance_with_insert_select_interceptor(
+        interceptor: SqlQueryInterceptorRef<Error>,
+    ) -> TestResult<Instance> {
+        let plugins = Plugins::new();
+        plugins.insert::<SqlQueryInterceptorRef<Error>>(interceptor);
+
+        test_instance_with_plugins(
+            test_table(1024, "source")?,
+            test_table(1025, "target")?,
+            plugins,
+        )
+        .await
+    }
+
+    async fn test_instance_with_plugins(
+        source_table: TableRef,
+        target_table: TableRef,
+        plugins: Plugins,
+    ) -> TestResult<Instance> {
+        test_instance_with_plugins_and_metric_names(source_table, target_table, plugins, None).await
+    }
+
+    async fn test_instance_with_plugins_and_metric_names(
+        source_table: TableRef,
+        target_table: TableRef,
+        plugins: Plugins,
+        metric_names_table: Option<TableRef>,
+    ) -> TestResult<Instance> {
+        let catalog_manager = catalog::memory::MemoryCatalogManager::new_with_table(source_table);
+        test_instance_with_catalog_manager(
+            catalog_manager,
+            target_table,
+            plugins,
+            metric_names_table,
+            Arc::new(NoopProcedureExecutor),
+        )
+        .await
+    }
+
+    /// Builds a test frontend `Instance` over the given (already source-registered)
+    /// catalog manager, completing DDL tasks through `procedure_executor`.
+    async fn test_instance_with_catalog_manager(
+        catalog_manager: Arc<catalog::memory::MemoryCatalogManager>,
+        target_table: TableRef,
+        plugins: Plugins,
+        metric_names_table: Option<TableRef>,
+        procedure_executor: ProcedureExecutorRef,
+    ) -> TestResult<Instance> {
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let process_manager = Arc::new(ProcessManager::new("test-frontend".to_string(), None));
+        let target_table_name = "target";
+        catalog_manager
+            .register_table_sync(catalog::RegisterTableRequest {
+                catalog: "greptime".to_string(),
+                schema: "public".to_string(),
+                table_name: target_table_name.to_string(),
+                table_id: 1025,
+                table: target_table,
+            })
+            .with_context(|_| RegisterTableSnafu {
+                table_name: target_table_name.to_string(),
+            })?;
+        if let Some(table) = metric_names_table {
+            catalog_manager
+                .deregister_table_sync(catalog::DeregisterTableRequest {
+                    catalog: "greptime".to_string(),
+                    schema: "information_schema".to_string(),
+                    table_name: "tables".to_string(),
+                })
+                .unwrap();
+            catalog_manager
+                .register_table_sync(catalog::RegisterTableRequest {
+                    catalog: "greptime".to_string(),
+                    schema: "information_schema".to_string(),
+                    table_name: "tables".to_string(),
+                    table_id: 2048,
+                    table,
+                })
+                .unwrap();
+        }
+        catalog_manager.register_process_list_table(process_manager.clone());
+
+        let cache_registry = test_cache_registry(kv_backend.clone())?;
+
+        FrontendBuilder::new(
+            FrontendOptions::default(),
+            kv_backend,
+            cache_registry,
+            catalog_manager,
+            Arc::new(client::client_manager::NodeClients::default()),
+            procedure_executor,
+            process_manager,
+        )
+        .with_plugin(plugins)
+        .try_build()
+        .await
+        .context(BuildFrontendSnafu)
+    }
+
+    async fn execute_one_sql(
+        instance: &Instance,
+        sql: &str,
+        query_ctx: QueryContextRef,
+    ) -> TestResult<Output> {
+        let mut results = instance.do_query_inner(sql, query_ctx).await;
+        ensure!(
+            results.len() == 1,
+            UnexpectedOutputCountSnafu {
+                sql: sql.to_string(),
+                actual: results.len(),
+            }
+        );
+        results.remove(0).with_context(|_| ExecuteSqlSnafu {
+            sql: sql.to_string(),
+        })
+    }
+
+    fn assert_permission_denied<T>(result: servers::error::Result<T>) {
+        let err = match result {
+            Ok(_) => panic!("request should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(StatusCode::PermissionDenied, err.status_code());
+    }
+
+    fn assert_action_checked(
+        checker: &RejectEndpointPermissionChecker,
+        action: PermissionAction,
+        targets: Option<PermissionTableTargets>,
+    ) {
+        assert_eq!(CheckedAction { action, targets }, checker.take_check());
+    }
+
+    #[tokio::test]
+    async fn test_prom_remote_read_with_custom_timestamp_and_value_columns() -> TestResult<()> {
+        let schema = Arc::new(GtSchema::new(vec![
+            ColumnSchema::new(
+                "custom_ts",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            )
+            .with_time_index(true),
+            ColumnSchema::new("custom_value", ConcreteDataType::float64_datatype(), false),
+        ]));
+        let recordbatch = RecordBatch::new(
+            schema,
+            vec![
+                Arc::new(TimestampMillisecondVector::from_vec(vec![1000, 2000, 3000])) as VectorRef,
+                Arc::new(Float64Vector::from_vec(vec![1.0, 2.0, 3.0])) as VectorRef,
+            ],
+        )
+        .unwrap();
+        let instance = test_instance_with_tables(
+            MemTable::table("custom_metric", recordbatch),
+            test_table(1025, "target")?,
+        )
+        .await?;
+
+        let response = PromStoreProtocolHandler::read(
+            &instance,
+            ReadRequest {
+                queries: vec![RemoteQuery {
+                    start_timestamp_ms: 1500,
+                    end_timestamp_ms: 2500,
+                    matchers: vec![LabelMatcher {
+                        r#type: PromMatcherType::Eq as i32,
+                        name: servers::prom_store::METRIC_NAME_LABEL.to_string(),
+                        value: "custom_metric".to_string(),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            test_query_ctx(1),
+        )
+        .await
+        .unwrap();
+        let body = servers::prom_store::snappy_decompress(&response.body).unwrap();
+        let response = ReadResponse::decode(body.as_slice()).unwrap();
+
+        assert_eq!(1, response.results.len());
+        assert_eq!(1, response.results[0].timeseries.len());
+        let timeseries = &response.results[0].timeseries[0];
+        assert_eq!(
+            vec![Label {
+                name: servers::prom_store::METRIC_NAME_LABEL.to_string(),
+                value: "custom_metric".to_string(),
+            }],
+            timeseries.labels
+        );
+        assert_eq!(
+            vec![Sample {
+                value: 2.0,
+                timestamp: 2000,
+            }],
+            timeseries.samples
         );
 
-        // Verify that many new entries were added (proving operations completed)
-        let final_count = cache_concurrent.len();
-        assert!(
-            final_count > 1 + num_threads * operations_per_thread / 2,
-            "Expected more cache entries, got {}",
-            final_count
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prom_remote_read_prefers_default_value_column() -> TestResult<()> {
+        let schema = Arc::new(GtSchema::new(vec![
+            ColumnSchema::new(
+                "custom_ts",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            )
+            .with_time_index(true),
+            ColumnSchema::new("extra_field", ConcreteDataType::float64_datatype(), false),
+            ColumnSchema::new(
+                greptime_value(),
+                ConcreteDataType::float64_datatype(),
+                false,
+            ),
+        ]));
+        let recordbatch = RecordBatch::new(
+            schema,
+            vec![
+                Arc::new(TimestampMillisecondVector::from_vec(vec![1000, 2000, 3000])) as VectorRef,
+                Arc::new(Float64Vector::from_vec(vec![99.0, 99.0, 99.0])) as VectorRef,
+                Arc::new(Float64Vector::from_vec(vec![1.0, 2.0, 3.0])) as VectorRef,
+            ],
+        )
+        .unwrap();
+        let instance = test_instance_with_tables(
+            MemTable::table("multi_field_metric", recordbatch),
+            test_table(1025, "target")?,
+        )
+        .await?;
+
+        let response = PromStoreProtocolHandler::read(
+            &instance,
+            ReadRequest {
+                queries: vec![RemoteQuery {
+                    start_timestamp_ms: 1500,
+                    end_timestamp_ms: 2500,
+                    matchers: vec![LabelMatcher {
+                        r#type: PromMatcherType::Eq as i32,
+                        name: servers::prom_store::METRIC_NAME_LABEL.to_string(),
+                        value: "multi_field_metric".to_string(),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            test_query_ctx(1),
+        )
+        .await
+        .unwrap();
+        let body = servers::prom_store::snappy_decompress(&response.body).unwrap();
+        let response = ReadResponse::decode(body.as_slice()).unwrap();
+
+        assert_eq!(1, response.results.len());
+        assert_eq!(1, response.results[0].timeseries.len());
+        let timeseries = &response.results[0].timeseries[0];
+        assert_eq!(
+            vec![
+                Label {
+                    name: servers::prom_store::METRIC_NAME_LABEL.to_string(),
+                    value: "multi_field_metric".to_string(),
+                },
+                Label {
+                    name: "extra_field".to_string(),
+                    value: "99".to_string(),
+                },
+            ],
+            timeseries.labels
         );
+        assert_eq!(
+            vec![Sample {
+                value: 2.0,
+                timestamp: 2000,
+            }],
+            timeseries.samples
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prom_remote_read_rejects_ambiguous_value_columns() -> TestResult<()> {
+        let schema = Arc::new(GtSchema::new(vec![
+            ColumnSchema::new(
+                "custom_ts",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            )
+            .with_time_index(true),
+            ColumnSchema::new("field_a", ConcreteDataType::float64_datatype(), false),
+            ColumnSchema::new("field_b", ConcreteDataType::float64_datatype(), false),
+        ]));
+        let recordbatch = RecordBatch::new(
+            schema,
+            vec![
+                Arc::new(TimestampMillisecondVector::from_vec(vec![1000])) as VectorRef,
+                Arc::new(Float64Vector::from_vec(vec![1.0])) as VectorRef,
+                Arc::new(Float64Vector::from_vec(vec![2.0])) as VectorRef,
+            ],
+        )
+        .unwrap();
+        let instance = test_instance_with_tables(
+            MemTable::table("ambiguous_metric", recordbatch),
+            test_table(1025, "target")?,
+        )
+        .await?;
+
+        let err = PromStoreProtocolHandler::read(
+            &instance,
+            ReadRequest {
+                queries: vec![RemoteQuery {
+                    matchers: vec![LabelMatcher {
+                        r#type: PromMatcherType::Eq as i32,
+                        name: servers::prom_store::METRIC_NAME_LABEL.to_string(),
+                        value: "ambiguous_metric".to_string(),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            test_query_ctx(1),
+        )
+        .await
+        .err()
+        .expect("ambiguous value columns should fail remote read");
+
+        assert_eq!(StatusCode::InvalidArguments, err.status_code());
+        assert!(format!("{err:?}").contains("Ambiguous value column"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_event_recorder_is_exposed() -> TestResult<()> {
+        let instance =
+            test_instance_with_tables(test_table(1024, "source")?, test_table(1025, "target")?)
+                .await?;
+
+        let _event_recorder = instance.event_recorder();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_restricted_endpoint_handlers_check_permissions() -> TestResult<()> {
+        let checker = Arc::new(RejectEndpointPermissionChecker::default());
+        let plugins = Plugins::new();
+        plugins.insert::<PermissionCheckerRef>(checker.clone());
+        let instance = test_instance_with_plugins(
+            test_table(1024, "denied")?,
+            test_table(1025, "target")?,
+            plugins,
+        )
+        .await?;
+        let mut ctx = test_query_ctx(1);
+        Arc::get_mut(&mut ctx).unwrap().set_extension(
+            servers::http::jaeger::JAEGER_QUERY_TABLE_NAME_KEY,
+            "denied".to_string(),
+        );
+        let jaeger_targets = Some(PermissionTableTargets::resolved(vec![
+            PermissionTableTarget::new("greptime", "public", "denied"),
+        ]));
+
+        assert_permission_denied(JaegerQueryHandler::get_services(&instance, ctx.clone()).await);
+        assert_action_checked(&checker, JAEGER_QUERY, jaeger_targets.clone());
+        assert_permission_denied(
+            JaegerQueryHandler::get_operations(&instance, ctx.clone(), "service", None).await,
+        );
+        assert_action_checked(&checker, JAEGER_QUERY, jaeger_targets.clone());
+        assert_permission_denied(
+            JaegerQueryHandler::get_trace(&instance, ctx.clone(), "trace", None, None, None).await,
+        );
+        assert_action_checked(&checker, JAEGER_QUERY, jaeger_targets.clone());
+        assert_permission_denied(
+            JaegerQueryHandler::find_traces(
+                &instance,
+                ctx.clone(),
+                servers::http::jaeger::QueryTraceParams {
+                    service_name: "service".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+        assert_action_checked(&checker, JAEGER_QUERY, jaeger_targets);
+
+        assert_permission_denied(
+            PipelineHandler::get_pipeline_str(&instance, "pipeline", None, ctx.clone()).await,
+        );
+        assert_action_checked(&checker, PIPELINE_QUERY, None);
+        assert_permission_denied(
+            PipelineHandler::insert_pipeline(
+                &instance,
+                "pipeline",
+                "application/yaml",
+                "",
+                ctx.clone(),
+            )
+            .await,
+        );
+        assert_action_checked(&checker, PIPELINE_INSERT, None);
+        assert_permission_denied(
+            PipelineHandler::delete_pipeline(&instance, "pipeline", None, ctx.clone()).await,
+        );
+        assert_action_checked(&checker, PIPELINE_DELETE, None);
+        let app = axum::Router::new()
+            .route(
+                "/pipelines/_dryrun",
+                axum::routing::post(servers::http::event::pipeline_dryrun),
+            )
+            .with_state(servers::http::event::LogState {
+                log_handler: Arc::new(instance.clone()),
+                log_validator: None,
+                ingest_interceptor: None,
+            })
+            .layer(axum::Extension((*ctx).clone()));
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/pipelines/_dryrun")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(axum::http::StatusCode::FORBIDDEN, response.status());
+        assert_action_checked(&checker, PIPELINE_QUERY, None);
+
+        assert_permission_denied(
+            DashboardHandler::save(&instance, "dashboard", "{}", ctx.clone()).await,
+        );
+        assert_action_checked(&checker, DASHBOARD_SAVE, None);
+        assert_permission_denied(DashboardHandler::list(&instance, ctx.clone()).await);
+        assert_action_checked(&checker, DASHBOARD_QUERY, None);
+        assert_permission_denied(
+            DashboardHandler::delete(&instance, "dashboard", ctx.clone()).await,
+        );
+        assert_action_checked(&checker, DASHBOARD_DELETE, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_only_ingestion_loads_named_pipeline() -> TestResult<()> {
+        let plugins = Plugins::new();
+        plugins.insert::<PermissionCheckerRef>(Arc::new(WriteOnlyPermissionChecker));
+        let instance = test_instance_with_plugins(
+            test_table(1024, "source")?,
+            test_table(1025, "target")?,
+            plugins,
+        )
+        .await?;
+        instance
+            .catalog_manager()
+            .as_any()
+            .downcast_ref::<catalog::memory::MemoryCatalogManager>()
+            .unwrap()
+            .register_table_sync(catalog::RegisterTableRequest {
+                catalog: "greptime".to_string(),
+                schema: DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+                table_name: "pipelines".to_string(),
+                table_id: 2049,
+                table: test_pipeline_table(),
+            })
+            .with_context(|_| RegisterTableSnafu {
+                table_name: "pipelines".to_string(),
+            })?;
+        let ctx = test_query_ctx(1);
+        let handler: PipelineHandlerRef = Arc::new(instance.clone());
+
+        handler
+            .get_pipeline("pipeline", None, ctx.clone())
+            .await
+            .unwrap();
+        assert_permission_denied(
+            PipelineHandler::get_pipeline_str(&instance, "pipeline", None, ctx.clone()).await,
+        );
+
+        let app = axum::Router::new()
+            .route(
+                "/pipelines/_dryrun",
+                axum::routing::post(servers::http::event::pipeline_dryrun),
+            )
+            .with_state(servers::http::event::LogState {
+                log_handler: handler,
+                log_validator: None,
+                ingest_interceptor: None,
+            })
+            .layer(axum::Extension((*ctx).clone()));
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/pipelines/_dryrun")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(axum::http::StatusCode::FORBIDDEN, response.status());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_only_grpc_sql_is_checked_after_parsing() -> TestResult<()> {
+        let plugins = Plugins::new();
+        plugins.insert::<PermissionCheckerRef>(Arc::new(WriteOnlyPermissionChecker));
+        let instance = test_instance_with_plugins(
+            test_table(1024, "source")?,
+            test_table(1025, "target")?,
+            plugins,
+        )
+        .await?;
+
+        let insert = Request::Query(api::v1::QueryRequest {
+            query: Some(Query::Sql(
+                "INSERT INTO target SELECT * FROM source".to_string(),
+            )),
+        });
+        servers::query_handler::grpc::GrpcQueryHandler::do_query(
+            &instance,
+            insert,
+            QueryContext::arc(),
+        )
+        .await
+        .unwrap();
+
+        let select = Request::Query(api::v1::QueryRequest {
+            query: Some(Query::Sql("SELECT * FROM source".to_string())),
+        });
+        assert_permission_denied(
+            servers::query_handler::grpc::GrpcQueryHandler::do_query(
+                &instance,
+                select,
+                QueryContext::arc(),
+            )
+            .await,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_target_independent_checker_skips_target_resolution() -> TestResult<()> {
+        let physical_table = "physical_metric";
+        let checker = Arc::new(TargetIndependentPermissionChecker::default());
+        let plugins = Plugins::new();
+        plugins.insert::<PermissionCheckerRef>(checker.clone());
+        let instance = test_instance_with_plugins(
+            test_physical_table(1024, physical_table)?,
+            test_table(1025, "target")?,
+            plugins,
+        )
+        .await?;
+
+        let ctx = test_query_ctx(1);
+        let physical_target = PermissionTableTarget::new("greptime", "public", physical_table);
+        assert_eq!(
+            PermissionTableTargets::Resolved(vec![physical_target.clone()]),
+            instance
+                .resolve_query_permission_targets(
+                    PermissionTableTargets::resolved(vec![physical_target]),
+                    &ctx,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            vec![physical_table.to_string(), "target".to_string()],
+            PrometheusHandler::filter_metadata_metric_names(
+                &instance,
+                vec![physical_table.to_string(), "target".to_string()],
+                "public",
+                &ctx,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(1, checker.checks.load(atomic::Ordering::Relaxed));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query_permission_targets_are_deduplicated() -> TestResult<()> {
+        let plugins = Plugins::new();
+        plugins.insert::<PermissionCheckerRef>(Arc::new(RejectUnresolvedPermissionChecker));
+        let instance = test_instance_with_plugins(
+            test_table(1024, "source")?,
+            test_table(1025, "target")?,
+            plugins,
+        )
+        .await?;
+        let ctx = test_query_ctx(1);
+        let target = PermissionTableTarget::new("greptime", "public", "target");
+
+        assert_eq!(
+            PermissionTableTargets::Resolved(vec![target.clone()]),
+            instance
+                .resolve_query_permission_targets(
+                    PermissionTableTargets::resolved(vec![target.clone(), target]),
+                    &ctx,
+                )
+                .await
+                .unwrap()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_physical_query_targets_fail_closed() -> TestResult<()> {
+        let physical_table = "physical_metric";
+        let plugins = Plugins::new();
+        plugins.insert::<PermissionCheckerRef>(Arc::new(RejectUnresolvedPermissionChecker));
+        let instance = test_instance_with_plugins(
+            test_physical_table(1024, physical_table)?,
+            test_table(1025, "target")?,
+            plugins,
+        )
+        .await?;
+
+        let ctx = test_query_ctx(1);
+        let logical_target = PermissionTableTarget::new("greptime", "public", "target");
+        assert_eq!(
+            PermissionTableTargets::Resolved(vec![logical_target.clone()]),
+            instance
+                .resolve_query_permission_targets(
+                    PermissionTableTargets::resolved(vec![logical_target.clone()]),
+                    &ctx,
+                )
+                .await
+                .unwrap()
+        );
+        let physical_target = PermissionTableTarget::new("greptime", "public", physical_table);
+        assert_eq!(
+            PermissionTableTargets::Unresolved,
+            instance
+                .resolve_query_permission_targets(
+                    PermissionTableTargets::resolved(
+                        vec![logical_target, physical_target.clone(),]
+                    ),
+                    &ctx,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            vec!["target".to_string()],
+            PrometheusHandler::filter_metadata_metric_names(
+                &instance,
+                vec!["target".to_string(), "denied".to_string()],
+                "public",
+                &ctx,
+            )
+            .await
+            .unwrap()
+        );
+
+        let query = PromQuery {
+            query: physical_table.to_string(),
+            ..Default::default()
+        };
+        let err = PrometheusHandler::check_query_target_permission(
+            &instance,
+            PermissionTableTargets::resolved(vec![physical_target]),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(StatusCode::PermissionDenied, err.status_code());
+        let err = PrometheusHandler::check_query_permission(
+            &instance,
+            std::slice::from_ref(&query),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(StatusCode::PermissionDenied, err.status_code());
+        let err = PrometheusHandler::do_query(&instance, &query, ctx.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(StatusCode::PermissionDenied, err.status_code());
+
+        for sql in [
+            "SELECT * FROM physical_metric",
+            "TQL EVAL (0, 10, '5s') physical_metric",
+            "INSERT INTO target SELECT * FROM physical_metric",
+        ] {
+            let mut results = instance.do_query_inner(sql, ctx.clone()).await;
+            assert_eq!(1, results.len(), "{sql}");
+            let err = results.remove(0).unwrap_err();
+            assert_eq!(StatusCode::PermissionDenied, err.status_code(), "{sql}");
+        }
+        let err = LogQueryHandler::query(
+            &instance,
+            LogQuery {
+                table: TableName::new("greptime", "public", physical_table),
+                ..Default::default()
+            },
+            ctx.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(StatusCode::PermissionDenied, err.status_code());
+        let err = instance
+            .do_describe_inner(parse_one_sql("SELECT * FROM physical_metric"), ctx.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(StatusCode::PermissionDenied, err.status_code());
+
+        let request = ReadRequest {
+            queries: vec![RemoteQuery {
+                matchers: vec![LabelMatcher {
+                    r#type: PromMatcherType::Eq as i32,
+                    name: servers::prom_store::METRIC_NAME_LABEL.to_string(),
+                    value: physical_table.to_string(),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let Err(err) = PromStoreProtocolHandler::read(&instance, request, ctx.clone()).await else {
+            panic!("physical remote-read target must be rejected");
+        };
+        assert_eq!(StatusCode::PermissionDenied, err.status_code());
+
+        let err = PrometheusHandler::query_label_values(
+            &instance,
+            physical_table.to_string(),
+            "host".to_string(),
+            vec![],
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(StatusCode::PermissionDenied, err.status_code());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_non_exact_query_discovery_keeps_denied_targets_for_batch_check() -> TestResult<()>
+    {
+        let plugins = Plugins::new();
+        plugins.insert::<PermissionCheckerRef>(Arc::new(RejectUnresolvedPermissionChecker));
+        let instance = test_instance_with_plugins_and_metric_names(
+            test_logical_table(1024, "denied")?,
+            test_logical_table(1025, "target")?,
+            plugins,
+            Some(test_metric_names_table()),
+        )
+        .await?;
+        let ctx = test_query_ctx(1);
+
+        let mut metric_names = PrometheusHandler::query_metric_names(
+            &instance,
+            vec![Matcher::new(
+                promql_parser::label::MatchOp::NotEqual,
+                "__name__",
+                "",
+            )],
+            "public",
+            &ctx,
+        )
+        .await
+        .unwrap();
+        metric_names.sort_unstable();
+        assert_eq!(
+            vec!["denied".to_string(), "target".to_string()],
+            metric_names
+        );
+
+        let queries = metric_names
+            .into_iter()
+            .map(|query| PromQuery {
+                query,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let err = PrometheusHandler::check_query_permission(&instance, &queries, &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(StatusCode::PermissionDenied, err.status_code());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_fast_legacy_check_is_read_only() {
+        let cache = DashMap::new();
+        cache.insert("metric1".to_string(), true);
+
+        let names = vec!["metric1".to_string(), "metric2".to_string()];
+        assert_eq!(Some(true), fast_legacy_check(&cache, &names).unwrap());
+        assert!(!cache.contains_key("metric2"));
+
+        cache_legacy_mode(&cache, &names, true).unwrap();
+        assert!(*cache.get("metric2").unwrap().value());
+        assert!(cache_legacy_mode(&cache, &names, false).is_err());
+        assert!(*cache.get("metric2").unwrap().value());
+
+        let cache_incompatible = DashMap::new();
+        cache_incompatible.insert("metric1".to_string(), true);
+        cache_incompatible.insert("metric2".to_string(), false);
+        assert!(fast_legacy_check(&cache_incompatible, &names).is_err());
+    }
+
+    #[test]
+    fn test_should_track_statement_process() {
+        assert!(should_track_statement_process(&parse_one_sql(
+            "SELECT * FROM demo"
+        )));
+        assert!(should_track_statement_process(&parse_one_sql(
+            "INSERT INTO demo SELECT * FROM source"
+        )));
+        assert!(!should_track_statement_process(&parse_one_sql(
+            "INSERT INTO demo VALUES (1)"
+        )));
+        assert!(!should_track_statement_process(&parse_one_sql(
+            "INSERT INTO demo VALUES (now())"
+        )));
+    }
+
+    #[test]
+    fn test_should_track_plan_process() {
+        let select_stmt = parse_one_sql("SELECT * FROM demo");
+        let insert_select_stmt = parse_one_sql("INSERT INTO demo SELECT * FROM source");
+        let insert_values_stmt = parse_one_sql("INSERT INTO demo VALUES (now())");
+
+        let empty_plan = LogicalPlanBuilder::empty(false).build().unwrap();
+        assert!(should_track_plan_process(Some(&select_stmt), &empty_plan));
+        assert!(should_track_plan_process(
+            Some(&insert_select_stmt),
+            &insert_dml_plan()
+        ));
+        assert!(!should_track_plan_process(
+            Some(&insert_values_stmt),
+            &insert_dml_plan()
+        ));
+        assert!(!should_track_plan_process(None, &insert_dml_plan()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_insert_select_is_visible_in_show_processlist() -> TestResult<()> {
+        let insert_sql = "INSERT INTO target SELECT * FROM source";
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let interceptor = Arc::new(BlockingInsertSelectInterceptor::new(started_tx, finish_rx));
+        let instance = Arc::new(test_instance_with_insert_select_interceptor(interceptor).await?);
+
+        let insert_task = tokio::spawn({
+            let instance = instance.clone();
+            async move { execute_one_sql(&instance, insert_sql, test_query_ctx(4242)).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .context(InsertStartTimeoutSnafu)?
+            .context(InsertStartChannelClosedSnafu)?;
+
+        let output = execute_one_sql(&instance, "SHOW PROCESSLIST", test_query_ctx(43)).await?;
+        let process_list = output.data.pretty_print().await;
+        assert!(
+            process_list.contains(insert_sql),
+            "process list did not contain running insert:\n{process_list}"
+        );
+
+        finish_tx
+            .send(())
+            .map_err(|_| ReleaseBlockedInsertSnafu.build())?;
+        insert_task.await.context(InsertTaskPanicSnafu)??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_show_processlist_catalog_scope() -> TestResult<()> {
+        let instance =
+            test_instance_with_tables(test_table(1024, "source")?, test_table(1025, "target")?)
+                .await?;
+        let _current_catalog = instance.process_manager().register_query(
+            "greptime".to_string(),
+            vec!["public".to_string()],
+            "current_catalog_query".to_string(),
+            String::new(),
+            None,
+            None,
+        );
+        let _other_catalog = instance.process_manager().register_query(
+            "other".to_string(),
+            vec!["public".to_string()],
+            "other_catalog_query".to_string(),
+            String::new(),
+            None,
+            None,
+        );
+
+        for sql in ["SHOW PROCESSLIST", "SHOW FULL PROCESSLIST"] {
+            let output = execute_one_sql(&instance, sql, test_query_ctx(43)).await?;
+            let process_list = output.data.pretty_print().await;
+            assert!(
+                process_list.contains("current_catalog_query"),
+                "{process_list}"
+            );
+            assert!(
+                !process_list.contains("other_catalog_query"),
+                "{process_list}"
+            );
+
+            let admin_ctx = test_query_ctx(44);
+            admin_ctx.set_current_user(Arc::new(AdminUserInfo));
+            let output = execute_one_sql(&instance, sql, admin_ctx).await?;
+            let process_list = output.data.pretty_print().await;
+            assert!(
+                process_list.contains("current_catalog_query"),
+                "{process_list}"
+            );
+            assert!(
+                process_list.contains("other_catalog_query"),
+                "{process_list}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_kill_query_cancels_insert_select() -> TestResult<()> {
+        assert_kill_cancels_insert_select("KILL QUERY 4242").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_kill_process_id_cancels_insert_select() -> TestResult<()> {
+        assert_kill_cancels_insert_select("KILL 'test-frontend/4242'").await
+    }
+
+    async fn assert_kill_cancels_insert_select(kill_sql: &str) -> TestResult<()> {
+        let insert_sql = "INSERT INTO target SELECT * FROM source";
+        let (source_polled_tx, source_polled_rx) = oneshot::channel();
+        let instance = Arc::new(
+            test_instance_with_tables(
+                pending_table(1024, "source", source_polled_tx)?,
+                test_table(1025, "target")?,
+            )
+            .await?,
+        );
+
+        let insert_task = tokio::spawn({
+            let instance = instance.clone();
+            async move { execute_one_sql(&instance, insert_sql, test_query_ctx(4242)).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), source_polled_rx)
+            .await
+            .context(SourcePollTimeoutSnafu)?
+            .context(SourcePollChannelClosedSnafu)?;
+
+        let output = execute_one_sql(&instance, kill_sql, test_query_ctx(43)).await?;
+        assert!(matches!(output.data, OutputData::AffectedRows(1)));
+
+        let insert_result = tokio::time::timeout(Duration::from_secs(5), insert_task)
+            .await
+            .context(InsertTaskTimeoutSnafu)?
+            .context(InsertTaskPanicSnafu)?;
+        let err = match insert_result {
+            Ok(_) => return InsertSelectNotCancelledSnafu.fail(),
+            Err(TestError::ExecuteSql { source, .. }) => source,
+            Err(err) => return Err(err),
+        };
+        assert_eq!(StatusCode::Cancelled, err.status_code());
+
+        let output = execute_one_sql(&instance, "SHOW PROCESSLIST", test_query_ctx(43)).await?;
+        let process_list = output.data.pretty_print().await;
+        assert!(
+            !process_list.contains(insert_sql),
+            "process list still contains killed insert:\n{process_list}"
+        );
+
+        Ok(())
+    }
+
+    fn insert_dml_plan() -> LogicalPlan {
+        let schema = SchemaRef::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let target = Arc::new(LogicalTableSource::new(schema));
+        let input = LogicalPlanBuilder::empty(false).build().unwrap();
+
+        LogicalPlanBuilder::insert_into(input, "demo", target, InsertOp::Append)
+            .unwrap()
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -1345,6 +3703,13 @@ mod tests {
         let sql = "DROP TABLE {catalog}{schema}demo;";
         replace_test(sql, plugins.clone(), &query_ctx);
 
+        // test undrop table
+        #[cfg(feature = "enterprise")]
+        {
+            let sql = "UNDROP TABLE {catalog}{schema}demo;";
+            replace_test(sql, plugins.clone(), &query_ctx);
+        }
+
         // test show tables
         let sql = "SHOW TABLES FROM public";
         let stmt = parse_stmt(sql, &GreptimeDbDialect {}).unwrap();
@@ -1380,5 +3745,370 @@ mod tests {
             let result = check_permission(plugins.clone(), stmt, &query_ctx);
             assert_eq!(result.is_ok(), is_ok);
         }
+    }
+
+    /// A `DropView` DDL sent through the direct gRPC ingress must return an error
+    /// (e.g. table not found) instead of panicking on `todo!()`.
+    #[tokio::test]
+    async fn qx_152_drop_view_via_grpc_ddl_returns_error_not_panic() -> TestResult<()> {
+        let instance =
+            test_instance_with_tables(test_table(1024, "source")?, test_table(1025, "target")?)
+                .await?;
+
+        let request = api::v1::greptime_request::Request::Ddl(api::v1::DdlRequest {
+            expr: Some(api::v1::ddl_request::Expr::DropView(
+                api::v1::DropViewExpr {
+                    catalog_name: String::new(),
+                    schema_name: String::new(),
+                    view_name: "non_existent_view".to_string(),
+                    view_id: None,
+                    drop_if_exists: false,
+                },
+            )),
+        });
+
+        let result = servers::query_handler::grpc::GrpcQueryHandler::do_query(
+            &instance,
+            request,
+            QueryContext::arc(),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("DropView DDL request must return an error instead of panicking"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.status_code(),
+            StatusCode::TableNotFound,
+            "dropping a non-existent view without IF EXISTS must report TableNotFound, got {err}"
+        );
+        Ok(())
+    }
+
+    /// `DROP VIEW IF EXISTS` on a missing view through the direct gRPC ingress must
+    /// succeed with 0 affected rows (no error, no DDL task submitted), instead of
+    /// returning `TableNotFound`.
+    #[tokio::test]
+    async fn qx_152_drop_view_if_exists_missing_view_via_grpc_ddl_succeeds() -> TestResult<()> {
+        let catalog_manager =
+            catalog::memory::MemoryCatalogManager::new_with_table(test_table(1024, "source")?);
+        let procedure_executor = Arc::new(MockProcedureExecutor::new(catalog_manager.clone()));
+        let instance = test_instance_with_catalog_manager(
+            catalog_manager,
+            test_table(1025, "target")?,
+            Plugins::new(),
+            None,
+            procedure_executor.clone() as ProcedureExecutorRef,
+        )
+        .await?;
+
+        let request = api::v1::greptime_request::Request::Ddl(api::v1::DdlRequest {
+            expr: Some(api::v1::ddl_request::Expr::DropView(
+                api::v1::DropViewExpr {
+                    catalog_name: String::new(),
+                    schema_name: String::new(),
+                    view_name: "non_existent_view".to_string(),
+                    view_id: None,
+                    drop_if_exists: true,
+                },
+            )),
+        });
+
+        let result = servers::query_handler::grpc::GrpcQueryHandler::do_query(
+            &instance,
+            request,
+            QueryContext::arc(),
+        )
+        .await;
+
+        let output = match result {
+            Ok(output) => output,
+            Err(err) => {
+                panic!("DROP VIEW IF EXISTS on a missing view must succeed, got error: {err}")
+            }
+        };
+        assert!(
+            matches!(output.data, OutputData::AffectedRows(0)),
+            "DROP VIEW IF EXISTS on a missing view must report 0 affected rows"
+        );
+        assert!(
+            procedure_executor.submitted.lock().unwrap().is_empty(),
+            "DROP VIEW IF EXISTS on a missing view must not submit a DDL task"
+        );
+        Ok(())
+    }
+
+    /// A `CREATE VIEW` followed by `DROP VIEW` through the direct gRPC ingress must
+    /// succeed end to end: the view is registered in the catalog and then removed.
+    #[tokio::test]
+    async fn qx_152_drop_existing_view_via_grpc_ddl_succeeds() -> TestResult<()> {
+        let catalog_manager =
+            catalog::memory::MemoryCatalogManager::new_with_table(test_table(1024, "source")?);
+        let procedure_executor = Arc::new(MockProcedureExecutor::new(catalog_manager.clone()));
+        let instance = test_instance_with_catalog_manager(
+            catalog_manager,
+            test_table(1025, "target")?,
+            Plugins::new(),
+            None,
+            procedure_executor.clone() as ProcedureExecutorRef,
+        )
+        .await?;
+
+        // The default "greptime.public" schema must be visible to the kv-backed table
+        // metadata manager for `CREATE VIEW`/`CREATE TABLE` to pass validation.
+        instance
+            .table_metadata_manager()
+            .schema_manager()
+            .create(
+                common_meta::key::schema_name::SchemaNameKey::new("greptime", "public"),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let create_view_request = api::v1::greptime_request::Request::Ddl(api::v1::DdlRequest {
+            expr: Some(api::v1::ddl_request::Expr::CreateView(
+                api::v1::CreateViewExpr {
+                    catalog_name: String::new(),
+                    schema_name: String::new(),
+                    view_name: "my_view".to_string(),
+                    logical_plan: vec![1, 2, 3],
+                    create_if_not_exists: false,
+                    or_replace: false,
+                    table_names: vec![],
+                    columns: vec![],
+                    plan_columns: vec![],
+                    definition: "CREATE VIEW my_view AS SELECT * FROM source".to_string(),
+                },
+            )),
+        });
+
+        let output = match servers::query_handler::grpc::GrpcQueryHandler::do_query(
+            &instance,
+            create_view_request,
+            QueryContext::arc(),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => panic!("CREATE VIEW via gRPC DDL must succeed, got error: {err}"),
+        };
+        assert!(
+            matches!(output.data, OutputData::AffectedRows(0)),
+            "CREATE VIEW via gRPC DDL must report 0 affected rows"
+        );
+
+        // The view is registered in the catalog as a view.
+        let view = instance
+            .catalog_manager()
+            .table("greptime", "public", "my_view", None)
+            .await
+            .unwrap()
+            .expect("view should exist after CREATE VIEW");
+        assert_eq!(view.table_info().table_type, TableType::View);
+
+        let drop_view_request = api::v1::greptime_request::Request::Ddl(api::v1::DdlRequest {
+            expr: Some(api::v1::ddl_request::Expr::DropView(
+                api::v1::DropViewExpr {
+                    catalog_name: String::new(),
+                    schema_name: String::new(),
+                    view_name: "my_view".to_string(),
+                    view_id: None,
+                    drop_if_exists: false,
+                },
+            )),
+        });
+
+        let output = match servers::query_handler::grpc::GrpcQueryHandler::do_query(
+            &instance,
+            drop_view_request,
+            QueryContext::arc(),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => panic!("DROP VIEW via gRPC DDL must succeed, got error: {err}"),
+        };
+        assert!(
+            matches!(output.data, OutputData::AffectedRows(0)),
+            "DROP VIEW via gRPC DDL must report 0 affected rows"
+        );
+
+        // The view is gone after the drop.
+        assert!(
+            instance
+                .catalog_manager()
+                .table("greptime", "public", "my_view", None)
+                .await
+                .unwrap()
+                .is_none(),
+            "view should be removed after DROP VIEW"
+        );
+
+        let submitted = procedure_executor.submitted.lock().unwrap();
+        assert_eq!(
+            submitted.len(),
+            2,
+            "expected create and drop view tasks, got {submitted:?}"
+        );
+        assert!(matches!(&submitted[0], DdlTask::CreateView(_)));
+        assert!(matches!(&submitted[1], DdlTask::DropView(_)));
+        Ok(())
+    }
+
+    /// A direct gRPC `CreateTable` whose time index column is not a timestamp must
+    /// be rejected with `InvalidArguments` instead of panicking while building the schema.
+    #[tokio::test]
+    async fn qx_153_create_table_with_non_timestamp_time_index_via_grpc_returns_error()
+    -> TestResult<()> {
+        let instance =
+            test_instance_with_tables(test_table(1024, "source")?, test_table(1025, "target")?)
+                .await?;
+
+        let request = api::v1::greptime_request::Request::Ddl(api::v1::DdlRequest {
+            expr: Some(api::v1::ddl_request::Expr::CreateTable(
+                api::v1::CreateTableExpr {
+                    catalog_name: String::new(),
+                    schema_name: String::new(),
+                    table_name: "demo".to_string(),
+                    desc: String::new(),
+                    column_defs: vec![api::v1::ColumnDef {
+                        name: "host".to_string(),
+                        data_type: api::v1::ColumnDataType::String as i32,
+                        is_nullable: true,
+                        default_constraint: vec![],
+                        semantic_type: 0,
+                        comment: String::new(),
+                        datatype_extension: None,
+                        options: None,
+                    }],
+                    time_index: "host".to_string(),
+                    primary_keys: vec![],
+                    create_if_not_exists: false,
+                    table_options: HashMap::new(),
+                    table_id: None,
+                    engine: "mito".to_string(),
+                },
+            )),
+        });
+
+        let result = servers::query_handler::grpc::GrpcQueryHandler::do_query(
+            &instance,
+            request,
+            QueryContext::arc(),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("CreateTable with a non-timestamp time index must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.status_code(), StatusCode::InvalidArguments, "{err}");
+        Ok(())
+    }
+
+    /// A valid `CREATE TABLE` (timestamp time index) through the direct gRPC ingress
+    /// must succeed, guarding that the `validate_create_expr` ingress check doesn't
+    /// accidentally reject good requests.
+    #[tokio::test]
+    async fn qx_153_create_table_with_timestamp_time_index_via_grpc_succeeds() -> TestResult<()> {
+        let catalog_manager =
+            catalog::memory::MemoryCatalogManager::new_with_table(test_table(1024, "source")?);
+        let procedure_executor = Arc::new(MockProcedureExecutor::new(catalog_manager.clone()));
+        let instance = test_instance_with_catalog_manager(
+            catalog_manager,
+            test_table(1025, "target")?,
+            Plugins::new(),
+            None,
+            procedure_executor.clone() as ProcedureExecutorRef,
+        )
+        .await?;
+
+        // The default "greptime.public" schema must be visible to the kv-backed table
+        // metadata manager for `CREATE TABLE` to pass validation.
+        instance
+            .table_metadata_manager()
+            .schema_manager()
+            .create(
+                common_meta::key::schema_name::SchemaNameKey::new("greptime", "public"),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let request = api::v1::greptime_request::Request::Ddl(api::v1::DdlRequest {
+            expr: Some(api::v1::ddl_request::Expr::CreateTable(
+                api::v1::CreateTableExpr {
+                    catalog_name: String::new(),
+                    schema_name: String::new(),
+                    table_name: "demo".to_string(),
+                    desc: String::new(),
+                    column_defs: vec![
+                        api::v1::ColumnDef {
+                            name: "host".to_string(),
+                            data_type: api::v1::ColumnDataType::String as i32,
+                            is_nullable: true,
+                            default_constraint: vec![],
+                            semantic_type: 0,
+                            comment: String::new(),
+                            datatype_extension: None,
+                            options: None,
+                        },
+                        api::v1::ColumnDef {
+                            name: "ts".to_string(),
+                            data_type: api::v1::ColumnDataType::TimestampMillisecond as i32,
+                            is_nullable: true,
+                            default_constraint: vec![],
+                            semantic_type: 0,
+                            comment: String::new(),
+                            datatype_extension: None,
+                            options: None,
+                        },
+                    ],
+                    time_index: "ts".to_string(),
+                    primary_keys: vec![],
+                    create_if_not_exists: false,
+                    table_options: HashMap::new(),
+                    table_id: None,
+                    engine: "mito".to_string(),
+                },
+            )),
+        });
+
+        let output = match servers::query_handler::grpc::GrpcQueryHandler::do_query(
+            &instance,
+            request,
+            QueryContext::arc(),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => panic!("CREATE TABLE via gRPC DDL must succeed, got error: {err}"),
+        };
+        assert!(
+            matches!(output.data, OutputData::AffectedRows(0)),
+            "CREATE TABLE via gRPC DDL must report 0 affected rows"
+        );
+
+        // The table is registered in the catalog.
+        let table = instance
+            .catalog_manager()
+            .table("greptime", "public", "demo", None)
+            .await
+            .unwrap()
+            .expect("table should exist after CREATE TABLE");
+        assert_eq!(table.table_info().table_type, TableType::Base);
+
+        let submitted = procedure_executor.submitted.lock().unwrap();
+        assert_eq!(
+            submitted.len(),
+            1,
+            "expected one create table task, got {submitted:?}"
+        );
+        assert!(matches!(&submitted[0], DdlTask::CreateTable(_)));
+        Ok(())
     }
 }

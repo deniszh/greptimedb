@@ -67,9 +67,18 @@ greptimedb_data
 
 # AI related
 .omc
+# Root AGENTS.md is the shared project guide (tracked); CLAUDE.md symlinks to it.
+# Personal/local agent config goes under .local/ and stays untracked.
+/.local/
 .codex
 .gemini
 .opencode
+.worktrees/
+.slim/deepwork/
 
 # local design docs
 docs/specs/
+.vs/
+
+# Claude Code personal/local overrides (keep shared .claude/ content tracked)
+.claude/*.local.* 

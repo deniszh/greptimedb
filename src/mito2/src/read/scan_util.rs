@@ -29,17 +29,16 @@ use datatypes::timestamp::timestamp_array_to_primitive;
 use futures::Stream;
 use prometheus::IntGauge;
 use smallvec::SmallVec;
-use snafu::OptionExt;
 use store_api::storage::RegionId;
 
-use crate::error::{Result, UnexpectedSnafu};
+use crate::error::Result;
 use crate::memtable::MemScanMetrics;
 use crate::metrics::{
     IN_PROGRESS_SCAN, PRECISE_FILTER_ROWS_TOTAL, READ_BATCHES_RETURN, READ_ROW_GROUPS_TOTAL,
     READ_ROWS_IN_ROW_GROUP_TOTAL, READ_ROWS_RETURN, READ_STAGE_ELAPSED,
 };
 use crate::read::dedup::{DedupMetrics, DedupMetricsReport};
-use crate::read::merge::{MergeMetrics, MergeMetricsReport};
+use crate::read::flat_merge::{MergeMetrics, MergeMetricsReport};
 use crate::read::pruner::PartitionPruner;
 use crate::read::range::{RangeMeta, RowGroupIndex};
 use crate::read::scan_region::StreamContext;
@@ -48,7 +47,7 @@ use crate::sst::file::{FileTimeRange, RegionFileId};
 use crate::sst::index::bloom_filter::applier::BloomFilterIndexApplyMetrics;
 use crate::sst::index::fulltext_index::applier::FulltextIndexApplyMetrics;
 use crate::sst::index::inverted_index::applier::InvertedIndexApplyMetrics;
-use crate::sst::parquet::file_range::FileRange;
+use crate::sst::parquet::file_range::{FileRange, PreFilterMode};
 use crate::sst::parquet::flat_format::time_index_column_index;
 use crate::sst::parquet::reader::{MetadataCacheMetrics, ReaderFilterMetrics, ReaderMetrics};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
@@ -196,6 +195,8 @@ pub(crate) struct ScanMetricsSet {
     pruner_cache_miss: usize,
     /// Duration spent waiting for pruner to build file ranges.
     pruner_prune_cost: Duration,
+    /// Number of files filtered by manifest time-range pruning.
+    files_time_range_pruned: usize,
     /// Number of record batches read from SST.
     num_sst_record_batches: usize,
     /// Number of batches decoded from SST.
@@ -327,6 +328,7 @@ impl fmt::Debug for ScanMetricsSet {
             pruner_cache_hit,
             pruner_cache_miss,
             pruner_prune_cost,
+            files_time_range_pruned,
             num_sst_record_batches,
             num_sst_batches,
             num_sst_rows,
@@ -391,6 +393,9 @@ impl fmt::Debug for ScanMetricsSet {
         }
 
         // Write non-zero filter counters
+        if *files_time_range_pruned > 0 {
+            write!(f, ", \"files_time_range_pruned\":{files_time_range_pruned}")?;
+        }
         if *rg_fulltext_filtered > 0 {
             write!(f, ", \"rg_fulltext_filtered\":{rg_fulltext_filtered}")?;
         }
@@ -690,6 +695,7 @@ impl ScanMetricsSet {
                     pruner_cache_hit,
                     pruner_cache_miss,
                     pruner_prune_cost,
+                    files_time_range_pruned,
                     inverted_index_apply_metrics,
                     bloom_filter_apply_metrics,
                     fulltext_index_apply_metrics,
@@ -706,6 +712,8 @@ impl ScanMetricsSet {
 
         self.build_parts_cost += *build_cost;
         self.sst_scan_cost += *scan_cost;
+
+        self.files_time_range_pruned += *files_time_range_pruned;
 
         self.rg_total += *rg_total;
         self.rg_fulltext_filtered += *rg_fulltext_filtered;
@@ -1258,13 +1266,25 @@ pub(crate) fn should_split_flat_batches_for_merge(
             // This is a file range.
             let file_index = index.index - stream_ctx.input.num_memtables();
             let file = &stream_ctx.input.files[file_index];
-            if file.meta_ref().num_rows < SPLIT_ROW_THRESHOLD || file.meta_ref().num_series == 0 {
+            let file_meta = file.meta_ref();
+            if file_meta.level == 0 {
+                // Always split level 0 files.
+                num_files_to_split += 1;
+                continue;
+            } else if file_meta.num_rows < SPLIT_ROW_THRESHOLD || file_meta.num_series == 0 {
                 // If the file doesn't have enough rows, or the number of series is unavailable, skips it.
                 continue;
             }
-            debug_assert!(file.meta_ref().num_rows > 0);
-            if !can_split_series(file.meta_ref().num_rows, file.meta_ref().num_series) {
+            debug_assert!(file_meta.num_rows > 0);
+            if !can_split_series(file_meta.num_rows, file_meta.num_series) {
                 // We can't split batches in a file.
+                common_telemetry::trace!(
+                    "Can't split series for file {}, level: {}, num_rows: {}, num_series: {}",
+                    file_meta.file_id,
+                    file_meta.level,
+                    file_meta.num_rows,
+                    file_meta.num_series,
+                );
                 return None;
             } else {
                 num_files_to_split += 1;
@@ -1310,17 +1330,112 @@ pub(crate) fn compute_parallel_channel_size(estimated_rows_per_batch: usize) -> 
     size.clamp(2, 64)
 }
 
+/// Computes the average estimated rows per batch across multiple range readers.
+pub(crate) fn compute_average_batch_size(
+    estimated_rows_per_batch: impl IntoIterator<Item = usize>,
+) -> usize {
+    let mut total = 0usize;
+    let mut count = 0usize;
+    for size in estimated_rows_per_batch {
+        total += size;
+        count += 1;
+    }
+
+    if count == 0 {
+        return DEFAULT_READ_BATCH_SIZE;
+    }
+
+    (total / count).clamp(1, DEFAULT_READ_BATCH_SIZE)
+}
+
 fn can_split_series(num_rows: u64, num_series: u64) -> bool {
-    assert!(num_series > 0);
-    assert!(num_rows > 0);
+    if num_rows == 0 || num_series == 0 {
+        return false;
+    }
 
     // It doesn't have too many series or it will have enough rows for each batch.
     num_series < NUM_SERIES_THRESHOLD || num_rows / num_series >= BATCH_SIZE_THRESHOLD
 }
 
+#[cfg(test)]
+mod split_tests {
+    use std::sync::Arc;
+
+    use common_time::Timestamp;
+    use smallvec::smallvec;
+    use store_api::storage::FileId;
+
+    use super::*;
+    use crate::read::flat_projection::FlatProjectionMapper;
+    use crate::read::range::{RangeMeta, RowGroupIndex, SourceIndex};
+    use crate::read::scan_region::{ScanInput, StreamContext};
+    use crate::sst::file::FileHandle;
+    use crate::test_util::memtable_util::metadata_with_primary_key;
+    use crate::test_util::scheduler_util::SchedulerEnv;
+    use crate::test_util::sst_util::sst_file_handle_with_file_id;
+
+    async fn new_stream_context_with_files(files: Vec<FileHandle>) -> StreamContext {
+        let env = SchedulerEnv::new().await;
+        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
+        let mapper = FlatProjectionMapper::new(&metadata, [0, 2, 3]).unwrap();
+        let input = ScanInput::new(env.access_layer.clone(), mapper).with_files(files);
+
+        StreamContext {
+            input,
+            ranges: vec![],
+            scan_fingerprint: None,
+            scan_implied_time_range: None,
+            query_start: std::time::Instant::now(),
+        }
+    }
+
+    fn single_file_range_meta() -> RangeMeta {
+        RangeMeta {
+            time_range: (
+                Timestamp::new_millisecond(0),
+                Timestamp::new_millisecond(1000),
+            ),
+            indices: smallvec![SourceIndex {
+                index: 0,
+                num_row_groups: 1,
+            }],
+            row_group_indices: smallvec![RowGroupIndex {
+                index: 0,
+                row_group_index: 0,
+            }],
+            num_rows: 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn should_split_level_zero_file_even_when_series_stats_are_missing() {
+        let mut file = sst_file_handle_with_file_id(FileId::random(), 0, 1000)
+            .meta_ref()
+            .clone();
+        file.level = 0;
+        file.num_rows = DEFAULT_ROW_GROUP_SIZE as u64;
+        file.num_row_groups = 1;
+        file.num_series = 0;
+
+        let file = FileHandle::new(file, crate::test_util::new_noop_file_purger());
+        let stream_ctx = Arc::new(new_stream_context_with_files(vec![file]).await);
+
+        assert!(
+            should_split_flat_batches_for_merge(&stream_ctx, &single_file_range_meta()).is_some()
+        );
+    }
+
+    #[test]
+    fn can_split_series_returns_false_for_zero_inputs() {
+        assert!(!can_split_series(0, 1));
+        assert!(!can_split_series(1, 0));
+        assert!(!can_split_series(0, 0));
+    }
+}
+
 /// Creates a new [ReaderFilterMetrics] with optional apply metrics initialized
 /// based on the `explain_verbose` flag.
-fn new_filter_metrics(explain_verbose: bool) -> ReaderFilterMetrics {
+pub(crate) fn new_filter_metrics(explain_verbose: bool) -> ReaderFilterMetrics {
     if explain_verbose {
         ReaderFilterMetrics {
             inverted_index_apply_metrics: Some(InvertedIndexApplyMetrics::default()),
@@ -1392,7 +1507,7 @@ pub(crate) async fn scan_flat_file_ranges(
     fields(read_type = read_type, range_count = ranges.len())
 )]
 pub fn build_flat_file_range_scan_stream(
-    _stream_ctx: Arc<StreamContext>,
+    stream_ctx: Arc<StreamContext>,
     part_metrics: PartitionMetrics,
     read_type: &'static str,
     ranges: SmallVec<[FileRange; 2]>,
@@ -1410,18 +1525,19 @@ pub fn build_flat_file_range_scan_stream(
         };
         for range in ranges {
             let build_reader_start = Instant::now();
-            let Some(mut reader) = range.flat_reader(_stream_ctx.input.series_row_selector, fetch_metrics.as_deref()).await? else{continue};
+            let Some(mut reader) = range
+                .flat_reader(
+                    stream_ctx.input.series_row_selector,
+                    fetch_metrics.as_deref(),
+                )
+                .await?
+            else {
+                continue;
+            };
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
 
-            let may_compat = range
-                .compat_batch()
-                .map(|compat| {
-                    compat.as_flat().context(UnexpectedSnafu {
-                        reason: "Invalid compat for flat format",
-                    })
-                })
-                .transpose()?;
+            let may_compat = range.compat_batch();
 
             let mapper = range.compaction_projection_mapper();
             while let Some(record_batch) = reader.next_batch().await? {
@@ -1471,11 +1587,12 @@ pub(crate) async fn scan_flat_extension_range(
     context: Arc<StreamContext>,
     index: RowGroupIndex,
     partition_metrics: PartitionMetrics,
+    options: crate::extension::ExtensionRangeReadOptions,
 ) -> Result<BoxedRecordBatchStream> {
     use snafu::ResultExt;
 
     let range = context.input.extension_range(index.index);
-    let reader = range.flat_reader(context.as_ref());
+    let reader = range.flat_reader(context.as_ref(), options);
     let stream = reader
         .read(context, partition_metrics, index)
         .await
@@ -1487,10 +1604,12 @@ pub(crate) async fn maybe_scan_flat_other_ranges(
     context: &Arc<StreamContext>,
     index: RowGroupIndex,
     metrics: &PartitionMetrics,
+    pre_filter_mode: PreFilterMode,
 ) -> Result<BoxedRecordBatchStream> {
     #[cfg(feature = "enterprise")]
     {
-        scan_flat_extension_range(context.clone(), index, metrics.clone()).await
+        let options = crate::extension::ExtensionRangeReadOptions { pre_filter_mode };
+        scan_flat_extension_range(context.clone(), index, metrics.clone(), options).await
     }
 
     #[cfg(not(feature = "enterprise"))]
@@ -1498,6 +1617,7 @@ pub(crate) async fn maybe_scan_flat_other_ranges(
         let _ = context;
         let _ = index;
         let _ = metrics;
+        let _ = pre_filter_mode;
 
         crate::error::UnexpectedSnafu {
             reason: "no other ranges scannable in flat format",
@@ -1551,7 +1671,7 @@ where
     }
 }
 
-/// Splits the batch by timestamps.
+/// Splits the batch so each sub-batch has strictly increasing timestamps.
 ///
 /// # Panics
 /// Panics if the timestamp array is invalid.
@@ -1572,7 +1692,7 @@ pub(crate) fn split_record_batch(record_batch: RecordBatch, batches: &mut VecDeq
     offsets.push(0);
     let values = ts_values.values();
     for (i, &value) in values.iter().take(batch_rows - 1).enumerate() {
-        if value > values[i + 1] {
+        if value >= values[i + 1] {
             offsets.push(i + 1);
         }
     }
@@ -1601,7 +1721,7 @@ mod tests {
         BoxedBatchIterator, BoxedRecordBatchIterator, IterBuilder, MemtableRange,
         MemtableRangeContext, MemtableStats,
     };
-    use crate::read::projection::ProjectionMapper;
+    use crate::read::flat_projection::FlatProjectionMapper;
     use crate::read::range::{MemRangeBuilder, SourceIndex};
     use crate::read::scan_region::ScanInput;
     use crate::sst::file::{FileHandle, FileMeta};
@@ -1635,7 +1755,7 @@ mod tests {
     ) -> Arc<StreamContext> {
         let env = SchedulerEnv::new().await;
         let metadata = metadata_for_test();
-        let mapper = ProjectionMapper::new(&metadata, [0, 2, 3].into_iter()).unwrap();
+        let mapper = FlatProjectionMapper::new(&metadata, [0, 2, 3]).unwrap();
         let input = ScanInput::new(env.access_layer.clone(), mapper)
             .with_cache(CacheStrategy::Disabled)
             .with_memtables(memtables)
@@ -1645,6 +1765,7 @@ mod tests {
             input,
             ranges: Vec::new(),
             scan_fingerprint: None,
+            scan_implied_time_range: None,
             query_start: Instant::now(),
         })
     }
@@ -1653,6 +1774,7 @@ mod tests {
         let meta = FileMeta {
             region_id: RegionId::new(123, 456),
             file_id: Default::default(),
+            level: 1,
             time_range: (
                 Timestamp::new_millisecond(0),
                 Timestamp::new_millisecond(1000),
@@ -1815,5 +1937,99 @@ mod tests {
             2,
             compute_parallel_channel_size(DEFAULT_READ_BATCH_SIZE * 2)
         );
+    }
+
+    #[test]
+    fn test_compute_average_batch_size_uses_arithmetic_mean() {
+        assert_eq!(24, compute_average_batch_size([16, 24, 32]));
+    }
+
+    #[test]
+    fn test_compute_average_batch_size_clamps_values() {
+        assert_eq!(
+            DEFAULT_READ_BATCH_SIZE,
+            compute_average_batch_size([DEFAULT_READ_BATCH_SIZE, DEFAULT_READ_BATCH_SIZE * 2])
+        );
+        assert_eq!(1, compute_average_batch_size([0, 1]));
+    }
+
+    #[test]
+    fn test_compute_average_batch_size_falls_back_when_empty() {
+        assert_eq!(
+            DEFAULT_READ_BATCH_SIZE,
+            compute_average_batch_size(std::iter::empty())
+        );
+    }
+
+    /// Builds a flat-format record batch whose time index column holds `timestamps`.
+    fn flat_ts_batch(timestamps: &[i64]) -> RecordBatch {
+        use datatypes::arrow::array::{TimestampMillisecondArray, UInt8Array, UInt64Array};
+        use datatypes::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        let num_rows = timestamps.len();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("pk", DataType::UInt64, false),
+            Field::new("seq", DataType::UInt64, false),
+            Field::new("op", DataType::UInt8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMillisecondArray::from(timestamps.to_vec())),
+                Arc::new(UInt64Array::from(vec![0u64; num_rows])),
+                Arc::new(UInt64Array::from(vec![0u64; num_rows])),
+                Arc::new(UInt8Array::from(vec![0u8; num_rows])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Splits `timestamps` and returns the time index values of each sub-batch.
+    fn split_ts(timestamps: &[i64]) -> Vec<Vec<i64>> {
+        let mut batches = VecDeque::new();
+        split_record_batch(flat_ts_batch(timestamps), &mut batches);
+        batches
+            .iter()
+            .map(|batch| {
+                let pos = time_index_column_index(batch.num_columns());
+                let (values, _) = timestamp_array_to_primitive(batch.column(pos)).unwrap();
+                values.values().to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_split_record_batch_on_equal_timestamps() {
+        // Splits on both decreasing and equal timestamps.
+        assert_eq!(
+            split_ts(&[1, 2, 2, 3, 1]),
+            vec![vec![1, 2], vec![2, 3], vec![1]]
+        );
+        // A run of equal timestamps yields single-row sub-batches.
+        assert_eq!(split_ts(&[5, 5, 5]), vec![vec![5], vec![5], vec![5]]);
+        // Equal-ts run at the leading edge of the batch.
+        assert_eq!(split_ts(&[5, 5, 1, 2]), vec![vec![5], vec![5], vec![1, 2]]);
+        // Equal-ts run at the trailing edge of the batch.
+        assert_eq!(split_ts(&[1, 2, 5, 5]), vec![vec![1, 2, 5], vec![5]]);
+    }
+
+    #[test]
+    fn test_split_record_batch_on_decreasing_timestamps() {
+        assert_eq!(split_ts(&[1, 2, 3]), vec![vec![1, 2, 3]]);
+        assert_eq!(split_ts(&[1, 3, 2, 4]), vec![vec![1, 3], vec![2, 4]]);
+    }
+
+    #[test]
+    fn test_split_record_batch_empty_and_single_row() {
+        let mut batches = VecDeque::new();
+        split_record_batch(flat_ts_batch(&[]), &mut batches);
+        assert!(batches.is_empty());
+
+        assert_eq!(split_ts(&[42]), vec![vec![42]]);
     }
 }

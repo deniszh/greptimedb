@@ -29,29 +29,30 @@ pub(crate) mod utils;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
-use std::sync::Arc;
 use std::time::Duration;
 
 use common_error::ext::BoxedError;
-use common_event_recorder::{Event, Eventable};
+use common_event_recorder::{Event, PersistentEventContext};
 use common_meta::cache_invalidator::CacheInvalidatorRef;
 use common_meta::ddl::RegionFailureDetectorControllerRef;
 use common_meta::instruction::CacheIdent;
 use common_meta::key::datanode_table::{DatanodeTableKey, DatanodeTableValue};
 use common_meta::key::table_route::TableRouteValue;
+use common_meta::key::topic_name::TopicNameKey;
 use common_meta::key::topic_region::{ReplayCheckpoint, TopicRegionKey};
 use common_meta::key::{DeserializedValueWithBytes, TableMetadataManagerRef};
 use common_meta::kv_backend::{KvBackendRef, ResettableKvBackendRef};
 use common_meta::lock_key::{CatalogLock, RegionLock, SchemaLock, TableLock};
 use common_meta::peer::Peer;
 use common_meta::region_keeper::{MemoryRegionKeeperRef, OperatingRegionGuard};
+use common_meta::rpc::ddl::TriggerReason;
 use common_procedure::error::{
     Error as ProcedureError, FromJsonSnafu, Result as ProcedureResult, ToJsonSnafu,
 };
 use common_procedure::{
-    Context as ProcedureContext, LockKey, Procedure, Status, StringKey, UserMetadata,
+    Context as ProcedureContext, EventContext, LockKey, Procedure, Status, StringKey,
 };
-use common_telemetry::{error, info};
+use common_telemetry::{debug, error, info};
 use manager::RegionMigrationProcedureGuard;
 pub use manager::{
     RegionMigrationManagerRef, RegionMigrationProcedureTask, RegionMigrationProcedureTracker,
@@ -64,7 +65,7 @@ use tokio::time::Instant;
 
 use self::migration_start::RegionMigrationStart;
 use crate::error::{self, Result};
-use crate::events::region_migration_event::RegionMigrationEvent;
+use crate::event::region_migration::{REGION_MIGRATION_EVENT_TYPE, RegionMigrationEvent};
 use crate::metrics::{
     METRIC_META_REGION_MIGRATION_ERROR, METRIC_META_REGION_MIGRATION_EXECUTE,
     METRIC_META_REGION_MIGRATION_STAGE_ELAPSED,
@@ -121,9 +122,9 @@ pub struct PersistentContext {
     /// The timeout for downgrading leader region and upgrading candidate region operations.
     #[serde(with = "humantime_serde", default = "default_timeout")]
     pub(crate) timeout: Duration,
-    /// The trigger reason of region migration.
+    /// The trigger reason persisted for compatibility with versions without procedure context.
     #[serde(default)]
-    pub(crate) trigger_reason: RegionMigrationTriggerReason,
+    trigger_reason: RegionMigrationTriggerReason,
 }
 
 impl PersistentContext {
@@ -145,6 +146,26 @@ impl PersistentContext {
             region_ids,
             timeout,
             trigger_reason,
+        }
+    }
+}
+
+impl RegionMigrationTriggerReason {
+    fn to_trigger_reason(self) -> TriggerReason {
+        match self {
+            Self::Manual => TriggerReason::Manual,
+            Self::AutoRebalance => TriggerReason::AutoRebalance,
+            Self::Failover => TriggerReason::RegionFailover,
+            Self::Unknown => TriggerReason::Unknown,
+        }
+    }
+
+    pub(crate) fn from_trigger_reason(reason: TriggerReason) -> Self {
+        match reason {
+            TriggerReason::Manual => Self::Manual,
+            TriggerReason::AutoRebalance => Self::AutoRebalance,
+            TriggerReason::RegionFailover => Self::Failover,
+            _ => Self::Unknown,
         }
     }
 }
@@ -200,12 +221,6 @@ impl PersistentContext {
                 .push(*region_id);
         }
         table_regions
-    }
-}
-
-impl Eventable for PersistentContext {
-    fn to_event(&self) -> Option<Box<dyn Event>> {
-        Some(Box::new(RegionMigrationEvent::from_persistent_ctx(self)))
     }
 }
 
@@ -429,6 +444,14 @@ pub struct Context {
 }
 
 impl Context {
+    pub(crate) fn trigger_reason(
+        &self,
+        event_context: Option<&PersistentEventContext>,
+    ) -> RegionMigrationTriggerReason {
+        event_context
+            .map(|ctx| RegionMigrationTriggerReason::from_trigger_reason(ctx.reason))
+            .unwrap_or(self.persistent_ctx.trigger_reason)
+    }
     /// Returns the next operation's timeout.
     pub fn next_operation_timeout(&self) -> Option<Duration> {
         self.persistent_ctx
@@ -627,6 +650,23 @@ impl Context {
         );
     }
 
+    /// Notifies the RegionSupervisor to reset failure detectors of candidate regions.
+    pub async fn reset_failure_detectors_for_candidate_regions(&self) {
+        let datanode_id = self.persistent_ctx.to_peer.id;
+        let region_ids = &self.persistent_ctx.region_ids;
+        let detecting_regions = region_ids
+            .iter()
+            .map(|region_id| (datanode_id, *region_id))
+            .collect::<Vec<_>>();
+        self.region_failure_detector_controller
+            .reset_failure_detectors(detecting_regions)
+            .await;
+        info!(
+            "Reset failure detectors after migration success for datanode {}, regions {:?}",
+            datanode_id, region_ids
+        );
+    }
+
     /// Notifies the RegionSupervisor to deregister failure detectors.
     ///
     /// The original failure detectors won't be removed once the procedure was triggered.
@@ -644,11 +684,11 @@ impl Context {
             .await;
     }
 
-    /// Notifies the RegionSupervisor to deregister failure detectors for the candidate region on the destination peer.
+    /// Notifies the RegionSupervisor to deregister failure detectors for the candidate regions on the destination peer.
     ///
-    /// The candidate region may be created on the destination peer,
-    /// so we need to deregister the failure detectors for the candidate region if the procedure is aborted.
-    pub async fn deregister_failure_detectors_for_candidate_region(&self) {
+    /// The candidate regions may be created on the destination peer,
+    /// so we need to deregister the failure detectors for the candidate regions if the procedure is aborted.
+    pub async fn deregister_failure_detectors_for_candidate_regions(&self) {
         let to_peer_id = self.persistent_ctx.to_peer.id;
         let region_ids = &self.persistent_ctx.region_ids;
         let detecting_regions = region_ids
@@ -661,11 +701,15 @@ impl Context {
             .await;
     }
 
-    /// Fetches the replay checkpoints for the given topic region keys.
-    pub async fn get_replay_checkpoints(
+    /// Fetches replay checkpoints and merges them with topic pruned entry ids.
+    pub async fn get_replay_checkpoints_with_topic_pruned_entry_ids(
         &self,
-        topic_region_keys: Vec<TopicRegionKey<'_>>,
+        region_topics: &[(RegionId, String, bool)],
     ) -> Result<HashMap<RegionId, ReplayCheckpoint>> {
+        let topic_region_keys = region_topics
+            .iter()
+            .map(|(region_id, topic, _)| TopicRegionKey::new(*region_id, topic))
+            .collect::<Vec<_>>();
         let topic_region_values = self
             .table_metadata_manager
             .topic_region_manager()
@@ -673,9 +717,41 @@ impl Context {
             .await
             .context(error::TableMetadataManagerSnafu)?;
 
-        let replay_checkpoints = topic_region_values
+        let topic_name_keys = region_topics
+            .iter()
+            .map(|(_, topic, _)| topic.as_str())
+            .collect::<HashSet<_>>()
             .into_iter()
-            .flat_map(|(key, value)| value.checkpoint.map(|value| (key, value)))
+            .map(TopicNameKey::new)
+            .collect::<Vec<_>>();
+        let topic_name_values = self
+            .table_metadata_manager
+            .topic_name_manager()
+            .batch_get(topic_name_keys)
+            .await
+            .context(error::TableMetadataManagerSnafu)?;
+        debug!(
+            "Fetched topic region values: {:?}, topic name values: {:?}",
+            topic_region_values, topic_name_values
+        );
+
+        let replay_checkpoints = region_topics
+            .iter()
+            .filter_map(|(region_id, topic, is_metric_engine)| {
+                let checkpoint = topic_region_values
+                    .get(region_id)
+                    .and_then(|value| value.checkpoint);
+                let pruned_entry_id = topic_name_values
+                    .get(topic)
+                    .map(|value| value.pruned_entry_id);
+
+                ReplayCheckpoint::merge_with_topic_pruned_entry_id(
+                    checkpoint,
+                    pruned_entry_id,
+                    *is_metric_engine,
+                )
+                .map(|checkpoint| (*region_id, checkpoint))
+            })
             .collect::<HashMap<_, _>>();
 
         Ok(replay_checkpoints)
@@ -834,7 +910,7 @@ impl RegionMigrationProcedure {
             }
         }
         self.context
-            .deregister_failure_detectors_for_candidate_region()
+            .deregister_failure_detectors_for_candidate_regions()
             .await;
         self.context.register_failure_detectors().await;
 
@@ -886,7 +962,7 @@ impl Procedure for RegionMigrationProcedure {
                     // Consumes the opening region guard before deregistering the failure detectors.
                     self.context.volatile_ctx.opening_region_guards.clear();
                     self.context
-                        .deregister_failure_detectors_for_candidate_region()
+                        .deregister_failure_detectors_for_candidate_regions()
                         .await;
                     error!(
                         e;
@@ -917,8 +993,17 @@ impl Procedure for RegionMigrationProcedure {
         LockKey::new(self.context.persistent_ctx.lock_key())
     }
 
-    fn user_metadata(&self) -> Option<UserMetadata> {
-        Some(UserMetadata::new(Arc::new(self.context.persistent_ctx())))
+    fn event(&self, ctx: &EventContext<'_>) -> Option<Box<dyn Event>> {
+        if !ctx.event_type_filter.allows(REGION_MIGRATION_EVENT_TYPE) {
+            return None;
+        }
+
+        Some(Box::new(RegionMigrationEvent::from_persistent_ctx(
+            &self.context.persistent_ctx,
+            self.context
+                .trigger_reason(ctx.event_context)
+                .to_trigger_reason(),
+        )))
     }
 }
 
@@ -979,6 +1064,39 @@ mod tests {
     }
 
     #[test]
+    fn test_event_hook_uses_current_persistent_context() {
+        let env = TestingEnv::new();
+        let procedure =
+            RegionMigrationProcedure::new(new_persistent_context(), env.context_factory(), vec![]);
+        let state = common_procedure::ProcedureState::Running;
+        let triggers = [
+            common_procedure::EventTrigger::Recovered,
+            common_procedure::EventTrigger::Retrying {
+                phase: common_procedure::RetryPhase::Execute,
+                attempt: 1,
+            },
+            common_procedure::EventTrigger::RollingBack,
+            common_procedure::EventTrigger::Succeeded,
+            common_procedure::EventTrigger::Failed,
+            common_procedure::EventTrigger::Poisoned,
+        ];
+
+        for trigger in triggers {
+            let event = procedure
+                .event(&EventContext {
+                    procedure_id: common_procedure::ProcedureId::random(),
+                    lifecycle_state: &state,
+                    trigger,
+                    event_type_filter: Arc::new(common_event_recorder::EventTypeFilter::All),
+                    event_context: None,
+                })
+                .unwrap();
+            assert_eq!(event.event_type(), "region_migration");
+            assert_eq!(event.extra_rows().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn test_backward_compatibility() {
         let persistent_ctx = PersistentContext {
             #[allow(deprecated)]
@@ -990,13 +1108,98 @@ mod tests {
             to_peer: Peer::empty(2),
             region_ids: vec![RegionId::new(1024, 1)],
             timeout: Duration::from_secs(10),
-            trigger_reason: RegionMigrationTriggerReason::default(),
+            trigger_reason: RegionMigrationTriggerReason::Unknown,
         };
         // NOTES: Changes it will break backward compatibility.
         let serialized = r#"{"catalog":"greptime","schema":"public","from_peer":{"id":1,"addr":""},"to_peer":{"id":2,"addr":""},"region_id":4398046511105}"#;
         let deserialized: PersistentContext = serde_json::from_str(serialized).unwrap();
 
         assert_eq!(persistent_ctx, deserialized);
+    }
+
+    #[test]
+    fn test_legacy_trigger_reason_survives_recovery_and_repersistence() {
+        let serialized = r#"{"persistent_ctx":{"catalog":"greptime","schema":"public","from_peer":{"id":1,"addr":""},"to_peer":{"id":2,"addr":""},"region_id":4398046511105,"trigger_reason":"Failover"},"state":{"region_migration_state":"RegionMigrationStart"}}"#;
+        let env = TestingEnv::new();
+        let procedure = RegionMigrationProcedure::from_json(
+            serialized,
+            env.context_factory(),
+            RegionMigrationProcedureTracker::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            procedure.context.persistent_ctx.trigger_reason,
+            RegionMigrationTriggerReason::Failover
+        );
+        let repersisted = procedure.dump().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&repersisted).unwrap()["persistent_ctx"]["trigger_reason"],
+            "Failover"
+        );
+
+        let recovered = RegionMigrationProcedure::from_json(
+            &repersisted,
+            env.context_factory(),
+            RegionMigrationProcedureTracker::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.context.trigger_reason(None),
+            RegionMigrationTriggerReason::Failover
+        );
+        let event_context = PersistentEventContext::new(TriggerReason::AutoRebalance);
+        assert_eq!(
+            recovered.context.trigger_reason(Some(&event_context)),
+            RegionMigrationTriggerReason::AutoRebalance
+        );
+
+        let state = common_procedure::ProcedureState::Running;
+        let event = recovered
+            .event(&EventContext {
+                procedure_id: common_procedure::ProcedureId::random(),
+                lifecycle_state: &state,
+                trigger: common_procedure::EventTrigger::Recovered,
+                event_type_filter: Arc::new(common_event_recorder::EventTypeFilter::All),
+                event_context: None,
+            })
+            .unwrap();
+        assert_eq!(
+            event.extra_rows().unwrap()[0].values[3].value_data,
+            Some(api::v1::value::ValueData::StringValue(
+                "Failover".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_migration_reason_uses_event_context() {
+        let env = TestingEnv::new();
+        let context = env.context_factory().new_context(new_persistent_context());
+        let event_context = PersistentEventContext::new(TriggerReason::RegionFailover);
+
+        assert_eq!(
+            context.trigger_reason(Some(&event_context)),
+            RegionMigrationTriggerReason::Failover
+        );
+
+        let procedure =
+            RegionMigrationProcedure::new(new_persistent_context(), env.context_factory(), vec![]);
+        let state = common_procedure::ProcedureState::Running;
+        let event = procedure
+            .event(&EventContext {
+                procedure_id: common_procedure::ProcedureId::random(),
+                lifecycle_state: &state,
+                trigger: common_procedure::EventTrigger::Submitted,
+                event_type_filter: Arc::new(common_event_recorder::EventTypeFilter::All),
+                event_context: Some(&event_context),
+            })
+            .unwrap();
+        assert_eq!(
+            event.extra_rows().unwrap()[0].values[3].value_data,
+            Some(api::v1::value::ValueData::StringValue(
+                "Failover".to_string()
+            ))
+        );
     }
 
     #[derive(Debug, Serialize, Deserialize, Default)]
@@ -1448,7 +1651,13 @@ mod tests {
                 "Should be throwing a retryable error",
                 Some(mock_datanode_reply(
                     to_peer_id,
-                    Arc::new(|id| Ok(new_open_region_reply(id, false, None))),
+                    Arc::new(|id| {
+                        Ok(new_open_region_reply(
+                            id,
+                            false,
+                            Some("mock retryable open region error".to_string()),
+                        ))
+                    }),
                 )),
                 Assertion::error(|error| assert!(error.is_retryable(), "err: {error:?}")),
             ),

@@ -121,10 +121,10 @@ impl DataSource for MemtableDataSource {
         &self,
         request: ScanRequest,
     ) -> std::result::Result<SendableRecordBatchStream, BoxedError> {
-        let df_recordbatch = if let Some(indices) = request.projection {
+        let df_recordbatch = if let Some(indices) = request.projection.as_deref() {
             self.recordbatch
                 .df_record_batch()
-                .project(&indices)
+                .project(indices)
                 .context(TableProjectionSnafu)
                 .map_err(BoxedError::new)?
         } else {

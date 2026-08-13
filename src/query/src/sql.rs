@@ -20,8 +20,9 @@ use std::sync::Arc;
 
 use catalog::CatalogManagerRef;
 use catalog::information_schema::{
-    CHARACTER_SETS, COLLATIONS, COLUMNS, FLOWS, KEY_COLUMN_USAGE, REGION_PEERS, SCHEMATA, TABLES,
-    VIEWS, columns, flows, key_column_usage, process_list, region_peers, schemata, tables,
+    CHARACTER_SETS, COLLATIONS, COLUMNS, FLOW_STATISTICS, FLOWS, REGION_PEERS, SCHEMATA,
+    STATISTICS, TABLES, VIEWS, columns, flow_statistics, flows, process_list, region_peers,
+    schemata, statistics, tables,
 };
 use common_catalog::consts::{
     INFORMATION_SCHEMA_NAME, SEMANTIC_TYPE_FIELD, SEMANTIC_TYPE_PRIMARY_KEY,
@@ -30,9 +31,9 @@ use common_catalog::consts::{
 use common_catalog::format_full_table_name;
 use common_datasource::file_format::{FileFormat, Format, infer_schemas};
 use common_datasource::lister::{Lister, Source};
-use common_datasource::object_store::build_backend;
-use common_datasource::util::find_dir_and_filename;
+use common_datasource::object_store::{LocalFileAccess, build_backend_with_path};
 use common_meta::SchemaOptions;
+use common_meta::ddl::create_flow::FlowType;
 use common_meta::key::flow::flow_info::FlowInfoValue;
 use common_query::Output;
 use common_query::prelude::greptime_timestamp;
@@ -40,9 +41,8 @@ use common_recordbatch::RecordBatches;
 use common_recordbatch::adapter::RecordBatchStreamAdapter;
 use common_time::Timestamp;
 use common_time::timezone::get_timezone;
-use datafusion::common::ScalarValue;
 use datafusion::prelude::SessionContext;
-use datafusion_expr::{Expr, SortExpr, case, col, lit};
+use datafusion_expr::{Expr, SortExpr, col, lit};
 use datatypes::prelude::*;
 use datatypes::schema::{ColumnDefaultConstraint, ColumnSchema, Schema};
 use datatypes::vectors::StringVector;
@@ -58,8 +58,8 @@ use sql::parser::ParserContext;
 use sql::statements::OptionMap;
 use sql::statements::create::{CreateDatabase, CreateFlow, CreateView, Partitions, SqlOrTql};
 use sql::statements::show::{
-    ShowColumns, ShowDatabases, ShowFlows, ShowIndex, ShowKind, ShowProcessList, ShowRegion,
-    ShowTableStatus, ShowTables, ShowVariables, ShowViews,
+    ShowColumns, ShowDatabases, ShowFlowStatus, ShowFlows, ShowIndex, ShowKind, ShowProcessList,
+    ShowRegion, ShowTableStatus, ShowTables, ShowVariables, ShowViews,
 };
 use sql::statements::statement::Statement;
 use sqlparser::ast::ObjectName;
@@ -78,6 +78,7 @@ const VIEWS_COLUMN: &str = "Views";
 const FLOWS_COLUMN: &str = "Flows";
 const FIELD_COLUMN: &str = "Field";
 const TABLE_TYPE_COLUMN: &str = "Table_type";
+
 const COLUMN_NAME_COLUMN: &str = "Column";
 const COLUMN_GREPTIME_TYPE_COLUMN: &str = "Greptime_type";
 const COLUMN_TYPE_COLUMN: &str = "Type";
@@ -93,7 +94,6 @@ const COLUMN_SEMANTIC_TYPE_COLUMN: &str = "Semantic Type";
 const YES_STR: &str = "YES";
 const NO_STR: &str = "NO";
 const PRI_KEY: &str = "PRI";
-const TIME_INDEX: &str = "TIME INDEX";
 
 /// SHOW index columns
 const INDEX_TABLE_COLUMN: &str = "Table";
@@ -171,10 +171,6 @@ static SHOW_CREATE_VIEW_OUTPUT_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
         ColumnSchema::new("Create View", ConcreteDataType::string_datatype(), false),
     ]))
 });
-
-fn null() -> Expr {
-    lit(ScalarValue::Null)
-}
 
 pub async fn show_databases(
     stmt: ShowDatabases,
@@ -430,51 +426,35 @@ pub async fn show_index(
     };
 
     let select = vec![
-        col(key_column_usage::TABLE_NAME).alias(INDEX_TABLE_COLUMN),
-        // 1 as `Non_unique`: contain duplicates
-        lit(1).alias(INDEX_NONT_UNIQUE_COLUMN),
-        col(key_column_usage::CONSTRAINT_NAME).alias(INDEX_KEY_NAME_COLUMN),
-        col(key_column_usage::ORDINAL_POSITION).alias(INDEX_SEQ_IN_INDEX_COLUMN),
-        col(key_column_usage::COLUMN_NAME).alias(INDEX_COLUMN_NAME_COLUMN),
-        // How the column is sorted in the index: A (ascending).
-        lit("A").alias(COLUMN_COLLATION_COLUMN),
-        null().alias(INDEX_CARDINALITY_COLUMN),
-        null().alias(INDEX_SUB_PART_COLUMN),
-        null().alias(INDEX_PACKED_COLUMN),
-        // case `constraint_name`
-        //    when 'TIME INDEX' then 'NO'
-        //    else 'YES'
-        // end as `Null`
-        case(col(key_column_usage::CONSTRAINT_NAME))
-            .when(lit(TIME_INDEX), lit(NO_STR))
-            .otherwise(lit(YES_STR))
-            .context(error::PlanSqlSnafu)?
-            .alias(COLUMN_NULLABLE_COLUMN),
-        col(key_column_usage::GREPTIME_INDEX_TYPE).alias(INDEX_INDEX_TYPE_COLUMN),
-        lit("").alias(COLUMN_COMMENT_COLUMN),
-        lit("").alias(INDEX_COMMENT_COLUMN),
-        lit(YES_STR).alias(INDEX_VISIBLE_COLUMN),
-        null().alias(INDEX_EXPRESSION_COLUMN),
+        col(statistics::TABLE_NAME).alias(INDEX_TABLE_COLUMN),
+        col(statistics::NON_UNIQUE).alias(INDEX_NONT_UNIQUE_COLUMN),
+        col(statistics::INDEX_NAME).alias(INDEX_KEY_NAME_COLUMN),
+        col(statistics::SEQ_IN_INDEX).alias(INDEX_SEQ_IN_INDEX_COLUMN),
+        col(statistics::COLUMN_NAME).alias(INDEX_COLUMN_NAME_COLUMN),
+        col(statistics::COLLATION).alias(COLUMN_COLLATION_COLUMN),
+        col(statistics::CARDINALITY).alias(INDEX_CARDINALITY_COLUMN),
+        col(statistics::SUB_PART).alias(INDEX_SUB_PART_COLUMN),
+        col(statistics::PACKED).alias(INDEX_PACKED_COLUMN),
+        col(statistics::NULLABLE).alias(COLUMN_NULLABLE_COLUMN),
+        col(statistics::INDEX_TYPE).alias(INDEX_INDEX_TYPE_COLUMN),
+        col(statistics::COMMENT).alias(COLUMN_COMMENT_COLUMN),
+        col(statistics::INDEX_COMMENT).alias(INDEX_COMMENT_COLUMN),
+        col(statistics::IS_VISIBLE).alias(INDEX_VISIBLE_COLUMN),
+        col(statistics::EXPRESSION).alias(INDEX_EXPRESSION_COLUMN),
     ];
 
     let projects = vec![
-        (key_column_usage::TABLE_NAME, INDEX_TABLE_COLUMN),
+        (statistics::TABLE_NAME, INDEX_TABLE_COLUMN),
         (INDEX_NONT_UNIQUE_COLUMN, INDEX_NONT_UNIQUE_COLUMN),
-        (key_column_usage::CONSTRAINT_NAME, INDEX_KEY_NAME_COLUMN),
-        (
-            key_column_usage::ORDINAL_POSITION,
-            INDEX_SEQ_IN_INDEX_COLUMN,
-        ),
-        (key_column_usage::COLUMN_NAME, INDEX_COLUMN_NAME_COLUMN),
+        (statistics::INDEX_NAME, INDEX_KEY_NAME_COLUMN),
+        (statistics::SEQ_IN_INDEX, INDEX_SEQ_IN_INDEX_COLUMN),
+        (statistics::COLUMN_NAME, INDEX_COLUMN_NAME_COLUMN),
         (COLUMN_COLLATION_COLUMN, COLUMN_COLLATION_COLUMN),
         (INDEX_CARDINALITY_COLUMN, INDEX_CARDINALITY_COLUMN),
         (INDEX_SUB_PART_COLUMN, INDEX_SUB_PART_COLUMN),
         (INDEX_PACKED_COLUMN, INDEX_PACKED_COLUMN),
         (COLUMN_NULLABLE_COLUMN, COLUMN_NULLABLE_COLUMN),
-        (
-            key_column_usage::GREPTIME_INDEX_TYPE,
-            INDEX_INDEX_TYPE_COLUMN,
-        ),
+        (statistics::INDEX_TYPE, INDEX_INDEX_TYPE_COLUMN),
         (COLUMN_COMMENT_COLUMN, COLUMN_COMMENT_COLUMN),
         (INDEX_COMMENT_COLUMN, INDEX_COMMENT_COLUMN),
         (INDEX_VISIBLE_COLUMN, INDEX_VISIBLE_COLUMN),
@@ -482,18 +462,20 @@ pub async fn show_index(
     ];
 
     let filters = vec![
-        col(key_column_usage::TABLE_NAME).eq(lit(&stmt.table)),
-        col(key_column_usage::TABLE_SCHEMA).eq(lit(schema_name.clone())),
-        col(key_column_usage::REAL_TABLE_CATALOG).eq(lit(query_ctx.current_catalog())),
+        col(statistics::TABLE_NAME).eq(lit(&stmt.table)),
+        col(statistics::TABLE_SCHEMA).eq(lit(schema_name.clone())),
     ];
     let like_field = None;
-    let sort = vec![col(columns::COLUMN_NAME).sort(true, true)];
+    let sort = vec![
+        col(statistics::INDEX_NAME).sort(true, true),
+        col(statistics::SEQ_IN_INDEX).sort(true, true),
+    ];
 
     query_from_information_schema_table(
         query_engine,
         catalog_manager,
         query_ctx,
-        KEY_COLUMN_USAGE,
+        STATISTICS,
         select,
         projects,
         filters,
@@ -990,6 +972,45 @@ pub async fn show_flows(
     .await
 }
 
+/// Execute [`ShowFlowStatus`] statement and return the [`Output`] if success.
+pub async fn show_flow_status(
+    stmt: ShowFlowStatus,
+    query_engine: &QueryEngineRef,
+    catalog_manager: &CatalogManagerRef,
+    query_ctx: QueryContextRef,
+) -> Result<Output> {
+    let projects = vec![
+        (flow_statistics::FLOW_ID, flow_statistics::FLOW_ID),
+        (flow_statistics::FLOW_NAME, flow_statistics::FLOW_NAME),
+        (flow_statistics::START_TIME, flow_statistics::START_TIME),
+        (
+            flow_statistics::LAST_EXECUTION_TIME,
+            flow_statistics::LAST_EXECUTION_TIME,
+        ),
+        (
+            flow_statistics::UPTIME_SECONDS,
+            flow_statistics::UPTIME_SECONDS,
+        ),
+        (flow_statistics::STATE_SIZE, flow_statistics::STATE_SIZE),
+    ];
+    let like_field = Some(flow_statistics::FLOW_NAME);
+    let sort = vec![col(flow_statistics::FLOW_NAME).sort(true, true)];
+
+    query_from_information_schema_table(
+        query_engine,
+        catalog_manager,
+        query_ctx,
+        FLOW_STATISTICS,
+        vec![],
+        projects,
+        vec![],
+        like_field,
+        sort,
+        stmt.kind,
+    )
+    .await
+}
+
 #[cfg(feature = "enterprise")]
 pub async fn show_triggers(
     stmt: sql::statements::show::trigger::ShowTriggers,
@@ -1056,6 +1077,10 @@ pub fn show_create_flow(
         expire_after: flow_val.expire_after(),
         eval_interval: flow_val.eval_interval(),
         comment,
+        flow_options: OptionMap::from_filtered_string_map(
+            flow_val.options(),
+            &[FlowType::FLOW_TYPE_KEY],
+        ),
         query,
     };
 
@@ -1096,9 +1121,16 @@ fn describe_column_types(columns_schemas: &[ColumnSchema]) -> VectorRef {
     Arc::new(StringVector::from(
         columns_schemas
             .iter()
-            .map(|cs| cs.data_type.name())
+            .map(|cs| describe_column_type_name(&cs.data_type))
             .collect::<Vec<_>>(),
     ))
+}
+
+fn describe_column_type_name(data_type: &ConcreteDataType) -> String {
+    match data_type {
+        ConcreteDataType::Json(json_type) if json_type.is_json2() => "Json2".to_string(),
+        data_type => data_type.name(),
+    }
 }
 
 fn describe_column_keys(
@@ -1156,6 +1188,7 @@ fn describe_column_semantic_types(
 // lists files in the frontend to reduce unnecessary scan requests repeated in each datanode.
 pub async fn prepare_file_table_files(
     options: &HashMap<String, String>,
+    local_file_access: &LocalFileAccess,
 ) -> Result<(ObjectStore, Vec<String>)> {
     let url = options
         .get(FILE_TABLE_LOCATION_KEY)
@@ -1163,19 +1196,20 @@ pub async fn prepare_file_table_files(
             name: FILE_TABLE_LOCATION_KEY,
         })?;
 
-    let (dir, filename) = find_dir_and_filename(url);
-    let source = if let Some(filename) = filename {
-        Source::Filename(filename)
-    } else {
-        Source::Dir
-    };
     let regex = options
         .get(FILE_TABLE_PATTERN_KEY)
         .map(|x| Regex::new(x))
         .transpose()
         .context(error::BuildRegexSnafu)?;
-    let object_store = build_backend(url, options).context(error::BuildBackendSnafu)?;
-    let lister = Lister::new(object_store.clone(), source, dir, regex);
+    let backend = build_backend_with_path(url, options, local_file_access)
+        .await
+        .context(error::BuildBackendSnafu)?;
+    let source = if let Some(filename) = backend.object_path {
+        Source::Filename(filename)
+    } else {
+        Source::Dir
+    };
+    let lister = Lister::new(backend.object_store.clone(), source, url.clone(), regex);
     // If we scan files in a directory every time the database restarts,
     // then it might lead to a potential undefined behavior:
     // If a user adds a file with an incompatible schema to that directory,
@@ -1193,7 +1227,7 @@ pub async fn prepare_file_table_files(
             }
         })
         .collect::<Vec<_>>();
-    Ok((object_store, files))
+    Ok((backend.object_store, files))
 }
 
 pub async fn infer_file_table_schema(
@@ -1326,7 +1360,11 @@ pub async fn show_processlist(
         ]
     };
 
-    let filters = vec![];
+    let filters = if query_ctx.current_user().is_admin() {
+        vec![]
+    } else {
+        vec![col(process_list::CATALOG).eq(lit(query_ctx.current_catalog()))]
+    };
     let like_field = None;
     let sort = vec![col("id").sort(true, true)];
     query_from_information_schema_table(
@@ -1354,6 +1392,7 @@ mod test {
     use common_time::timestamp::TimeUnit;
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::{ColumnDefaultConstraint, ColumnSchema, Schema, SchemaRef};
+    use datatypes::types::json_type::JsonNativeType;
     use datatypes::vectors::{StringVector, TimestampMillisecondVector, UInt32Vector, VectorRef};
     use session::context::QueryContextBuilder;
     use snafu::ResultExt;
@@ -1362,7 +1401,7 @@ mod test {
     use table::TableRef;
     use table::test_util::MemTable;
 
-    use super::show_variable;
+    use super::{describe_column_type_name, show_variable};
     use crate::error;
     use crate::error::Result;
     use crate::sql::{
@@ -1403,6 +1442,18 @@ mod test {
         ];
 
         describe_table_test_by_schema(table_name, schema, data, expected_columns)
+    }
+
+    #[test]
+    fn test_describe_column_type_name_json2() {
+        assert_eq!(
+            describe_column_type_name(&ConcreteDataType::json2(JsonNativeType::Null)),
+            "Json2"
+        );
+        assert_eq!(
+            describe_column_type_name(&ConcreteDataType::uint32_datatype()),
+            "UInt32"
+        );
     }
 
     fn describe_table_test_by_schema(

@@ -17,7 +17,7 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use common_telemetry::{debug, error, info, warn};
@@ -27,27 +27,31 @@ use futures::future::BoxFuture;
 use log_store::kafka::log_store::KafkaLogStore;
 use log_store::noop::log_store::NoopLogStore;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
+use object_store::ObjectStore;
 use object_store::manager::ObjectStoreManagerRef;
-use object_store::util::normalize_dir;
+use object_store::util::{is_object_storage, normalize_dir};
+use parquet::file::metadata::PageIndexPolicy;
 use snafu::{OptionExt, ResultExt, ensure};
+use store_api::codec::PrimaryKeyEncoding;
 use store_api::logstore::LogStore;
 use store_api::logstore::provider::Provider;
 use store_api::metadata::{
     ColumnMetadata, RegionMetadata, RegionMetadataBuilder, RegionMetadataRef,
 };
 use store_api::region_engine::RegionRole;
-use store_api::region_request::PathType;
+use store_api::region_request::{PathType, RegionRequirements};
 use store_api::storage::{ColumnId, RegionId};
 use tokio::sync::Semaphore;
 
 use crate::access_layer::AccessLayer;
-use crate::cache::CacheManagerRef;
 use crate::cache::file_cache::{FileCache, FileType, IndexKey};
+use crate::cache::{CacheManagerRef, SstMetaPreparation, prepare_sst_meta};
 use crate::config::MitoConfig;
+use crate::engine::region_hook::RegionHookRef;
 use crate::error;
 use crate::error::{
-    EmptyRegionDirSnafu, InvalidMetadataSnafu, ObjectStoreNotFoundSnafu, RegionCorruptedSnafu,
-    Result, StaleLogEntrySnafu,
+    EmptyRegionDirSnafu, InvalidMetadataSnafu, InvalidRegionOptionsSnafu, ObjectStoreNotFoundSnafu,
+    RegionCorruptedSnafu, Result, StaleLogEntrySnafu,
 };
 use crate::manifest::action::RegionManifest;
 use crate::manifest::manager::{RegionManifestManager, RegionManifestOptions};
@@ -59,6 +63,7 @@ use crate::region::options::RegionOptions;
 use crate::region::version::{VersionBuilder, VersionControl, VersionControlRef};
 use crate::region::{
     ManifestContext, ManifestStats, MitoRegion, MitoRegionRef, RegionLeaderState, RegionRoleState,
+    RegionStats,
 };
 use crate::region_write_ctx::RegionWriteCtx;
 use crate::request::OptionOutputTx;
@@ -70,7 +75,7 @@ use crate::sst::file_ref::FileReferenceManagerRef;
 use crate::sst::index::intermediate::IntermediateManager;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
 use crate::sst::location::{self, region_dir_from_table_dir};
-use crate::sst::parquet::metadata::MetadataLoader;
+use crate::sst::parquet::metadata::{MetadataLoader, extract_primary_key_range};
 use crate::sst::parquet::reader::MetadataCacheMetrics;
 use crate::time_provider::TimeProviderRef;
 use crate::wal::entry_reader::WalEntryReader;
@@ -80,6 +85,13 @@ const PARQUET_META_PRELOAD_CONCURRENCY: usize = 8;
 
 static PARQUET_META_PRELOAD_SEMAPHORE: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(PARQUET_META_PRELOAD_CONCURRENCY));
+
+fn initial_pruned_entry_id(wal_options: &WalOptions) -> EntryId {
+    match wal_options {
+        WalOptions::Kafka(options) => options.initial_pruned_entry_id.unwrap_or(0),
+        WalOptions::RaftEngine | WalOptions::Noop => 0,
+    }
+}
 
 /// A fetcher to retrieve partition expr for a region.
 ///
@@ -113,6 +125,7 @@ pub(crate) struct RegionOpener {
     replay_checkpoint: Option<u64>,
     file_ref_manager: FileReferenceManagerRef,
     partition_expr_fetcher: PartitionExprFetcherRef,
+    hook: Option<RegionHookRef>,
 }
 
 impl RegionOpener {
@@ -151,7 +164,14 @@ impl RegionOpener {
             replay_checkpoint: None,
             file_ref_manager,
             partition_expr_fetcher,
+            hook: None,
         }
+    }
+
+    /// Sets the region hook for observing manifest mutations.
+    pub(crate) fn hook(mut self, hook: Option<RegionHookRef>) -> Self {
+        self.hook = hook;
+        self
     }
 
     /// Sets metadata builder of the region to create.
@@ -179,7 +199,8 @@ impl RegionOpener {
 
     /// Parses and sets options for the region.
     pub(crate) fn parse_options(self, options: HashMap<String, String>) -> Result<Self> {
-        self.options(RegionOptions::try_from(&options)?)
+        let region_id = self.region_id;
+        self.options(RegionOptions::try_from_options(region_id, &options)?)
     }
 
     /// Sets the replay checkpoint for the region.
@@ -203,6 +224,32 @@ impl RegionOpener {
         options.validate()?;
         self.options = Some(options);
         Ok(self)
+    }
+
+    /// Ensures the current region request satisfies its requirements.
+    pub(crate) fn ensure_region_requirements(
+        &self,
+        requirements: RegionRequirements,
+    ) -> Result<()> {
+        if !requirements.object_storage {
+            return Ok(());
+        }
+
+        let options = self.options.as_ref().context(InvalidRegionOptionsSnafu {
+            reason: "missing region options before requirement check".to_string(),
+        })?;
+        let object_store = get_object_store(&options.storage, &self.object_store_manager)?;
+
+        ensure!(
+            supports_open_region_object_storage_requirement(&object_store),
+            error::RegionRequirementSnafu {
+                region_id: self.region_id,
+                requirement: "object storage",
+                reason: "region data must be accessible from another datanode",
+            }
+        );
+
+        Ok(())
     }
 
     /// Sets the cache manager for the region.
@@ -287,7 +334,10 @@ impl RegionOpener {
             .and_then(|cm| cm.write_cache())
             .and_then(|wc| wc.manifest_cache());
         // For remote WAL, we need to set flushed_entry_id to current topic's latest entry id.
-        let flushed_entry_id = provider.initial_flushed_entry_id::<S>(wal.store());
+        // Kafka WAL allocation also carries the topic's pruned entry id as a create-time hint.
+        let flushed_entry_id = provider
+            .initial_flushed_entry_id::<S>(wal.store())
+            .max(initial_pruned_entry_id(&options.wal_options));
         let manifest_manager = RegionManifestManager::new(
             metadata.clone(),
             flushed_entry_id,
@@ -314,6 +364,7 @@ impl RegionOpener {
 
         let version = VersionBuilder::new(metadata, mutable)
             .options(options)
+            .flushed_entry_id(flushed_entry_id)
             .build();
         let version_control = Arc::new(VersionControl::new(version));
         let access_layer = Arc::new(AccessLayer::new(
@@ -333,6 +384,7 @@ impl RegionOpener {
             manifest_ctx: Arc::new(ManifestContext::new(
                 manifest_manager,
                 RegionRoleState::Leader(RegionLeaderState::Writable),
+                self.hook.clone(),
             )),
             file_purger: create_file_purger(
                 config.gc.enable,
@@ -344,12 +396,11 @@ impl RegionOpener {
             ),
             provider,
             last_flush_millis: AtomicI64::new(now),
-            last_compaction_millis: AtomicI64::new(now),
+            last_schedule_compaction_millis: AtomicI64::new(now),
             time_provider: self.time_provider.clone(),
-            topic_latest_entry_id: AtomicU64::new(0),
-            written_bytes: Arc::new(AtomicU64::new(0)),
+            topic_latest_entry_id: AtomicU64::new(flushed_entry_id),
+            region_stats: RegionStats::new(),
             stats: self.stats,
-            staging_partition_info: Mutex::new(None),
         }))
     }
 
@@ -386,31 +437,7 @@ impl RegionOpener {
     }
 
     fn provider<S: LogStore>(&self, wal_options: &WalOptions) -> Result<Provider> {
-        match wal_options {
-            WalOptions::RaftEngine => {
-                ensure!(
-                    TypeId::of::<RaftEngineLogStore>() == TypeId::of::<S>()
-                        || TypeId::of::<NoopLogStore>() == TypeId::of::<S>(),
-                    error::IncompatibleWalProviderChangeSnafu {
-                        global: "`kafka`",
-                        region: "`raft_engine`",
-                    }
-                );
-                Ok(Provider::raft_engine_provider(self.region_id.as_u64()))
-            }
-            WalOptions::Kafka(options) => {
-                ensure!(
-                    TypeId::of::<KafkaLogStore>() == TypeId::of::<S>()
-                        || TypeId::of::<NoopLogStore>() == TypeId::of::<S>(),
-                    error::IncompatibleWalProviderChangeSnafu {
-                        global: "`raft_engine`",
-                        region: "`kafka`",
-                    }
-                );
-                Ok(Provider::kafka_provider(options.topic.clone()))
-            }
-            WalOptions::Noop => Ok(Provider::noop_provider()),
-        }
+        provider_from_wal_options::<S>(self.region_id, wal_options)
     }
 
     /// Tries to open the region and returns `None` if the region directory is empty.
@@ -510,11 +537,11 @@ impl RegionOpener {
         let flushed_entry_id = version.flushed_entry_id;
         let version_control = Arc::new(VersionControl::new(version));
 
+        let replay_from_entry_id = self
+            .replay_checkpoint
+            .unwrap_or_default()
+            .max(flushed_entry_id);
         let topic_latest_entry_id = if !self.skip_wal_replay {
-            let replay_from_entry_id = self
-                .replay_checkpoint
-                .unwrap_or_default()
-                .max(flushed_entry_id);
             info!(
                 "Start replaying memtable at replay_from_entry_id: {} for region {}, manifest version: {}, flushed entry id: {}, elapsed: {:?}",
                 replay_from_entry_id,
@@ -537,7 +564,11 @@ impl RegionOpener {
             // Only set after the WAL replay is completed.
 
             if provider.is_remote_wal() && version_control.current().version.memtables.is_empty() {
-                wal.store().latest_entry_id(&provider).unwrap_or(0)
+                wal.store()
+                    .latest_entry_id(&provider)
+                    .unwrap_or(replay_from_entry_id)
+            } else if provider.is_remote_wal() {
+                replay_from_entry_id
             } else {
                 0
             }
@@ -550,7 +581,11 @@ impl RegionOpener {
                 now.elapsed()
             );
 
-            0
+            if provider.is_remote_wal() {
+                replay_from_entry_id
+            } else {
+                0
+            }
         };
 
         if let Some(committed_in_manifest) = manifest.committed_sequence {
@@ -577,17 +612,16 @@ impl RegionOpener {
             manifest_ctx: Arc::new(ManifestContext::new(
                 manifest_manager,
                 RegionRoleState::Follower,
+                self.hook.clone(),
             )),
             file_purger,
             provider: provider.clone(),
             last_flush_millis: AtomicI64::new(now),
-            last_compaction_millis: AtomicI64::new(now),
+            last_schedule_compaction_millis: AtomicI64::new(now),
             time_provider: self.time_provider.clone(),
             topic_latest_entry_id: AtomicU64::new(topic_latest_entry_id),
-            written_bytes: Arc::new(AtomicU64::new(0)),
+            region_stats: RegionStats::new(),
             stats: self.stats.clone(),
-            // TODO(weny): reload the staging partition info from the manifest.
-            staging_partition_info: Mutex::new(None),
         };
 
         let region = Arc::new(region);
@@ -597,6 +631,52 @@ impl RegionOpener {
 
         Ok(Some(region))
     }
+}
+
+pub(crate) fn provider_from_wal_options<S: LogStore>(
+    region_id: RegionId,
+    wal_options: &WalOptions,
+) -> Result<Provider> {
+    match wal_options {
+        WalOptions::RaftEngine => {
+            ensure!(
+                TypeId::of::<RaftEngineLogStore>() == TypeId::of::<S>()
+                    || TypeId::of::<NoopLogStore>() == TypeId::of::<S>(),
+                error::IncompatibleWalProviderChangeSnafu {
+                    global: "`kafka`",
+                    region: "`raft_engine`",
+                }
+            );
+            Ok(Provider::raft_engine_provider(region_id.as_u64()))
+        }
+        WalOptions::Kafka(options) => {
+            ensure!(
+                TypeId::of::<KafkaLogStore>() == TypeId::of::<S>()
+                    || TypeId::of::<NoopLogStore>() == TypeId::of::<S>(),
+                error::IncompatibleWalProviderChangeSnafu {
+                    global: "`raft_engine`",
+                    region: "`kafka`",
+                }
+            );
+            Ok(Provider::kafka_provider(options.topic.clone()))
+        }
+        WalOptions::Noop => Ok(Provider::noop_provider()),
+    }
+}
+
+#[cfg(not(feature = "test-shared-fs-region-migration"))]
+fn supports_open_region_object_storage_requirement(object_store: &ObjectStore) -> bool {
+    is_object_storage(object_store)
+}
+
+#[cfg(feature = "test-shared-fs-region-migration")]
+fn supports_open_region_object_storage_requirement(object_store: &ObjectStore) -> bool {
+    // Integration tests can configure multiple datanodes to share the same
+    // temporary home dir. That makes file storage accessible to all test
+    // datanodes, but production file storage still does not satisfy this
+    // requirement.
+    is_object_storage(object_store)
+        || object_store.info().scheme() == object_store::services::FS_SCHEME
 }
 
 /// Creates a version builder from a region manifest.
@@ -618,18 +698,24 @@ pub(crate) fn version_builder_from_manifest(
 
 /// Updates region options by persistent options.
 pub(crate) fn sanitize_region_options(manifest: &RegionManifest, options: &mut RegionOptions) {
-    let option_format = options.sst_format.unwrap_or_default();
-    if option_format != manifest.sst_format {
-        common_telemetry::warn!(
-            "Overriding SST format from {:?} to {:?} for region {}",
-            option_format,
-            manifest.sst_format,
-            manifest.metadata.region_id,
-        );
+    // The caller-supplied options win when they specify an explicit `sst_format`,
+    // so re-parsed options (e.g. bulk memtable forcing flat format) take effect on
+    // the running region instead of being clobbered by the persisted manifest value.
+    // Fall back to the manifest only when the caller did not provide a value.
+    match options.sst_format {
+        Some(format) if format != manifest.sst_format => {
+            common_telemetry::warn!(
+                "Overriding SST format from {:?} (manifest) to {:?} (options) for region {}",
+                manifest.sst_format,
+                format,
+                manifest.metadata.region_id,
+            );
+        }
+        Some(_) => {}
+        None => {
+            options.sst_format = Some(manifest.sst_format);
+        }
     }
-    // Always set sst_format from manifest to ensure it's explicitly stored,
-    // even when the default matches the manifest value.
-    options.sst_format = Some(manifest.sst_format);
     if let Some(manifest_append_mode) = manifest.append_mode
         && options.append_mode != manifest_append_mode
     {
@@ -747,6 +833,7 @@ where
     // data in the WAL.
     let mut last_entry_id = flushed_entry_id;
     let replay_from_entry_id = flushed_entry_id + 1;
+    let region_metadata = version_control.current().version.metadata.clone();
 
     let mut wal_stream = wal_entry_reader.read(provider, replay_from_entry_id)?;
     while let Some(res) = wal_stream.next().await {
@@ -791,7 +878,16 @@ where
         }
 
         for bulk_entry in entry.bulk_entries {
-            let part = BulkPart::try_from(bulk_entry)?;
+            let mut part = BulkPart::try_from(bulk_entry)?;
+            // The entry may miss columns added by a concurrent alter if it was
+            // written by a writer with a stale schema (older versions kept the
+            // stale raw data when filling missing columns). Fills missing
+            // columns like the write path, otherwise the memtable rejects the
+            // batch. Skips sparse batches as they don't carry tag columns by
+            // design.
+            if region_metadata.primary_key_encoding != PrimaryKeyEncoding::Sparse {
+                part.fill_missing_columns(&region_metadata)?;
+            }
             rows_replayed += part.num_rows();
             // During replay, we should adopt the sequence from WAL.
             let bulk_sequence_from_wal = part.sequence;
@@ -812,6 +908,9 @@ where
         region_write_ctx.set_next_entry_id(last_entry_id + 1);
         region_write_ctx.write_memtable().await;
         region_write_ctx.write_bulk().await;
+        // Publish the replayed sequences only after all rows (including bulk
+        // parts) are installed, matching the write path ordering.
+        region_write_ctx.publish_sequence_and_entry_id();
     }
 
     // TODO(weny): We need to update `flushed_entry_id` in the region manifest
@@ -994,6 +1093,7 @@ fn maybe_load_cache(
 /// - If the region storage backend is local filesystem (`Scheme::Fs`), it may also load metadata
 ///   directly from the local store.
 /// - It will not fetch metadata from remote object stores (S3/GCS/OSS/...).
+#[allow(clippy::too_many_arguments)]
 async fn preload_parquet_meta_cache_for_files(
     region_id: RegionId,
     cache_manager: CacheManagerRef,
@@ -1001,39 +1101,75 @@ async fn preload_parquet_meta_cache_for_files(
     table_dir: String,
     path_type: PathType,
     object_store: object_store::ObjectStore,
+    region_metadata: RegionMetadataRef,
     mut files: Vec<FileHandle>,
 ) -> usize {
     if !cache_manager.sst_meta_cache_enabled()
         || sst_meta_cache_capacity == 0
-        || cache_manager.sst_meta_cache_weighted_size() >= sst_meta_cache_capacity
+        || cache_manager.sst_meta_cache_is_full()
     {
         return 0;
     }
 
-    let allow_direct_load = matches!(object_store.info().scheme(), object_store::Scheme::Fs);
+    let allow_direct_load = object_store.info().scheme() == object_store::services::FS_SCHEME;
 
     // Sort by time range so we can prefer preloading newer files first.
     files.sort_by_key(|b| std::cmp::Reverse(b.meta_ref().time_range.1));
 
     let mut loaded = 0usize;
     for file_handle in files {
-        // Stop when the shared SST meta cache is full.
-        if cache_manager.sst_meta_cache_weighted_size() >= sst_meta_cache_capacity {
+        // Stop when the protected authoritative tier is full.
+        if cache_manager.sst_meta_cache_is_full() {
             break;
         }
 
         let file_id = file_handle.file_id();
         let mut cache_metrics = MetadataCacheMetrics::default();
-        if cache_manager
-            .get_parquet_meta_data(file_id, &mut cache_metrics, Default::default())
+        if let Some(metadata) = cache_manager
+            .get_compact_sst_meta_data(file_id, PageIndexPolicy::Optional)
             .await
-            .is_some()
         {
-            // Metadata is either already in memory or loaded from file cache.
-            if cache_metrics.mem_cache_hit == 0 {
-                loaded += 1;
+            if file_handle.primary_key_range().is_none()
+                && let Some(primary_key_range) = extract_primary_key_range(
+                    metadata.parquet_metadata().as_ref(),
+                    &region_metadata,
+                )
+            {
+                file_handle.set_primary_key_range(primary_key_range);
             }
             continue;
+        }
+
+        if let Some(write_cache) = cache_manager.write_cache() {
+            let key = IndexKey::new(file_id.region_id(), file_id.file_id(), FileType::Parquet);
+            if let Some(metadata) = write_cache
+                .file_cache()
+                .get_sst_meta_data(key, &mut cache_metrics, PageIndexPolicy::Optional)
+                .await
+            {
+                let decoded = metadata.decoded();
+                if file_handle.primary_key_range().is_none()
+                    && let Some(primary_key_range) = extract_primary_key_range(
+                        decoded.parquet_metadata().as_ref(),
+                        &region_metadata,
+                    )
+                {
+                    file_handle.set_primary_key_range(primary_key_range);
+                }
+                match metadata {
+                    SstMetaPreparation::Prepared(metadata) => {
+                        cache_manager.put_prepared_sst_meta(file_id, metadata, false);
+                        loaded += 1;
+                    }
+                    SstMetaPreparation::DecodedOnly { encoding_error, .. } => warn!(
+                        encoding_error;
+                        "Failed to encode file-cached SST metadata during preload, region: {}, file: {}",
+                        region_id,
+                        file_id.file_id()
+                    ),
+                }
+                continue;
+            }
         }
 
         if !allow_direct_load {
@@ -1042,11 +1178,44 @@ async fn preload_parquet_meta_cache_for_files(
 
         let file_size = file_handle.meta_ref().file_size;
         let file_path = file_handle.file_path(&table_dir, path_type);
-        let loader = MetadataLoader::new(object_store.clone(), &file_path, file_size);
+        let mut loader = MetadataLoader::new(object_store.clone(), &file_path, file_size);
+        loader.with_page_index_policy(PageIndexPolicy::Optional);
         match loader.load(&mut cache_metrics).await {
             Ok(metadata) => {
-                cache_manager.put_parquet_meta_data(file_id, Arc::new(metadata), None);
-                loaded += 1;
+                if let Some(primary_key_range) =
+                    extract_primary_key_range(&metadata, &region_metadata)
+                {
+                    file_handle.set_primary_key_range(primary_key_range);
+                }
+                match prepare_sst_meta(
+                    &file_path,
+                    metadata,
+                    // The SST can predate schema changes, so decode its embedded region metadata
+                    // instead of substituting the region's current schema.
+                    None,
+                    PageIndexPolicy::Optional,
+                )
+                .await
+                {
+                    Ok(SstMetaPreparation::Prepared(metadata)) => {
+                        // Preload the compact canonical entry only. Query traffic promotes decoded
+                        // entries into the separate acceleration tier according to actual demand.
+                        cache_manager.put_prepared_sst_meta(file_id, metadata, false);
+                        loaded += 1;
+                    }
+                    Ok(SstMetaPreparation::DecodedOnly { encoding_error, .. }) => warn!(
+                        encoding_error;
+                        "Failed to encode preloaded parquet metadata, region: {}, file: {}",
+                        region_id,
+                        file_path
+                    ),
+                    Err(err) => {
+                        warn!(
+                            err; "Failed to prepare preloaded parquet metadata, region: {}, file: {}",
+                            region_id, file_path
+                        );
+                    }
+                }
             }
             Err(err) => {
                 // Preloading is best-effort. Failure shouldn't affect region open.
@@ -1093,6 +1262,7 @@ fn maybe_preload_parquet_meta_cache(
         let table_dir = region.access_layer.table_dir().to_string();
         let path_type = region.access_layer.path_type();
         let object_store = region.access_layer.object_store().clone();
+        let region_metadata = region.version_control.current().version.metadata.clone();
 
         // Collect SST files. Do not hold the version longer than needed.
         let mut files = Vec::new();
@@ -1112,6 +1282,7 @@ fn maybe_preload_parquet_meta_cache(
             table_dir,
             path_type,
             object_store,
+            region_metadata,
             files,
         )
         .await;
@@ -1145,29 +1316,140 @@ fn can_load_cache(state: RegionRoleState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use common_base::readable_size::ReadableSize;
     use common_test_util::temp_dir::create_temp_dir;
     use common_time::Timestamp;
-    use datatypes::arrow::array::{ArrayRef, Int64Array};
+    use common_wal::options::{KafkaWalOptions, WalOptions};
+    use datatypes::arrow::array::{ArrayRef, BinaryArray, Int64Array};
     use datatypes::arrow::record_batch::RecordBatch;
     use object_store::ObjectStore;
-    use object_store::services::{Fs, Memory};
+    use object_store::services::{Fs, Memory, S3};
     use parquet::arrow::ArrowWriter;
-    use parquet::file::metadata::KeyValue;
+    use parquet::file::metadata::{KeyValue, PageIndexPolicy};
     use parquet::file::properties::WriterProperties;
     use store_api::region_request::PathType;
     use store_api::storage::{FileId, RegionId};
 
-    use super::preload_parquet_meta_cache_for_files;
+    use super::{
+        initial_pruned_entry_id, preload_parquet_meta_cache_for_files, sanitize_region_options,
+        supports_open_region_object_storage_requirement,
+    };
     use crate::cache::CacheManager;
     use crate::cache::file_cache::{FileType, IndexKey};
+    use crate::manifest::action::{RegionManifest, RemovedFilesRecord};
+    use crate::region::options::RegionOptions;
+    use crate::sst::FormatType;
     use crate::sst::file::{FileHandle, FileMeta};
     use crate::sst::file_purger::NoopFilePurger;
     use crate::sst::parquet::PARQUET_METADATA_KEY;
     use crate::test_util::TestEnv;
     use crate::test_util::sst_util::sst_region_metadata;
+
+    fn build_test_manifest(sst_format: FormatType) -> RegionManifest {
+        RegionManifest {
+            metadata: Arc::new(sst_region_metadata()),
+            files: HashMap::new(),
+            removed_files: RemovedFilesRecord::default(),
+            flushed_entry_id: 0,
+            flushed_sequence: 0,
+            committed_sequence: None,
+            manifest_version: 0,
+            truncated_entry_id: None,
+            compaction_time_window: None,
+            sst_format,
+            append_mode: None,
+        }
+    }
+
+    fn build_fs_object_store() -> ObjectStore {
+        ObjectStore::new(Fs::default().root("/tmp"))
+            .unwrap()
+            .finish()
+    }
+
+    #[test]
+    fn test_initial_pruned_entry_id() {
+        assert_eq!(0, initial_pruned_entry_id(&WalOptions::RaftEngine));
+        assert_eq!(0, initial_pruned_entry_id(&WalOptions::Noop));
+        assert_eq!(
+            0,
+            initial_pruned_entry_id(&WalOptions::Kafka(KafkaWalOptions::new(
+                "test_topic".to_string()
+            )))
+        );
+        assert_eq!(
+            42,
+            initial_pruned_entry_id(&WalOptions::Kafka(KafkaWalOptions {
+                topic: "test_topic".to_string(),
+                initial_pruned_entry_id: Some(42),
+            }))
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "test-shared-fs-region-migration"))]
+    fn test_open_requirement_rejects_fs_object_store() {
+        let object_store = build_fs_object_store();
+
+        assert!(!supports_open_region_object_storage_requirement(
+            &object_store
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "test-shared-fs-region-migration")]
+    fn test_open_requirement_accepts_shared_fs_object_store_for_tests() {
+        let object_store = build_fs_object_store();
+
+        assert!(supports_open_region_object_storage_requirement(
+            &object_store
+        ));
+    }
+
+    #[test]
+    fn test_open_requirement_accepts_s3_object_store() {
+        let object_store = ObjectStore::new(
+            S3::default()
+                .bucket("test-bucket")
+                .region("us-east-1")
+                .disable_ec2_metadata(),
+        )
+        .unwrap()
+        .finish();
+
+        assert!(supports_open_region_object_storage_requirement(
+            &object_store
+        ));
+    }
+
+    #[test]
+    fn test_sanitize_region_options_options_format_wins() {
+        // Manifest persisted PrimaryKey, but the re-parsed options now request Flat
+        // (e.g., bulk memtable). The options' value must win.
+        let manifest = build_test_manifest(FormatType::PrimaryKey);
+        let mut options = RegionOptions {
+            sst_format: Some(FormatType::Flat),
+            ..Default::default()
+        };
+        sanitize_region_options(&manifest, &mut options);
+        assert_eq!(options.sst_format, Some(FormatType::Flat));
+    }
+
+    #[test]
+    fn test_sanitize_region_options_fills_from_manifest_when_unset() {
+        // When the caller didn't specify sst_format, fall back to the manifest value
+        // so downstream code always sees a concrete format.
+        let manifest = build_test_manifest(FormatType::Flat);
+        let mut options = RegionOptions {
+            sst_format: None,
+            ..Default::default()
+        };
+        sanitize_region_options(&manifest, &mut options);
+        assert_eq!(options.sst_format, Some(FormatType::Flat));
+    }
 
     fn sst_parquet_bytes(batch: &RecordBatch) -> Vec<u8> {
         let key_value_meta = KeyValue::new(
@@ -1206,7 +1488,15 @@ mod tests {
         let file_id = FileId::random();
 
         let col = Arc::new(Int64Array::from_iter_values([1, 2, 3])) as ArrayRef;
-        let batch = RecordBatch::try_from_iter([("col", col)]).unwrap();
+        let primary_key = Arc::new(BinaryArray::from_iter_values([b"a", b"b", b"c"])) as ArrayRef;
+        let batch = RecordBatch::try_from_iter([
+            ("col", col),
+            (
+                store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME,
+                primary_key,
+            ),
+        ])
+        .unwrap();
         let parquet_bytes = sst_parquet_bytes(&batch);
         let file_size = parquet_bytes.len() as u64;
 
@@ -1226,6 +1516,7 @@ mod tests {
             sequence: None,
             partition_expr: None,
             num_series: 0,
+            ..Default::default()
         };
         let file_handle = FileHandle::new(file_meta, Arc::new(NoopFilePurger));
 
@@ -1261,7 +1552,8 @@ mod tests {
             table_dir.to_string(),
             path_type,
             source_store.clone(),
-            vec![file_handle],
+            Arc::new(sst_region_metadata()),
+            vec![file_handle.clone()],
         )
         .await;
 
@@ -1269,9 +1561,14 @@ mod tests {
         assert_eq!(loaded, 1);
         assert!(
             cache_manager
-                .get_parquet_meta_data_from_mem_cache(region_file_id)
+                .get_compact_sst_meta_data(
+                    region_file_id,
+                    parquet::file::metadata::PageIndexPolicy::Optional,
+                )
+                .await
                 .is_some()
         );
+        assert!(file_handle.primary_key_range().is_some());
     }
 
     #[tokio::test]
@@ -1302,6 +1599,7 @@ mod tests {
             sequence: None,
             partition_expr: None,
             num_series: 0,
+            ..Default::default()
         };
         let file_handle = FileHandle::new(file_meta, Arc::new(NoopFilePurger));
 
@@ -1330,6 +1628,7 @@ mod tests {
             table_dir.to_string(),
             path_type,
             object_store,
+            Arc::new(sst_region_metadata()),
             vec![file_handle],
         )
         .await;
@@ -1375,6 +1674,7 @@ mod tests {
             sequence: None,
             partition_expr: None,
             num_series: 0,
+            ..Default::default()
         };
         let file_handle = FileHandle::new(file_meta, Arc::new(NoopFilePurger));
 
@@ -1402,6 +1702,7 @@ mod tests {
             table_dir.to_string(),
             path_type,
             object_store,
+            Arc::new(sst_region_metadata()),
             vec![file_handle],
         )
         .await;
@@ -1409,7 +1710,8 @@ mod tests {
         assert_eq!(loaded, 1);
         assert!(
             cache_manager
-                .get_parquet_meta_data_from_mem_cache(region_file_id)
+                .get_compact_sst_meta_data(region_file_id, PageIndexPolicy::Optional)
+                .await
                 .is_some()
         );
     }

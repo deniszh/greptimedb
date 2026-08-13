@@ -21,8 +21,7 @@ use common_datasource::file_format::Format;
 use common_datasource::file_format::csv::stream_to_csv;
 use common_datasource::file_format::json::stream_to_json;
 use common_datasource::file_format::parquet::stream_to_parquet;
-use common_datasource::object_store::{build_backend, parse_url};
-use common_datasource::util::find_dir_and_filename;
+use common_datasource::object_store::build_backend_for_write_with_path;
 use common_query::Output;
 use common_recordbatch::adapter::DfRecordBatchStreamAdapter;
 use common_recordbatch::{
@@ -169,19 +168,23 @@ impl StatementExecutor {
         location: &str,
         connection: &HashMap<String, String>,
     ) -> Result<usize> {
+        let output = output
+            .map_dictionary_to_values()
+            .context(error::BuildRecordBatchSnafu)?;
         let stream = match output.data {
             OutputData::Stream(stream) => stream,
             OutputData::RecordBatches(record_batches) => record_batches.as_stream(),
             _ => unreachable!(),
         };
 
-        let (_schema, _host, path) = parse_url(location).context(error::ParseUrlSnafu)?;
-        let (_, filename) = find_dir_and_filename(&path);
-        let filename = filename.context(error::UnexpectedSnafu {
-            violated: format!("Expected filename, path: {path}"),
+        let backend =
+            build_backend_for_write_with_path(location, connection, &self.local_file_access)
+                .await
+                .context(error::BuildBackendSnafu)?;
+        let filename = backend.object_path.context(error::UnexpectedSnafu {
+            violated: format!("Expected filename, path: {location}"),
         })?;
-        let object_store = build_backend(location, connection).context(error::BuildBackendSnafu)?;
-        self.stream_to_file(stream, format, object_store, &filename)
+        self.stream_to_file(stream, format, backend.object_store, &filename)
             .await
     }
 }

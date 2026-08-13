@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use cache::build_datanode_cache_registry;
-use catalog::kvbackend::MetaKvBackend;
+use catalog::kvbackend::new_read_only_meta_kv_backend;
 use common_base::Plugins;
 use common_meta::cache::LayeredCacheRegistryBuilder;
 use common_telemetry::info;
@@ -46,7 +46,12 @@ impl InstanceBuilder {
     ) -> Result<Self> {
         let guard = Self::init(&mut opts, &mut plugins).await?;
 
-        let datanode_builder = Self::datanode_builder(&opts, plugins).await?;
+        let mut datanode_builder = Self::datanode_builder(&opts, &plugins).await?;
+
+        plugins::setup_datanode_plugins_post_build(&mut plugins, &opts.plugins, &datanode_builder)
+            .await
+            .context(StartDatanodeSnafu)?;
+        datanode_builder.set_plugins(plugins);
 
         Ok(Self {
             guard,
@@ -57,6 +62,7 @@ impl InstanceBuilder {
 
     async fn init(opts: &mut DatanodeOptions, plugins: &mut Plugins) -> Result<Vec<WorkerGuard>> {
         common_runtime::init_global_runtimes(&opts.runtime);
+        common_runtime::init_datanode_runtimes(&opts.runtime);
 
         let dn_opts = &mut opts.component;
         let guard = common_telemetry::init_global_logging(
@@ -67,11 +73,12 @@ impl InstanceBuilder {
             None,
         );
 
+        crate::options::flush_dropped_plugin_warnings();
         log_versions(verbose_version(), short_version(), APP_NAME);
         maybe_activate_heap_profile(&dn_opts.memory);
         create_resource_limit_metrics(APP_NAME);
 
-        plugins::setup_datanode_plugins(plugins, &opts.plugins, dn_opts)
+        plugins::setup_datanode_plugins_pre_build(plugins, &opts.plugins, dn_opts)
             .await
             .context(StartDatanodeSnafu)?;
 
@@ -81,7 +88,10 @@ impl InstanceBuilder {
         Ok(guard)
     }
 
-    async fn datanode_builder(opts: &DatanodeOptions, plugins: Plugins) -> Result<DatanodeBuilder> {
+    async fn datanode_builder(
+        opts: &DatanodeOptions,
+        plugins: &Plugins,
+    ) -> Result<DatanodeBuilder> {
         let dn_opts = &opts.component;
 
         let member_id = dn_opts
@@ -93,15 +103,13 @@ impl InstanceBuilder {
         let client = meta_client::create_meta_client(
             MetaClientType::Datanode { member_id },
             meta_client_options,
-            Some(&plugins),
+            Some(plugins),
             None,
         )
         .await
         .context(MetaClientInitSnafu)?;
 
-        let backend = Arc::new(MetaKvBackend {
-            client: client.clone(),
-        });
+        let backend = new_read_only_meta_kv_backend(client.clone());
         let mut builder = DatanodeBuilder::new(dn_opts.clone(), plugins.clone(), backend.clone());
 
         let registry = Arc::new(

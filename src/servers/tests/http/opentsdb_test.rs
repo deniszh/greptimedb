@@ -37,6 +37,10 @@ struct DummyInstance {
 
 #[async_trait]
 impl OpentsdbProtocolHandler for DummyInstance {
+    async fn preflight(&self, _data_points: &[DataPoint], _ctx: QueryContextRef) -> Result<()> {
+        Ok(())
+    }
+
     async fn exec(&self, data_points: Vec<DataPoint>, _ctx: QueryContextRef) -> Result<usize> {
         let data_point = data_points.first().unwrap();
         if data_point.metric() == "should_failed" {
@@ -56,10 +60,14 @@ impl SqlQueryHandler for DummyInstance {
         unimplemented!()
     }
 
+    async fn do_analyze_stream_query(&self, _: &str, _: QueryContextRef) -> Result<Output> {
+        unimplemented!()
+    }
+
     async fn do_exec_plan(
         &self,
-        _stmt: Option<Statement>,
         _plan: LogicalPlan,
+        _stmt: Option<Statement>,
         _query_ctx: QueryContextRef,
     ) -> Result<Output> {
         unimplemented!()

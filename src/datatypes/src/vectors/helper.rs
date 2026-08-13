@@ -240,7 +240,7 @@ impl Helper {
                 ConstantVector::new(Arc::new(vector), length)
             }
             ScalarValue::Struct(v) => {
-                let struct_type = StructType::try_from(v.fields())?;
+                let struct_type = StructType::from(v.fields());
                 ConstantVector::new(
                     Arc::new(StructVector::try_new(struct_type, (*v).clone())?),
                     length,
@@ -401,7 +401,7 @@ impl Helper {
                     .downcast_ref::<StructArray>()
                     .unwrap();
                 Arc::new(StructVector::try_new(
-                    StructType::try_from(fields)?,
+                    StructType::from(fields),
                     array.clone(),
                 )?)
             }
@@ -460,14 +460,6 @@ impl Helper {
 
         Ok((vector, BooleanVector::from(filter)))
     }
-}
-
-#[cfg(test)]
-pub(crate) fn pretty_print(vector: VectorRef) -> String {
-    let array = vector.to_arrow_array();
-    arrow::util::pretty::pretty_format_columns(&vector.vector_type_name(), &[array])
-        .map(|x| x.to_string())
-        .unwrap_or_else(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -129,36 +129,6 @@ pub fn set_bytea_output(exprs: Vec<Expr>, ctx: QueryContextRef) -> Result<()> {
     Ok(())
 }
 
-pub fn set_search_path(exprs: Vec<Expr>, ctx: QueryContextRef) -> Result<()> {
-    let search_expr = exprs.first().context(NotSupportedSnafu {
-        feat: "No search path find in set variable statement",
-    })?;
-    match search_expr {
-        Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(search_path),
-            ..
-        })
-        | Expr::Value(ValueWithSpan {
-            value: Value::DoubleQuotedString(search_path),
-            ..
-        }) => {
-            ctx.set_current_schema(search_path);
-            Ok(())
-        }
-        Expr::Identifier(Ident { value, .. }) => {
-            ctx.set_current_schema(value);
-            Ok(())
-        }
-        expr => NotSupportedSnafu {
-            feat: format!(
-                "Unsupported search path expr {} in set variable statement",
-                expr
-            ),
-        }
-        .fail(),
-    }
-}
-
 pub fn validate_client_encoding(set: SetVariables) -> Result<()> {
     let Some((encoding, [])) = set.value.split_first() else {
         return InvalidSqlSnafu {
@@ -286,15 +256,24 @@ pub fn set_intervalstyle(exprs: Vec<Expr>, ctx: QueryContextRef) -> Result<()> {
         }
         .fail();
     };
-    let Expr::Value(value) = var_value else {
-        return NotSupportedSnafu {
-            feat: "Set variable value must be a value",
+    let intervalstyle = match var_value {
+        Expr::Identifier(Ident {
+            value,
+            quote_style: _,
+            span: _,
+        }) => PGIntervalStyle::try_from(value.as_str()).context(InvalidConfigValueSnafu)?,
+        Expr::Value(value) => {
+            PGIntervalStyle::try_from(&value.value).context(InvalidConfigValueSnafu)?
         }
-        .fail();
+        _ => {
+            return NotSupportedSnafu {
+                feat: "Set variable value must be a value or identifier",
+            }
+            .fail();
+        }
     };
-    ctx.configuration_parameter().set_pg_intervalstyle_format(
-        PGIntervalStyle::try_from(&value.value).context(InvalidConfigValueSnafu)?,
-    );
+    ctx.configuration_parameter()
+        .set_pg_intervalstyle_format(intervalstyle);
     Ok(())
 }
 

@@ -13,12 +13,16 @@
 // limitations under the License.
 
 mod catalog;
+mod registrations;
+mod remote_dyn_filter;
 
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use api::region::RegionResponse;
@@ -36,7 +40,8 @@ use common_error::status_code::StatusCode;
 use common_meta::datanode::TopicStatsReporter;
 use common_query::OutputData;
 use common_query::request::QueryRequest;
-use common_recordbatch::SendableRecordBatchStream;
+use common_recordbatch::adapter::RecordBatchMetrics;
+use common_recordbatch::{OrderOption, RecordBatch, RecordBatchStream, SendableRecordBatchStream};
 use common_runtime::Runtime;
 use common_telemetry::tracing::{self, info_span};
 use common_telemetry::tracing_context::{FutureExt, TracingContext};
@@ -44,8 +49,10 @@ use common_telemetry::{debug, error, info, warn};
 use dashmap::DashMap;
 use datafusion::datasource::TableProvider;
 use datafusion_common::tree_node::TreeNode;
+use datatypes::schema::SchemaRef;
 use either::Either;
 use futures_util::future::try_join_all;
+use futures_util::{Stream, StreamExt};
 use metric_engine::engine::MetricEngine;
 use mito2::engine::{MITO_ENGINE_NAME, MitoEngine};
 use prost::Message;
@@ -53,6 +60,7 @@ use query::QueryEngineRef;
 pub use query::dummy_catalog::{
     DummyCatalogList, DummyTableProviderFactory, TableProviderFactoryRef,
 };
+use query::options::should_collect_region_watermark_from_extensions;
 use serde_json;
 use servers::error::{
     self as servers_error, ExecuteGrpcRequestSnafu, Result as ServerResult, SuspendedSnafu,
@@ -60,7 +68,9 @@ use servers::error::{
 use servers::grpc::FlightCompression;
 use servers::grpc::flight::{FlightCraft, FlightRecordBatchStream, TonicStream};
 use servers::grpc::region_server::RegionServerHandler;
-use session::context::{QueryContext, QueryContextBuilder, QueryContextRef};
+use session::context::{
+    FLIGHT_METRICS_HEARTBEAT_INTERVAL, QueryContext, QueryContextBuilder, QueryContextRef,
+};
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::metric_engine_consts::{
     FILE_ENGINE_NAME, LOGICAL_TABLE_METADATA_KEY, METRIC_ENGINE_NAME,
@@ -75,8 +85,8 @@ use store_api::region_request::{
     RegionOpenRequest, RegionRequest,
 };
 use store_api::storage::RegionId;
-use tokio::sync::{Semaphore, SemaphorePermit};
-use tokio::time::timeout;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::time::{self, timeout};
 use tonic::{Request, Response, Result as TonicResult};
 
 use crate::error::{
@@ -85,10 +95,16 @@ use crate::error::{
     ExecuteLogicalPlanSnafu, FindLogicalRegionsSnafu, GetRegionMetadataSnafu,
     HandleBatchDdlRequestSnafu, HandleBatchOpenRequestSnafu, HandleRegionRequestSnafu,
     NewPlanDecoderSnafu, RegionEngineNotFoundSnafu, RegionNotFoundSnafu, RegionNotReadySnafu,
-    Result, SerializeJsonSnafu, StopRegionEngineSnafu, UnexpectedSnafu, UnsupportedOutputSnafu,
+    Result, RuntimeJoinSnafu, SerializeJsonSnafu, StopRegionEngineSnafu, UnexpectedSnafu,
+    UnsupportedOutputSnafu,
 };
 use crate::event_listener::RegionServerEventListenerRef;
+use crate::query_stream::QueryRuntimeStream;
 use crate::region_server::catalog::{NameAwareCatalogList, NameAwareDataSourceInjectorBuilder};
+use crate::region_server::registrations::RemoteDynFilterRegistry;
+use crate::region_server::remote_dyn_filter::wrap_remote_dyn_filter_guarded_stream;
+
+const QUERY_RUNTIME_STREAM_BUFFER_SIZE: usize = 8;
 
 #[derive(Clone)]
 pub struct RegionServer {
@@ -216,6 +232,16 @@ impl RegionServer {
         region_id: RegionId,
         request: RegionRequest,
     ) -> Result<RegionResponse> {
+        if RegionServerInner::is_ingest_request(&request) {
+            let inner = self.inner.clone();
+            let request_type = request.request_type();
+            return common_runtime::spawn_ingest(async move {
+                inner.handle_request(region_id, request).await
+            })
+            .await
+            .context(RuntimeJoinSnafu { request_type })?;
+        }
+
         self.inner.handle_request(region_id, request).await
     }
 
@@ -236,11 +262,14 @@ impl RegionServer {
             RegionNotReadySnafu { region_id }
         );
 
-        self.inner
+        let provider = self
+            .inner
             .table_provider_factory
             .create(region_id, status.into_engine(), ctx)
             .await
-            .context(ExecuteLogicalPlanSnafu)
+            .context(ExecuteLogicalPlanSnafu)?;
+
+        Ok(provider)
     }
 
     /// Handle reads from remote. They're often query requests received by our Arrow Flight service.
@@ -249,7 +278,15 @@ impl RegionServer {
         request: api::v1::region::QueryRequest,
         query_ctx: QueryContextRef,
     ) -> Result<SendableRecordBatchStream> {
-        let _permit = if let Some(p) = &self.inner.parallelism {
+        self.handle_remote_read_inner(request, query_ctx).await
+    }
+
+    async fn handle_remote_read_inner(
+        &self,
+        request: api::v1::region::QueryRequest,
+        query_ctx: QueryContextRef,
+    ) -> Result<SendableRecordBatchStream> {
+        let permit = if let Some(p) = &self.inner.parallelism {
             Some(p.acquire().await?)
         } else {
             None
@@ -278,21 +315,36 @@ impl RegionServer {
             .await
             .context(DecodeLogicalPlanSnafu)?;
 
-        self.inner
+        let cleanup = self.register_initial_remote_dyn_filter_cleanup(&query_ctx, region_id);
+
+        let stream = self
+            .inner
             .handle_read(
                 QueryRequest {
                     header: request.header,
                     region_id,
                     plan,
                 },
-                query_ctx,
+                query_ctx.clone(),
             )
-            .await
+            .await?;
+
+        let stream = wrap_flow_region_watermark_stream(stream, region_id, &query_ctx);
+        let stream = if let Some(cleanup) = cleanup {
+            wrap_remote_dyn_filter_guarded_stream(stream, cleanup)
+        } else {
+            stream
+        };
+        Ok(maybe_guard_stream(stream, permit))
     }
 
     #[tracing::instrument(skip_all)]
     pub async fn handle_read(&self, request: QueryRequest) -> Result<SendableRecordBatchStream> {
-        let _permit = if let Some(p) = &self.inner.parallelism {
+        self.handle_read_inner(request).await
+    }
+
+    async fn handle_read_inner(&self, request: QueryRequest) -> Result<SendableRecordBatchStream> {
+        let permit = if let Some(p) = &self.inner.parallelism {
             Some(p.acquire().await?)
         } else {
             None
@@ -301,6 +353,7 @@ impl RegionServer {
         let ctx = request.header.as_ref().map(|h| h.into());
         let query_ctx = Arc::new(ctx.unwrap_or_else(|| QueryContextBuilder::default().build()));
 
+        let region_id = request.region_id;
         let injector_builder = NameAwareDataSourceInjectorBuilder::from_plan(&request.plan)
             .context(DataFusionSnafu)?;
         let mut injector = injector_builder
@@ -313,9 +366,20 @@ impl RegionServer {
             .context(DataFusionSnafu)?
             .data;
 
-        self.inner
-            .handle_read(QueryRequest { plan, ..request }, query_ctx)
-            .await
+        let cleanup = self.register_initial_remote_dyn_filter_cleanup(&query_ctx, region_id);
+
+        let stream = self
+            .inner
+            .handle_read(QueryRequest { plan, ..request }, query_ctx.clone())
+            .await?;
+
+        let stream = wrap_flow_region_watermark_stream(stream, region_id, &query_ctx);
+        let stream = if let Some(cleanup) = cleanup {
+            wrap_remote_dyn_filter_guarded_stream(stream, cleanup)
+        } else {
+            stream
+        };
+        Ok(maybe_guard_stream(stream, permit))
     }
 
     /// Returns all opened and reportable regions.
@@ -360,6 +424,7 @@ impl RegionServer {
             engine.role(region_id).map(|role| match role {
                 RegionRole::Follower => false,
                 RegionRole::Leader => true,
+                RegionRole::StagingLeader => true,
                 RegionRole::DowngradingLeader => true,
             })
         })
@@ -583,13 +648,13 @@ impl RegionServer {
         });
 
         // Downcast to MetricEngine and call batch API
-        let metric_engine =
-            engine
-                .as_any()
-                .downcast_ref::<MetricEngine>()
-                .context(UnexpectedSnafu {
-                    violated: "Failed to downcast to MetricEngine",
-                })?;
+        let metric_engine = engine
+            .as_any()
+            .downcast_ref::<MetricEngine>()
+            .context(UnexpectedSnafu {
+                violated: "Failed to downcast to MetricEngine",
+            })?
+            .clone();
 
         let tracing_context = TracingContext::from_current_span();
         let batch_size = put_requests.len();
@@ -597,14 +662,18 @@ impl RegionServer {
             "RegionServer::handle_metric_batch_puts",
             batch_size = batch_size,
         ));
-        let result = metric_engine
-            .put_regions_batch(put_requests)
-            .trace(span)
-            .await
-            .map_err(BoxedError::new)
-            .context(HandleRegionRequestSnafu {
-                region_id: first_region_id,
-            });
+        let result = common_runtime::spawn_ingest(async move {
+            metric_engine
+                .put_regions_batch(put_requests)
+                .trace(span)
+                .await
+        })
+        .await
+        .context(RuntimeJoinSnafu { request_type })?
+        .map_err(BoxedError::new)
+        .context(HandleRegionRequestSnafu {
+            region_id: first_region_id,
+        });
 
         match result {
             Ok(total_affected) => {
@@ -748,6 +817,98 @@ impl RegionServer {
     }
 }
 
+fn wrap_flow_region_watermark_stream(
+    stream: SendableRecordBatchStream,
+    region_id: RegionId,
+    query_ctx: &QueryContextRef,
+) -> SendableRecordBatchStream {
+    if should_collect_region_watermark_from_extensions(&query_ctx.extensions())
+        && let Some(seq) = query_ctx.get_snapshot(region_id.as_u64())
+    {
+        Box::pin(RegionWatermarkStream::new(stream, region_id, seq)) as SendableRecordBatchStream
+    } else {
+        stream
+    }
+}
+
+/// Wraps a region read stream so terminal metrics can carry the scan-open watermark.
+struct RegionWatermarkStream {
+    stream: SendableRecordBatchStream,
+    region_id: u64,
+    snapshot_seq: u64,
+    finished: bool,
+}
+
+impl RegionWatermarkStream {
+    fn new(stream: SendableRecordBatchStream, region_id: RegionId, snapshot_seq: u64) -> Self {
+        Self {
+            stream,
+            region_id: region_id.as_u64(),
+            snapshot_seq,
+            finished: false,
+        }
+    }
+
+    fn merged_metrics(&self, mut metrics: RecordBatchMetrics) -> RecordBatchMetrics {
+        if metrics
+            .region_watermarks
+            .iter()
+            .any(|entry| entry.region_id == self.region_id)
+        {
+            return metrics;
+        }
+
+        metrics
+            .region_watermarks
+            .push(common_recordbatch::adapter::RegionWatermarkEntry {
+                region_id: self.region_id,
+                watermark: Some(self.snapshot_seq),
+            });
+        metrics
+    }
+}
+
+impl RecordBatchStream for RegionWatermarkStream {
+    fn name(&self) -> &str {
+        self.stream.name()
+    }
+
+    fn schema(&self) -> datatypes::schema::SchemaRef {
+        self.stream.schema()
+    }
+
+    fn output_ordering(&self) -> Option<&[OrderOption]> {
+        self.stream.output_ordering()
+    }
+
+    fn metrics(&self) -> Option<RecordBatchMetrics> {
+        let base = self.stream.metrics();
+        if !self.finished {
+            return base;
+        }
+
+        Some(self.merged_metrics(base.unwrap_or_default()))
+    }
+}
+
+impl Stream for RegionWatermarkStream {
+    type Item = common_recordbatch::error::Result<RecordBatch>;
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.stream).poll_next(cx) {
+            Poll::Ready(None) => {
+                self.finished = true;
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
 #[async_trait]
 impl RegionServerHandler for RegionServer {
     async fn handle(&self, request: region_request::Body) -> ServerResult<RegionResponseV1> {
@@ -765,6 +926,10 @@ impl RegionServerHandler for RegionServer {
             }
             region_request::Body::ListMetadata(list_metadata_request) => {
                 self.handle_list_metadata_request(list_metadata_request)
+                    .await
+            }
+            region_request::Body::RemoteDynFilter(remote_dyn_filter_request) => {
+                self.handle_remote_dyn_filter_request(remote_dyn_filter_request)
                     .await
             }
             _ => self.handle_requests_in_serial(request).await,
@@ -875,10 +1040,13 @@ struct RegionServerInner {
     /// server with a concrete engine; acceptable for now to fetch Mito-specific
     /// info (e.g., list SSTs). Consider a diagnostics trait later.
     mito_engine: RwLock<Option<MitoEngine>>,
+    /// TODO(remote-dyn-filter): Reap this query-scoped placeholder registry on query finish/cancel
+    /// and later fold it into the real remote dyn filter runtime state lifecycle.
+    initial_remote_dyn_filter_registrations: RemoteDynFilterRegistry,
 }
 
 struct RegionServerParallelism {
-    semaphore: Semaphore,
+    semaphore: Arc<Semaphore>,
     timeout: Duration,
 }
 
@@ -891,16 +1059,65 @@ impl RegionServerParallelism {
             return None;
         }
         Some(RegionServerParallelism {
-            semaphore: Semaphore::new(max_concurrent_queries),
+            semaphore: Arc::new(Semaphore::new(max_concurrent_queries)),
             timeout: concurrent_query_limiter_timeout,
         })
     }
 
-    pub async fn acquire(&self) -> Result<SemaphorePermit<'_>> {
-        timeout(self.timeout, self.semaphore.acquire())
+    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
+        timeout(self.timeout, self.semaphore.clone().acquire_owned())
             .await
             .context(ConcurrentQueryLimiterTimeoutSnafu)?
             .context(ConcurrentQueryLimiterClosedSnafu)
+    }
+}
+
+/// Wraps a record batch stream and holds a concurrency permit until the stream is
+/// fully consumed (dropped), so `max_concurrent_queries` bounds the number of
+/// in-flight read streams, not just query planning.
+struct PermitGuardedStream {
+    inner: SendableRecordBatchStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl RecordBatchStream for PermitGuardedStream {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn output_ordering(&self) -> Option<&[OrderOption]> {
+        self.inner.output_ordering()
+    }
+
+    fn metrics(&self) -> Option<RecordBatchMetrics> {
+        self.inner.metrics()
+    }
+}
+
+impl Stream for PermitGuardedStream {
+    type Item = common_recordbatch::error::Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// Wraps `stream` so it holds `permit` until fully consumed. Returns `stream`
+/// unchanged when no permit was acquired (limiter disabled).
+fn maybe_guard_stream(
+    stream: SendableRecordBatchStream,
+    permit: Option<OwnedSemaphorePermit>,
+) -> SendableRecordBatchStream {
+    match permit {
+        Some(permit) => Box::pin(PermitGuardedStream {
+            inner: stream,
+            _permit: permit,
+        }),
+        None => stream,
     }
 }
 
@@ -942,6 +1159,7 @@ impl RegionServerInner {
             parallelism,
             topic_stats_reporter: RwLock::new(None),
             mito_engine: RwLock::new(None),
+            initial_remote_dyn_filter_registrations: RemoteDynFilterRegistry::new(),
         }
     }
 
@@ -965,6 +1183,13 @@ impl RegionServerInner {
         *self.topic_stats_reporter.write().unwrap() = Some(topic_stats_reporter);
     }
 
+    fn is_ingest_request(request: &RegionRequest) -> bool {
+        matches!(
+            request,
+            RegionRequest::Put(_) | RegionRequest::Delete(_) | RegionRequest::BulkInserts(_)
+        )
+    }
+
     fn get_engine(
         &self,
         region_id: RegionId,
@@ -982,6 +1207,24 @@ impl RegionServerInner {
                     RegionEngineWithStatus::Ready(_) => status.clone().into_engine(),
                 },
                 _ => self
+                    .engines
+                    .read()
+                    .unwrap()
+                    .get(attribute.engine())
+                    .with_context(|| RegionEngineNotFoundSnafu {
+                        name: attribute.engine(),
+                    })?
+                    .clone(),
+            },
+            RegionChange::OfflineCleanup(attribute) => match current_region_status {
+                Some(status) => match status.clone() {
+                    RegionEngineWithStatus::Registering(_)
+                    | RegionEngineWithStatus::Deregistering(_)
+                    | RegionEngineWithStatus::Ready(_) => {
+                        return error::RegionBusySnafu { region_id }.fail();
+                    }
+                },
+                None => self
                     .engines
                     .read()
                     .unwrap()
@@ -1336,6 +1579,10 @@ impl RegionServerInner {
                 let attribute = parse_region_attribute(&open.engine, &open.options)?;
                 RegionChange::Register(attribute)
             }
+            RegionRequest::CleanUp(clean_up) => {
+                let attribute = parse_region_attribute(&clean_up.engine, &clean_up.options)?;
+                RegionChange::OfflineCleanup(attribute)
+            }
             RegionRequest::Close(_) | RegionRequest::Drop(_) => RegionChange::Deregisters,
             RegionRequest::Put(_) | RegionRequest::Delete(_) | RegionRequest::BulkInserts(_) => {
                 RegionChange::Ingest
@@ -1455,7 +1702,7 @@ impl RegionServerInner {
         region_change: RegionChange,
     ) {
         match region_change {
-            RegionChange::None | RegionChange::Ingest => {}
+            RegionChange::None | RegionChange::Ingest | RegionChange::OfflineCleanup(_) => {}
             RegionChange::Register(_) => {
                 self.region_map.remove(&region_id);
             }
@@ -1475,7 +1722,7 @@ impl RegionServerInner {
     ) -> Result<()> {
         let engine_type = engine.name();
         match region_change {
-            RegionChange::None | RegionChange::Ingest => {}
+            RegionChange::None | RegionChange::Ingest | RegionChange::OfflineCleanup(_) => {}
             RegionChange::Register(attribute) => {
                 info!(
                     "Region {region_id} is registered to engine {}",
@@ -1554,6 +1801,63 @@ impl RegionServerInner {
     }
 
     pub async fn handle_read(
+        self: &Arc<Self>,
+        request: QueryRequest,
+        query_ctx: QueryContextRef,
+    ) -> Result<SendableRecordBatchStream> {
+        let live_analyze_metrics =
+            query_ctx.explain_verbose() && query_ctx.live_analyze_metrics_enabled();
+        let inner = self.clone();
+        let mut stream = common_runtime::spawn_query(async move {
+            inner.handle_read_inner(request, query_ctx).await
+        })
+        .await
+        .context(RuntimeJoinSnafu {
+            request_type: "read",
+        })??;
+        let schema = stream.schema();
+        let output_ordering = stream.output_ordering().map(|ordering| ordering.to_vec());
+
+        let (sender, receiver) = mpsc::channel(QUERY_RUNTIME_STREAM_BUFFER_SIZE);
+        let metrics = QueryRuntimeStream::metrics_store();
+        let producer_metrics = metrics.clone();
+
+        let producer_handle = common_runtime::spawn_query(async move {
+            if live_analyze_metrics {
+                loop {
+                    match time::timeout(FLIGHT_METRICS_HEARTBEAT_INTERVAL, stream.next()).await {
+                        Ok(Some(batch)) => {
+                            *producer_metrics.write().unwrap() = stream.metrics();
+                            if sender.send(batch).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            *producer_metrics.write().unwrap() = stream.metrics();
+                        }
+                    }
+                }
+            } else {
+                while let Some(batch) = stream.next().await {
+                    *producer_metrics.write().unwrap() = stream.metrics();
+                    if sender.send(batch).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            *producer_metrics.write().unwrap() = stream.metrics();
+        });
+
+        Ok(Box::pin(
+            QueryRuntimeStream::new(schema, receiver)
+                .with_output_ordering(output_ordering)
+                .with_metrics_store(metrics)
+                .with_producer_handle(producer_handle),
+        ))
+    }
+
+    async fn handle_read_inner(
         &self,
         request: QueryRequest,
         query_ctx: QueryContextRef,
@@ -1591,7 +1895,10 @@ impl RegionServerInner {
 
         for (region_id, engine) in regions {
             let closed = engine
-                .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+                .handle_request(
+                    region_id,
+                    RegionRequest::Close(RegionCloseRequest::default()),
+                )
                 .await;
             match closed {
                 Ok(_) => debug!("Region {region_id} is closed"),
@@ -1619,6 +1926,7 @@ impl RegionServerInner {
 enum RegionChange {
     None,
     Register(RegionAttribute),
+    OfflineCleanup(RegionAttribute),
     Deregisters,
     Catchup,
     Ingest,
@@ -1666,23 +1974,265 @@ impl RegionAttribute {
 
 #[cfg(test)]
 mod tests {
-
     use std::assert_matches;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
-    use api::v1::SemanticType;
+    use api::v1::{Rows, SemanticType};
     use common_error::ext::ErrorExt;
-    use datatypes::prelude::ConcreteDataType;
+    use common_recordbatch::RecordBatches;
+    use common_recordbatch::adapter::{RecordBatchMetrics, RegionWatermarkEntry};
+    use datatypes::prelude::{ConcreteDataType, VectorRef};
+    use datatypes::schema::{ColumnSchema, Schema};
+    use datatypes::vectors::Int32Vector;
+    use futures_util::StreamExt;
     use mito2::test_util::CreateRequestBuilder;
+    use query::options::FLOW_RETURN_REGION_SEQ;
     use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataBuilder};
     use store_api::region_engine::RegionEngine;
     use store_api::region_request::{
-        PathType, RegionDropRequest, RegionOpenRequest, RegionTruncateRequest,
+        PathType, RegionCleanUpRequest, RegionCompactRequest, RegionDeleteRequest,
+        RegionDropRequest, RegionOpenRequest, RegionPutRequest, RegionTruncateRequest,
     };
     use store_api::storage::RegionId;
 
     use super::*;
-    use crate::error::Result;
     use crate::tests::{MockRegionEngine, mock_region_server};
+
+    #[test]
+    fn test_is_ingest_request() {
+        let rows = || Rows {
+            schema: Vec::new(),
+            rows: Vec::new(),
+        };
+
+        assert!(RegionServerInner::is_ingest_request(&RegionRequest::Put(
+            RegionPutRequest {
+                rows: rows(),
+                hint: None,
+                partition_expr_version: None,
+            },
+        )));
+        assert!(RegionServerInner::is_ingest_request(
+            &RegionRequest::Delete(RegionDeleteRequest {
+                rows: rows(),
+                hint: None,
+                partition_expr_version: None,
+            },)
+        ));
+        assert!(!RegionServerInner::is_ingest_request(
+            &RegionRequest::Compact(RegionCompactRequest::default()),
+        ));
+    }
+
+    fn single_value_stream() -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
+            "v",
+            ConcreteDataType::int32_datatype(),
+            false,
+        )]));
+        let values: VectorRef = Arc::new(Int32Vector::from_slice([1]));
+        let batch = RecordBatch::new(schema.clone(), vec![values]).unwrap();
+        RecordBatches::try_new(schema, vec![batch])
+            .unwrap()
+            .as_stream()
+    }
+
+    #[tokio::test]
+    async fn test_region_watermark_stream_only_sets_terminal_metrics() {
+        let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
+            "v",
+            ConcreteDataType::int32_datatype(),
+            false,
+        )]));
+        let values: VectorRef = Arc::new(Int32Vector::from_slice([1, 2]));
+        let batch = RecordBatch::new(schema.clone(), vec![values]).unwrap();
+        let stream = RecordBatches::try_new(schema, vec![batch])
+            .unwrap()
+            .as_stream();
+
+        let region_id = RegionId::new(42, 7);
+        let wrapped = RegionWatermarkStream::new(stream, region_id, 99);
+        let mut pinned = Box::pin(wrapped);
+
+        assert!(pinned.as_ref().get_ref().metrics().is_none());
+        while pinned.next().await.is_some() {}
+
+        let metrics = pinned.as_ref().get_ref().metrics().unwrap();
+        assert_eq!(
+            metrics.region_watermarks,
+            vec![RegionWatermarkEntry {
+                region_id: region_id.as_u64(),
+                watermark: Some(99),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_region_watermark_stream_preserves_unproved_watermark() {
+        let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
+            "v",
+            ConcreteDataType::int32_datatype(),
+            false,
+        )]));
+        let values: VectorRef = Arc::new(Int32Vector::from_slice([1]));
+        let batch = RecordBatch::new(schema.clone(), vec![values]).unwrap();
+        let stream = RecordBatches::try_new(schema, vec![batch])
+            .unwrap()
+            .as_stream();
+
+        let region_id = RegionId::new(42, 7);
+        let wrapped = RegionWatermarkStream::new(stream, region_id, 99);
+        let metrics = RecordBatchMetrics {
+            region_watermarks: vec![RegionWatermarkEntry {
+                region_id: region_id.as_u64(),
+                watermark: None,
+            }],
+            ..Default::default()
+        };
+
+        let merged = wrapped.merged_metrics(metrics);
+        assert_eq!(
+            merged.region_watermarks,
+            vec![RegionWatermarkEntry {
+                region_id: region_id.as_u64(),
+                watermark: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wrap_flow_region_watermark_stream_adds_terminal_metrics() {
+        let region_id = RegionId::new(42, 7);
+        let query_ctx = Arc::new(
+            QueryContextBuilder::default()
+                .extensions(HashMap::from([(
+                    FLOW_RETURN_REGION_SEQ.to_string(),
+                    "true".to_string(),
+                )]))
+                .build(),
+        );
+        query_ctx.set_snapshot(region_id.as_u64(), 99);
+
+        let wrapped =
+            wrap_flow_region_watermark_stream(single_value_stream(), region_id, &query_ctx);
+        let mut pinned = Box::pin(wrapped);
+        while pinned.next().await.is_some() {}
+
+        let metrics = pinned.as_ref().get_ref().metrics().unwrap();
+        assert_eq!(
+            metrics.region_watermarks,
+            vec![RegionWatermarkEntry {
+                region_id: region_id.as_u64(),
+                watermark: Some(99),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wrap_flow_region_watermark_stream_skips_without_extension() {
+        let region_id = RegionId::new(42, 7);
+        let query_ctx = Arc::new(QueryContextBuilder::default().build());
+        query_ctx.set_snapshot(region_id.as_u64(), 99);
+
+        let wrapped =
+            wrap_flow_region_watermark_stream(single_value_stream(), region_id, &query_ctx);
+        let mut pinned = Box::pin(wrapped);
+        while pinned.next().await.is_some() {}
+
+        assert!(pinned.as_ref().get_ref().metrics().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wrap_flow_region_watermark_stream_skips_without_snapshot() {
+        let region_id = RegionId::new(42, 7);
+        let query_ctx = Arc::new(
+            QueryContextBuilder::default()
+                .extensions(HashMap::from([(
+                    FLOW_RETURN_REGION_SEQ.to_string(),
+                    "true".to_string(),
+                )]))
+                .build(),
+        );
+
+        let wrapped =
+            wrap_flow_region_watermark_stream(single_value_stream(), region_id, &query_ctx);
+        let mut pinned = Box::pin(wrapped);
+        while pinned.next().await.is_some() {}
+
+        assert!(pinned.as_ref().get_ref().metrics().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_offline_cleanup_does_not_register_region() {
+        let mut mock_region_server = mock_region_server();
+        let (engine, mut receiver) = MockRegionEngine::new(MITO_ENGINE_NAME);
+        mock_region_server.register_engine(engine);
+
+        let region_id = RegionId::new(1, 1);
+        let response = mock_region_server
+            .handle_request(
+                region_id,
+                RegionRequest::CleanUp(RegionCleanUpRequest {
+                    engine: MITO_ENGINE_NAME.to_string(),
+                    table_dir: String::new(),
+                    path_type: PathType::Bare,
+                    options: HashMap::new(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.affected_rows, 0);
+        let (handled_region_id, handled_request) = receiver.try_recv().unwrap();
+        assert_eq!(handled_region_id, region_id);
+        assert_matches!(handled_request, RegionRequest::CleanUp(_));
+        assert!(
+            mock_region_server
+                .inner
+                .region_map
+                .get(&region_id)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_offline_cleanup_rejects_registered_region() {
+        let mut mock_region_server = mock_region_server();
+        let (engine, mut receiver) = MockRegionEngine::new(MITO_ENGINE_NAME);
+        mock_region_server.register_engine(engine.clone());
+
+        let region_id = RegionId::new(1, 1);
+        mock_region_server
+            .inner
+            .region_map
+            .insert(region_id, RegionEngineWithStatus::Ready(engine));
+
+        let err = mock_region_server
+            .handle_request(
+                region_id,
+                RegionRequest::CleanUp(RegionCleanUpRequest {
+                    engine: MITO_ENGINE_NAME.to_string(),
+                    table_dir: String::new(),
+                    path_type: PathType::Bare,
+                    options: HashMap::new(),
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status_code(), StatusCode::RegionBusy);
+        assert!(receiver.try_recv().is_err());
+        assert!(matches!(
+            mock_region_server
+                .inner
+                .region_map
+                .get(&region_id)
+                .unwrap()
+                .clone(),
+            RegionEngineWithStatus::Ready(_)
+        ));
+    }
 
     #[tokio::test]
     async fn test_region_registering() {
@@ -1727,6 +2277,7 @@ mod tests {
                     options: Default::default(),
                     skip_wal_replay: false,
                     checkpoint: None,
+                    requirements: Default::default(),
                 }),
             )
             .await
@@ -1785,7 +2336,10 @@ mod tests {
         );
 
         let response = mock_region_server
-            .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+            .handle_request(
+                region_id,
+                RegionRequest::Close(RegionCloseRequest::default()),
+            )
             .await
             .unwrap();
         assert_eq!(response.affected_rows, 0);
@@ -1905,6 +2459,7 @@ mod tests {
                             options: Default::default(),
                             skip_wal_replay: false,
                             checkpoint: None,
+                            requirements: Default::default(),
                         },
                     ),
                     (
@@ -1916,6 +2471,7 @@ mod tests {
                             options: Default::default(),
                             skip_wal_replay: false,
                             checkpoint: None,
+                            requirements: Default::default(),
                         },
                     ),
                 ],
@@ -1938,6 +2494,7 @@ mod tests {
                             options: Default::default(),
                             skip_wal_replay: false,
                             checkpoint: None,
+                            requirements: Default::default(),
                         },
                     ),
                     (
@@ -1949,6 +2506,7 @@ mod tests {
                             options: Default::default(),
                             skip_wal_replay: false,
                             checkpoint: None,
+                            requirements: Default::default(),
                         },
                     ),
                 ],
@@ -2085,6 +2643,43 @@ mod tests {
                 assert: Box::new(|result| {
                     let current_engine = result.unwrap();
                     assert_matches!(current_engine, CurrentEngine::Engine(_));
+                }),
+            },
+            // RegionChange::OfflineCleanup
+            CurrentEngineTest {
+                region_id,
+                current_region_status: None,
+                region_change: RegionChange::OfflineCleanup(RegionAttribute::Mito),
+                assert: Box::new(|result| {
+                    let current_engine = result.unwrap();
+                    assert_matches!(current_engine, CurrentEngine::Engine(_));
+                }),
+            },
+            CurrentEngineTest {
+                region_id,
+                current_region_status: Some(RegionEngineWithStatus::Registering(engine.clone())),
+                region_change: RegionChange::OfflineCleanup(RegionAttribute::Mito),
+                assert: Box::new(|result| {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.status_code(), StatusCode::RegionBusy);
+                }),
+            },
+            CurrentEngineTest {
+                region_id,
+                current_region_status: Some(RegionEngineWithStatus::Deregistering(engine.clone())),
+                region_change: RegionChange::OfflineCleanup(RegionAttribute::Mito),
+                assert: Box::new(|result| {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.status_code(), StatusCode::RegionBusy);
+                }),
+            },
+            CurrentEngineTest {
+                region_id,
+                current_region_status: Some(RegionEngineWithStatus::Ready(engine.clone())),
+                region_change: RegionChange::OfflineCleanup(RegionAttribute::Mito),
+                assert: Box::new(|result| {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.status_code(), StatusCode::RegionBusy);
                 }),
             },
         ];

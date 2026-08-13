@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use ahash::{HashMap as AHashMap, HashMapExt};
 use api::v1::column_data_type_extension::TypeExt;
 use api::v1::helper::time_index_column_schema;
 use api::v1::value::ValueData;
@@ -37,7 +38,7 @@ use crate::error::{
 pub struct TableData {
     schema: Vec<ColumnSchema>,
     rows: Vec<Row>,
-    column_indexes: HashMap<String, usize>,
+    column_indexes: AHashMap<String, usize>,
 }
 
 impl TableData {
@@ -45,7 +46,7 @@ impl TableData {
         Self {
             schema: Vec::with_capacity(num_columns),
             rows: Vec::with_capacity(num_rows),
-            column_indexes: HashMap::with_capacity(num_columns),
+            column_indexes: AHashMap::with_capacity(num_columns),
         }
     }
 
@@ -67,6 +68,28 @@ impl TableData {
     #[inline]
     pub fn add_row(&mut self, values: Vec<Value>) {
         self.rows.push(Row { values })
+    }
+
+    #[inline]
+    pub fn reserve_rows(&mut self, additional: usize) {
+        self.rows.reserve(additional);
+    }
+
+    pub(crate) fn ensure_column(&mut self, column_schema: ColumnSchema) -> Result<usize> {
+        if let Some(index) = self.column_indexes.get(&column_schema.column_name).copied() {
+            check_schema_number(
+                column_schema.datatype,
+                column_schema.semantic_type,
+                &self.schema[index],
+            )?;
+            return Ok(index);
+        }
+
+        let index = self.schema.len();
+        let name = column_schema.column_name.clone();
+        self.schema.push(column_schema);
+        self.column_indexes.insert(name, index);
+        Ok(index)
     }
 
     #[allow(dead_code)]
@@ -91,17 +114,30 @@ impl TableData {
         value: Option<ValueData>,
         one_row: &mut Vec<Value>,
     ) {
-        let name = name.to_string();
-        if let Some(index) = self.column_indexes.get(&name).copied() {
-            one_row[index].value_data = value;
-        } else {
-            let index = self.schema.len();
-            self.schema.push(ColumnSchema {
-                column_name: name.clone(),
+        self.write_column_unchecked(
+            ColumnSchema {
+                column_name: name.to_string(),
                 datatype: datatype as i32,
                 semantic_type: SemanticType::Field as i32,
                 ..Default::default()
-            });
+            },
+            value,
+            one_row,
+        );
+    }
+
+    pub fn write_column_unchecked(
+        &mut self,
+        column_schema: ColumnSchema,
+        value: Option<ValueData>,
+        one_row: &mut Vec<Value>,
+    ) {
+        if let Some(index) = self.column_indexes.get(&column_schema.column_name).copied() {
+            one_row[index].value_data = value;
+        } else {
+            let index = self.schema.len();
+            let name = column_schema.column_name.clone();
+            self.schema.push(column_schema);
             self.column_indexes.insert(name, index);
             one_row.push(Value { value_data: value });
         }
@@ -230,7 +266,7 @@ pub fn write_f64(
     )
 }
 
-fn build_json_column_schema(name: impl ToString) -> ColumnSchema {
+pub(crate) fn build_json_column_schema(name: impl ToString) -> ColumnSchema {
     ColumnSchema {
         column_name: name.to_string(),
         datatype: ColumnDataType::Binary as i32,
@@ -258,7 +294,7 @@ pub fn write_json(
     )
 }
 
-fn write_by_schema(
+pub(crate) fn write_by_schema(
     table_data: &mut TableData,
     kv_iter: impl Iterator<Item = (ColumnSchema, Option<ValueData>)>,
     one_row: &mut Vec<Value>,

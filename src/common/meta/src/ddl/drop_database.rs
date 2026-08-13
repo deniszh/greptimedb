@@ -23,7 +23,8 @@ use std::fmt::Debug;
 use common_error::ext::BoxedError;
 use common_procedure::error::{ExternalSnafu, FromJsonSnafu, ToJsonSnafu};
 use common_procedure::{
-    Context as ProcedureContext, LockKey, Procedure, Result as ProcedureResult, Status,
+    Context as ProcedureContext, EventContext, EventTrigger, LockKey, Procedure,
+    Result as ProcedureResult, Status,
 };
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,7 @@ use tonic::async_trait;
 
 use self::start::DropDatabaseStart;
 use crate::ddl::DdlContext;
+use crate::ddl::event::database::{DROP_DATABASE_EVENT_TYPE, DatabaseDdlEvent};
 use crate::ddl::utils::map_to_procedure_error;
 use crate::error::Result;
 use crate::key::table_name::TableNameValue;
@@ -58,6 +60,7 @@ pub(crate) struct DropDatabaseContext {
     schema: String,
     drop_if_exists: bool,
     tables: Option<BoxStream<'static, Result<(String, TableNameValue)>>>,
+    retrying: bool,
 }
 
 #[async_trait::async_trait]
@@ -90,6 +93,7 @@ impl DropDatabaseProcedure {
                 schema,
                 drop_if_exists,
                 tables: None,
+                retrying: false,
             },
             state: Box::new(DropDatabaseStart),
         }
@@ -110,6 +114,7 @@ impl DropDatabaseProcedure {
                 schema,
                 drop_if_exists,
                 tables: None,
+                retrying: false,
             },
             state,
         })
@@ -136,9 +141,10 @@ impl Procedure for DropDatabaseProcedure {
             })
     }
 
-    async fn execute(&mut self, _ctx: &ProcedureContext) -> ProcedureResult<Status> {
+    async fn execute(&mut self, ctx: &ProcedureContext) -> ProcedureResult<Status> {
         let state = &mut self.state;
 
+        self.context.retrying = ctx.is_retrying().await.unwrap_or(false);
         let (next, status) = state
             .next(&self.runtime_context, &mut self.context)
             .await
@@ -166,6 +172,23 @@ impl Procedure for DropDatabaseProcedure {
         ];
 
         LockKey::new(lock_key)
+    }
+
+    fn event(&self, ctx: &EventContext<'_>) -> Option<Box<dyn common_event_recorder::Event>> {
+        if !ctx.event_type_filter.allows(DROP_DATABASE_EVENT_TYPE) {
+            return None;
+        }
+
+        let event = if matches!(&ctx.trigger, EventTrigger::Submitted) {
+            DatabaseDdlEvent::drop_submitted(
+                &self.context.catalog,
+                &self.context.schema,
+                self.context.drop_if_exists,
+            )
+        } else {
+            DatabaseDdlEvent::drop_lifecycle(&self.context.catalog, &self.context.schema)
+        };
+        Some(Box::new(event))
     }
 }
 

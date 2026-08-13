@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use api::v1::SemanticType;
-use common_telemetry::{debug, info, warn};
+use common_query::native_histogram::is_native_histogram_value_type;
+use common_telemetry::{debug, info};
 use datatypes::schema::{SkippingIndexOptions, SkippingIndexType};
 use mito2::engine::MitoEngine;
 use snafu::ResultExt;
@@ -27,8 +28,8 @@ use store_api::storage::{ConcreteDataType, RegionId};
 
 use crate::engine::IndexOptions;
 use crate::error::{
-    ColumnTypeMismatchSnafu, ForbiddenPhysicalAlterSnafu, MitoReadOperationSnafu,
-    MitoWriteOperationSnafu, Result, SetSkippingIndexOptionSnafu,
+    AddingFieldColumnSnafu, ColumnTypeMismatchSnafu, ForbiddenPhysicalAlterSnafu,
+    MitoReadOperationSnafu, MitoWriteOperationSnafu, Result, SetSkippingIndexOptionSnafu,
 };
 use crate::metrics::{FORBIDDEN_OPERATION_COUNT, MITO_DDL_DURATION, PHYSICAL_COLUMN_COUNT};
 use crate::utils;
@@ -123,42 +124,52 @@ impl DataRegion {
             .into_iter()
             .enumerate()
             .map(|(delta, mut c)| {
-                if c.semantic_type == SemanticType::Tag {
-                    if !c.column_schema.data_type.is_string() {
-                        return ColumnTypeMismatchSnafu {
-                            expect: ConcreteDataType::string_datatype(),
-                            actual: c.column_schema.data_type.clone(),
+                match c.semantic_type {
+                    SemanticType::Tag => {
+                        if !c.column_schema.data_type.is_string() {
+                            return ColumnTypeMismatchSnafu {
+                                expect: ConcreteDataType::string_datatype(),
+                                actual: c.column_schema.data_type.clone(),
+                            }
+                            .fail();
+                        }
+                    }
+                    // Field columns can only be added to the shared physical
+                    // table for native histograms; ordinary metric fields are
+                    // created with the logical table.
+                    SemanticType::Field
+                        if is_native_histogram_value_type(&c.column_schema.data_type) => {}
+                    _ => {
+                        return AddingFieldColumnSnafu {
+                            name: &c.column_schema.name,
                         }
                         .fail();
                     }
-                } else {
-                    warn!(
-                        "Column {} in region {region_id} is not a tag",
-                        c.column_schema.name
-                    );
-                };
+                }
 
                 c.column_id = new_column_id_start + delta as u32;
                 c.column_schema.set_nullable();
-                match index_options {
-                    IndexOptions::None => {}
-                    IndexOptions::Inverted => {
-                        c.column_schema.set_inverted_index(true);
-                    }
-                    IndexOptions::Skipping {
-                        granularity,
-                        false_positive_rate,
-                    } => {
-                        c.column_schema
-                            .set_skipping_options(
-                                &SkippingIndexOptions::new(
-                                    granularity,
-                                    false_positive_rate,
-                                    SkippingIndexType::BloomFilter,
+                if c.semantic_type == SemanticType::Tag {
+                    match index_options {
+                        IndexOptions::None => {}
+                        IndexOptions::Inverted => {
+                            c.column_schema.set_inverted_index(true);
+                        }
+                        IndexOptions::Skipping {
+                            granularity,
+                            false_positive_rate,
+                        } => {
+                            c.column_schema
+                                .set_skipping_options(
+                                    &SkippingIndexOptions::new(
+                                        granularity,
+                                        false_positive_rate,
+                                        SkippingIndexType::BloomFilter,
+                                    )
+                                    .context(SetSkippingIndexOptionSnafu)?,
                                 )
-                                .context(SetSkippingIndexOptionSnafu)?,
-                            )
-                            .context(SetSkippingIndexOptionSnafu)?;
+                                .context(SetSkippingIndexOptionSnafu)?;
+                        }
                     }
                 }
 

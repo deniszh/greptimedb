@@ -17,7 +17,9 @@ use std::time::Duration;
 use common_base::readable_size::ReadableSize;
 use serde::{Deserialize, Serialize};
 
-use crate::config::kafka::common::{KafkaConnectionConfig, KafkaTopicConfig};
+use crate::config::kafka::common::{
+    DEFAULT_TOPIC_LATEST_OFFSET_FETCH_INTERVAL, KafkaConnectionConfig, KafkaTopicConfig,
+};
 
 /// Kafka wal configurations for datanode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +44,9 @@ pub struct DatanodeKafkaConfig {
     pub create_index: bool,
     #[serde(with = "humantime_serde")]
     pub dump_index_interval: Duration,
+    /// Internal interval for fetching latest Kafka topic offsets.
+    #[serde(with = "humantime_serde")]
+    pub topic_latest_offset_fetch_interval: Duration,
     /// Ignore missing entries during read WAL.
     pub overwrite_entry_start_id: bool,
 }
@@ -55,8 +60,9 @@ impl Default for DatanodeKafkaConfig {
             consumer_wait_timeout: Duration::from_millis(100),
             kafka_topic: KafkaTopicConfig::default(),
             auto_create_topics: true,
-            create_index: true,
+            create_index: false,
             dump_index_interval: Duration::from_secs(60),
+            topic_latest_offset_fetch_interval: DEFAULT_TOPIC_LATEST_OFFSET_FETCH_INTERVAL,
             overwrite_entry_start_id: false,
         }
     }

@@ -16,14 +16,17 @@ use std::env;
 use std::fmt::Display;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use auth::{DefaultPermissionChecker, PermissionCheckerRef, UserProviderRef};
 use axum::Router;
 use catalog::kvbackend::KvBackendCatalogManager;
 use common_base::Plugins;
 use common_config::Configurable;
+use common_meta::key::TableMetadataManager;
 use common_meta::key::catalog_name::CatalogNameKey;
 use common_meta::key::schema_name::SchemaNameKey;
+use common_meta::kv_backend::KvBackendRef;
 use common_query::Output;
 use common_runtime::runtime::BuilderBuild;
 use common_runtime::{Builder as RuntimeBuilder, Runtime};
@@ -47,6 +50,7 @@ use servers::http::{HttpOptions, HttpServerBuilder};
 use servers::metrics_handler::MetricsHandler;
 use servers::mysql::server::{MysqlServer, MysqlSpawnConfig, MysqlSpawnRef};
 use servers::otel_arrow::OtelArrowServiceHandler;
+use servers::pending_rows_batcher::PendingRowsBatcher;
 use servers::postgres::PostgresServer;
 use servers::prom_remote_write::validation::PromValidationMode;
 use servers::query_handler::sql::SqlQueryHandler;
@@ -358,6 +362,7 @@ pub(crate) fn create_datanode_opts(
         require_lease_before_startup: true,
         storage: StorageConfig {
             data_home: home_dir,
+            copy_root: None,
             providers,
             store: default_store,
         },
@@ -563,6 +568,32 @@ pub async fn setup_test_prom_app_with_frontend(
     store_type: StorageType,
     name: &str,
 ) -> (Router, TestGuard) {
+    setup_test_prom_app_with_frontend_inner(store_type, name, false, false).await
+}
+
+pub async fn setup_test_prom_app_with_frontend_native_histogram(
+    store_type: StorageType,
+    name: &str,
+) -> (Router, TestGuard) {
+    setup_test_prom_app_with_frontend_inner(store_type, name, false, true).await
+}
+
+/// Like [`setup_test_prom_app_with_frontend`] but enables the pending-rows batcher,
+/// so Prometheus remote write goes through the batched (metric-engine) path instead
+/// of the direct `PromStoreProtocolHandler::write` path.
+pub async fn setup_test_prom_app_with_frontend_batched(
+    store_type: StorageType,
+    name: &str,
+) -> (Router, TestGuard) {
+    setup_test_prom_app_with_frontend_inner(store_type, name, true, false).await
+}
+
+async fn setup_test_prom_app_with_frontend_inner(
+    store_type: StorageType,
+    name: &str,
+    enable_batcher: bool,
+    experimental_enable_prometheus_native_histogram: bool,
+) -> (Router, TestGuard) {
     unsafe {
         std::env::set_var("TZ", "UTC");
     }
@@ -615,6 +646,26 @@ pub async fn setup_test_prom_app_with_frontend(
         ..Default::default()
     };
     let frontend_ref = instance.fe_instance().clone();
+    // Mirror the production wiring at `frontend::server`: build the batcher from the
+    // instance's managers. A short flush interval keeps the test responsive.
+    let pending_rows_batcher = if enable_batcher {
+        PendingRowsBatcher::try_new(
+            frontend_ref.partition_manager().clone(),
+            frontend_ref.node_manager().clone(),
+            frontend_ref.catalog_manager().clone(),
+            frontend_ref.table_flownode_set_cache().clone(),
+            true,
+            frontend_ref.clone(),
+            Duration::from_millis(50),
+            1000,
+            4,
+            64,
+            64,
+            std::num::NonZeroUsize::new(1024).unwrap(),
+        )
+    } else {
+        None
+    };
     let http_server = HttpServerBuilder::new(http_opts)
         .with_sql_handler(frontend_ref.clone())
         .with_logs_handler(instance.fe_instance().clone())
@@ -623,7 +674,8 @@ pub async fn setup_test_prom_app_with_frontend(
             Some(frontend_ref.clone()),
             true,
             PromValidationMode::Strict,
-            None,
+            experimental_enable_prometheus_native_histogram,
+            pending_rows_batcher,
         )
         .with_prometheus_handler(frontend_ref)
         .with_greptime_config_options(instance.opts.datanode_options().to_toml().unwrap())
@@ -647,6 +699,20 @@ pub async fn setup_grpc_server_with_user_provider(
     setup_grpc_server_with(store_type, name, user_provider, None, None).await
 }
 
+/// Sets up a gRPC server backed by a standalone instance whose frontend has auto
+/// table creation disabled, for testing the server-side global switch.
+pub async fn setup_grpc_server_with_auto_create_table_disabled(
+    store_type: StorageType,
+    name: &str,
+) -> (GreptimeDbStandalone, Arc<GrpcServer>) {
+    let instance = GreptimeDbStandaloneBuilder::new(name)
+        .with_default_store_type(store_type)
+        .with_auto_create_table(false)
+        .build()
+        .await;
+    setup_grpc_server_for_instance(instance, None, None, None).await
+}
+
 pub async fn setup_grpc_server_with(
     store_type: StorageType,
     name: &str,
@@ -655,7 +721,17 @@ pub async fn setup_grpc_server_with(
     memory_limiter: Option<servers::request_memory_limiter::ServerMemoryLimiter>,
 ) -> (GreptimeDbStandalone, Arc<GrpcServer>) {
     let instance = setup_standalone_instance(name, store_type).await;
+    setup_grpc_server_for_instance(instance, user_provider, grpc_config, memory_limiter).await
+}
 
+/// Builds and starts a gRPC server on top of an already-constructed standalone
+/// instance. This is the shared core behind the `setup_grpc_server_*` helpers.
+async fn setup_grpc_server_for_instance(
+    instance: GreptimeDbStandalone,
+    user_provider: Option<UserProviderRef>,
+    grpc_config: Option<GrpcServerConfig>,
+    memory_limiter: Option<servers::request_memory_limiter::ServerMemoryLimiter>,
+) -> (GreptimeDbStandalone, Arc<GrpcServer>) {
     let runtime: Runtime = RuntimeBuilder::default()
         .worker_threads(2)
         .thread_name("grpc-handlers")
@@ -907,6 +983,17 @@ pub(crate) async fn prepare_another_catalog_and_schema(instance: &Instance) {
         .unwrap();
 
     let table_metadata_manager = catalog_manager.table_metadata_manager_ref();
+    prepare_another_catalog_and_schema_with_manager(table_metadata_manager).await;
+}
+
+pub(crate) async fn prepare_another_catalog_and_schema_with_kv_backend(kv_backend: KvBackendRef) {
+    let table_metadata_manager = TableMetadataManager::new(kv_backend);
+    prepare_another_catalog_and_schema_with_manager(&table_metadata_manager).await;
+}
+
+async fn prepare_another_catalog_and_schema_with_manager(
+    table_metadata_manager: &TableMetadataManager,
+) {
     table_metadata_manager
         .catalog_manager()
         .create(CatalogNameKey::new("another_catalog"), true)

@@ -20,16 +20,17 @@ use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use common_telemetry::{info, warn};
+use common_telemetry::{debug, info, warn};
 use parquet::file::metadata::PageIndexPolicy;
+use snafu::ResultExt;
 use store_api::logstore::LogStore;
 use store_api::metadata::RegionMetadataRef;
-use store_api::storage::RegionId;
+use store_api::storage::{RegionId, SequenceNumber};
 
 use crate::cache::CacheManagerRef;
 use crate::cache::file_cache::{FileType, IndexKey};
 use crate::config::IndexBuildMode;
-use crate::error::{RegionBusySnafu, RegionNotFoundSnafu, Result};
+use crate::error::{EditRegionSnafu, RegionBusySnafu, RegionNotFoundSnafu, Result};
 use crate::manifest::action::{
     RegionChange, RegionEdit, RegionMetaAction, RegionMetaActionList, RegionTruncate,
 };
@@ -40,18 +41,23 @@ use crate::region::options::RegionOptions;
 use crate::region::version::VersionControlRef;
 use crate::region::{MitoRegionRef, RegionLeaderState, RegionRoleState};
 use crate::request::{
-    BackgroundNotify, BuildIndexRequest, OptionOutputTx, RegionChangeResult, RegionEditRequest,
-    RegionEditResult, RegionSyncRequest, TruncateResult, WorkerRequest, WorkerRequestWithTime,
+    BackgroundNotify, BuildIndexRequest, DiscardUnflushedResult, OptionOutputTx,
+    RegionChangeResult, RegionEditRequest, RegionEditResult, RegionSyncRequest, TruncateResult,
+    WorkerRequest, WorkerRequestWithTime,
 };
 use crate::sst::index::IndexBuildType;
 use crate::sst::location;
+use crate::wal::EntryId;
 use crate::worker::{RegionWorkerLoop, WorkerListener};
 
 pub(crate) type RegionEditQueues = HashMap<RegionId, RegionEditQueue>;
 
-/// A queue for temporary store region edit requests, if the region is in the "Editing" state.
-/// When the current region edit request is completed, the next (if there exists) request in the
-/// queue will be processed.
+/// A queue for region edit requests received while the region is already `Editing`.
+///
+/// Normal writes and bulk inserts that arrive during `Editing` use the stalled-write queue instead.
+/// When an edit completes, those writes are handled before the next queued edit starts, preserving
+/// sequence ordering between direct SST edits and WAL/memtable writes unless global reject
+/// backpressure rejects them first.
 /// Everything is done in the region worker loop.
 pub(crate) struct RegionEditQueue {
     region_id: RegionId,
@@ -70,23 +76,86 @@ impl RegionEditQueue {
 
     fn enqueue(&mut self, request: RegionEditRequest) {
         if self.requests.len() > Self::QUEUE_MAX_LEN {
-            let _ = request.tx.send(
+            request.waiters.reply_with(|| {
                 RegionBusySnafu {
                     region_id: self.region_id,
                 }
-                .fail(),
-            );
+                .fail()
+            });
             return;
         };
         self.requests.push_back(request);
     }
 
     fn dequeue(&mut self) -> Option<RegionEditRequest> {
-        self.requests.pop_front()
+        fn can_merge(edit: &RegionEdit) -> bool {
+            // Only the `RegionEdit`:
+            // 1. contains the "raw" (file without a sequence) files to add,
+            // 2. and no `committed_sequence`,
+            // 3. and all other fields are empty,
+            // can it be merged.
+            //
+            // However, merging them means they will all share a same sequence, and if there are
+            // overlapping data in the files, the dedup is uncertain. This is a caution that must
+            // be noticed for editing region.
+            edit.files_to_add.iter().all(|f| f.sequence.is_none())
+                && edit.files_to_remove.is_empty()
+                && edit.timestamp_ms.is_none()
+                && edit.compaction_time_window.is_none()
+                && edit.flushed_entry_id.is_none()
+                && edit.flushed_sequence.is_none()
+                && edit.committed_sequence.is_none()
+        }
+
+        let mut merged = self.requests.pop_front()?;
+        if !can_merge(&merged.edit) {
+            return Some(merged);
+        }
+
+        while let Some(request) = self
+            .requests
+            .pop_front_if(|request| can_merge(&request.edit))
+        {
+            merged.edit.files_to_add.extend(request.edit.files_to_add);
+            merged.waiters.merge(request.waiters);
+        }
+        debug!(
+            "the files to add: [{}] are merged in one edit",
+            merged
+                .edit
+                .files_to_add
+                .iter()
+                .map(|x| x.file_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Some(merged)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    fn reject_all_as_not_found(mut self) {
+        while let Some(request) = self.requests.pop_front() {
+            request.waiters.reply_with(|| {
+                RegionNotFoundSnafu {
+                    region_id: self.region_id,
+                }
+                .fail()
+            });
+        }
     }
 }
 
 impl<S: LogStore> RegionWorkerLoop<S> {
+    /// Rejects queued region edit requests as region not found.
+    pub(crate) fn reject_region_edit_queue_as_not_found(&mut self, region_id: RegionId) {
+        if let Some(edit_queue) = self.region_edit_queues.remove(&region_id) {
+            edit_queue.reject_all_as_not_found();
+        }
+    }
+
     /// Handles region change result.
     pub(crate) async fn handle_manifest_region_change_result(
         &mut self,
@@ -134,7 +203,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             .await;
         }
         // Handles the stalled requests.
-        self.handle_region_stalled_requests(&change_result.region_id)
+        self.handle_region_stalled_requests(&change_result.region_id, true)
             .await;
     }
 
@@ -213,12 +282,14 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     }
 }
 
-impl<S> RegionWorkerLoop<S> {
+impl<S: LogStore> RegionWorkerLoop<S> {
     /// Handles region edit request.
     pub(crate) fn handle_region_edit(&mut self, request: RegionEditRequest) {
         let region_id = request.region_id;
         let Some(region) = self.regions.get_region(region_id) else {
-            let _ = request.tx.send(RegionNotFoundSnafu { region_id }.fail());
+            request
+                .waiters
+                .reply_with(|| RegionNotFoundSnafu { region_id }.fail());
             return;
         };
 
@@ -229,7 +300,9 @@ impl<S> RegionWorkerLoop<S> {
                     .or_insert_with(|| RegionEditQueue::new(region_id))
                     .enqueue(request);
             } else {
-                let _ = request.tx.send(RegionBusySnafu { region_id }.fail());
+                request
+                    .waiters
+                    .reply_with(|| RegionBusySnafu { region_id }.fail());
             }
             return;
         }
@@ -237,7 +310,8 @@ impl<S> RegionWorkerLoop<S> {
         let RegionEditRequest {
             region_id: _,
             mut edit,
-            tx: sender,
+            waiters,
+            preload_sst_cache,
         } = request;
         let file_sequence = region.version_control.committed_sequence() + 1;
         edit.committed_sequence = Some(file_sequence);
@@ -256,7 +330,8 @@ impl<S> RegionWorkerLoop<S> {
         };
         // Marks the region as editing.
         if let Err(e) = region.set_editing(expect_state) {
-            let _ = sender.send(Err(e));
+            let e = Arc::new(e);
+            waiters.reply_with(|| Err(e.clone()).context(EditRegionSnafu { region_id }));
             return;
         }
 
@@ -266,13 +341,21 @@ impl<S> RegionWorkerLoop<S> {
         // Now the region is in editing state.
         // Updates manifest in background.
         common_runtime::spawn_global(async move {
-            let result =
-                edit_region(&region, edit.clone(), cache_manager, listener, is_staging).await;
+            let result = edit_region(
+                &region,
+                edit.clone(),
+                cache_manager,
+                listener,
+                is_staging,
+                preload_sst_cache,
+            )
+            .await
+            .map_err(Arc::new);
             let notify = WorkerRequest::Background {
                 region_id,
                 notify: BackgroundNotify::RegionEdit(RegionEditResult {
                     region_id,
-                    sender,
+                    waiters,
                     edit,
                     result,
                     // we always need to restore region state after region edit
@@ -299,12 +382,17 @@ impl<S> RegionWorkerLoop<S> {
         let region = match self.regions.get_region(edit_result.region_id) {
             Some(region) => region,
             None => {
-                let _ = edit_result.sender.send(
+                // Fail writes stalled behind this edit if the region was removed before the
+                // edit-completion notification reached the worker.
+                self.fail_region_stalled_requests_as_not_found(&edit_result.region_id);
+                self.reject_region_edit_queue_as_not_found(edit_result.region_id);
+
+                edit_result.waiters.reply_with(|| {
                     RegionNotFoundSnafu {
                         region_id: edit_result.region_id,
                     }
-                    .fail(),
-                );
+                    .fail()
+                });
                 return;
             }
         };
@@ -318,8 +406,10 @@ impl<S> RegionWorkerLoop<S> {
 
             false
         } else {
-            let need_compaction =
-                edit_result.result.is_ok() && !edit_result.edit.files_to_add.is_empty();
+            let need_compaction = self.config.schedule_compaction_after_edit
+                && edit_result.result.is_ok()
+                && !edit_result.edit.files_to_add.is_empty();
+
             // Only apply the edit if the result is ok and region is not in staging state.
             if edit_result.result.is_ok() {
                 // Applies the edit to the region.
@@ -336,11 +426,33 @@ impl<S> RegionWorkerLoop<S> {
             need_compaction
         };
 
-        let _ = edit_result.sender.send(edit_result.result);
+        edit_result
+            .waiters
+            .reply_with(|| match &edit_result.result {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.clone()).context(EditRegionSnafu {
+                    region_id: edit_result.region_id,
+                }),
+            });
 
-        if let Some(edit_queue) = self.region_edit_queues.get_mut(&edit_result.region_id)
-            && let Some(request) = edit_queue.dequeue()
-        {
+        if edit_result.update_region_state {
+            // Writes stalled specifically by this edit are handled before the next queued edit.
+            // Otherwise the next edit could reserve a committed sequence before those writes.
+            self.handle_region_stalled_requests(&edit_result.region_id, false)
+                .await;
+        }
+
+        let next_request =
+            if let Some(edit_queue) = self.region_edit_queues.get_mut(&edit_result.region_id) {
+                let request = edit_queue.dequeue();
+                if edit_queue.is_empty() {
+                    self.region_edit_queues.remove(&edit_result.region_id);
+                }
+                request
+            } else {
+                None
+            };
+        if let Some(request) = next_request {
             self.handle_region_edit(request);
         }
 
@@ -393,6 +505,62 @@ impl<S> RegionWorkerLoop<S> {
                 }))
                 .await
                 .inspect_err(|_| warn!("failed to send truncate result"));
+        });
+    }
+
+    /// Advances the durable replay frontier before discarding a region's memtables.
+    pub(crate) fn handle_manifest_discard_unflushed_action(
+        &self,
+        region: MitoRegionRef,
+        discarded_entry_id: EntryId,
+        discarded_sequence: SequenceNumber,
+        discarded_rows: u64,
+        discarded_bytes: u64,
+        sender: OptionOutputTx,
+    ) {
+        if let Err(e) = region.set_truncating() {
+            sender.send(Err(e));
+            return;
+        }
+
+        let region_id = region.region_id;
+        let request_sender = self.sender.clone();
+        let manifest_ctx = region.manifest_ctx.clone();
+
+        common_runtime::spawn_global(async move {
+            // The frontier moves to the last written entry and sequence, so replaying the
+            // WAL after a restart skips everything the memtables held.
+            let edit = RegionEdit {
+                files_to_add: Vec::new(),
+                files_to_remove: Vec::new(),
+                timestamp_ms: None,
+                compaction_time_window: None,
+                flushed_entry_id: Some(discarded_entry_id),
+                flushed_sequence: Some(discarded_sequence),
+                committed_sequence: None,
+            };
+            let action_list = RegionMetaActionList::with_action(RegionMetaAction::Edit(edit));
+            let result = manifest_ctx
+                .update_manifest(RegionLeaderState::Truncating, action_list, false)
+                .await
+                .map(|_| ());
+
+            let result = DiscardUnflushedResult {
+                region_id,
+                sender,
+                result,
+                discarded_entry_id,
+                discarded_sequence,
+                discarded_rows,
+                discarded_bytes,
+            };
+            let _ = request_sender
+                .send(WorkerRequestWithTime::new(WorkerRequest::Background {
+                    region_id,
+                    notify: BackgroundNotify::DiscardUnflushed(result),
+                }))
+                .await
+                .inspect_err(|_| warn!("failed to send discard unflushed result"));
         });
     }
 
@@ -484,9 +652,12 @@ async fn edit_region(
     cache_manager: CacheManagerRef,
     listener: WorkerListener,
     is_staging: bool,
+    preload_sst_cache: bool,
 ) -> Result<()> {
     let region_id = region.region_id;
-    if let Some(write_cache) = cache_manager.write_cache() {
+    if let Some(write_cache) = cache_manager.write_cache()
+        && preload_sst_cache
+    {
         for file_meta in &edit.files_to_add {
             let write_cache = write_cache.clone();
             let layer = region.access_layer.clone();

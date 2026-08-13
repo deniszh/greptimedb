@@ -6,7 +6,13 @@ license.workspace = true
 
 [features]
 testing = []
-enterprise = ["common-meta/enterprise", "operator/enterprise", "sql/enterprise"]
+enterprise = [
+    "common-meta/enterprise",
+    "operator/enterprise",
+    "sql/enterprise",
+    "catalog/enterprise",
+    "common-function/enterprise",
+]
 
 [lints]
 workspace = true
@@ -46,18 +52,17 @@ common-version.workspace = true
 dashmap.workspace = true
 datafusion.workspace = true
 datafusion-expr.workspace = true
-datanode.workspace = true
 datatypes.workspace = true
 futures.workspace = true
 hostname.workspace = true
 humantime.workspace = true
 humantime-serde.workspace = true
-itertools.workspace = true
 lazy_static.workspace = true
 log-query.workspace = true
 meta-client.workspace = true
 num_cpus.workspace = true
 opentelemetry-proto.workspace = true
+opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
 operator.workspace = true
 otel-arrow-rust.workspace = true
 partition.workspace = true
@@ -85,11 +90,9 @@ tracing.workspace = true
 [dev-dependencies]
 catalog = { workspace = true, features = ["testing"] }
 common-test-util.workspace = true
-datanode.workspace = true
 datatypes.workspace = true
 futures.workspace = true
 hyper-util = { workspace = true, features = ["tokio"] }
-meta-srv.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 strfmt = "0.2"

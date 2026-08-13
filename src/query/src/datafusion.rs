@@ -15,6 +15,7 @@
 //! Planner, QueryEngine implementations based on DataFusion.
 
 mod error;
+mod json_expr_planner;
 mod planner;
 
 use std::any::Any;
@@ -23,12 +24,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common_base::Plugins;
-use common_catalog::consts::is_readonly_schema;
+use common_catalog::consts::is_readonly_table;
 use common_error::ext::BoxedError;
 use common_function::function::FunctionContext;
 use common_function::function_factory::ScalarFunctionFactory;
 use common_query::{Output, OutputData, OutputMeta};
-use common_recordbatch::adapter::RecordBatchStreamAdapter;
+use common_recordbatch::adapter::{RecordBatchStreamAdapter, RegionQueryStatCounters};
 use common_recordbatch::{EmptyRecordBatchStream, SendableRecordBatchStream};
 use common_telemetry::tracing;
 use datafusion::catalog::TableFunction;
@@ -48,18 +49,25 @@ use snafu::{OptionExt, ResultExt, ensure};
 use sqlparser::ast::AnalyzeFormat;
 use table::TableRef;
 use table::requests::{DeleteRequest, InsertRequest};
+use table::table::scan::{REGION_SCAN_EXEC_NAME, RegionScanExec};
 use tracing::Span;
 
 use crate::analyze::DistAnalyzeExec;
 pub use crate::datafusion::planner::DfContextProviderAdapter;
-use crate::dist_plan::{DistPlannerOptions, MergeScanLogicalPlan};
+use crate::dist_plan::{
+    DistPlannerOptions, MergeScanLogicalPlan, RemoteDynFilterReceiverInjectorRef,
+};
 use crate::error::{
-    CatalogSnafu, ConvertSchemaSnafu, CreateRecordBatchSnafu, MissingTableMutationHandlerSnafu,
+    CatalogSnafu, CreateRecordBatchSnafu, MissingTableMutationHandlerSnafu,
     MissingTimestampColumnSnafu, QueryExecutionSnafu, Result, TableMutationSnafu,
     TableNotFoundSnafu, TableReadOnlySnafu, UnsupportedExprSnafu,
 };
 use crate::executor::QueryExecutor;
-use crate::metrics::{OnDone, QUERY_STAGE_ELAPSED};
+use crate::metrics::{
+    OnDone, QUERY_STAGE_ELAPSED, maybe_attach_region_watermark_metrics,
+    should_collect_region_watermark_from_query_ctx,
+};
+use crate::options::ScheduledTimeExtension;
 use crate::physical_wrapper::PhysicalPlanWrapperRef;
 use crate::planner::{DfLogicalPlanner, LogicalPlanner};
 use crate::query_engine::{DescribeResult, QueryEngineContext, QueryEngineState};
@@ -71,6 +79,64 @@ pub const QUERY_PARALLELISM_HINT: &str = "query_parallelism";
 
 /// Whether to fallback to the original plan when failed to push down.
 pub const QUERY_FALLBACK_HINT: &str = "query_fallback";
+
+fn query_load_region_id(plan: &Arc<dyn ExecutionPlan>) -> Option<u64> {
+    let mut region_id = None;
+    let mut stack = vec![plan.clone()];
+
+    while let Some(plan) = stack.pop() {
+        if plan.name() == REGION_SCAN_EXEC_NAME
+            && let Some(scan) = plan.as_any().downcast_ref::<RegionScanExec>()
+            && let Some(scan_region_id) = scan.query_load_region_id()
+        {
+            match region_id {
+                Some(region_id) if region_id != scan_region_id => return None,
+                Some(_) => {}
+                None => region_id = Some(scan_region_id),
+            }
+        }
+        stack.extend(plan.children().into_iter().cloned());
+    }
+
+    region_id
+}
+
+// Finds the region-owned query statistic counters from the local datanode scan plan.
+//
+// Unlike the Prometheus read-load reporting in `MergeScanExec`, the heartbeat
+// counters must be updated before metrics leave the datanode process. The
+// `RecordBatchStreamAdapter` that resolves `RecordBatchMetrics` does not know
+// the owning `MitoRegion`, so we extract the counters from `RegionScanExec` and
+// pass them to the adapter. If a plan contains scans from different regions,
+// return `None` to avoid charging the whole plan metrics to one region.
+fn query_stat_counters(plan: &Arc<dyn ExecutionPlan>) -> Option<RegionQueryStatCounters> {
+    let mut counters: Option<RegionQueryStatCounters> = None;
+    let mut stack = vec![plan.clone()];
+
+    while let Some(plan) = stack.pop() {
+        if plan.name() == REGION_SCAN_EXEC_NAME
+            && let Some(scan) = plan.as_any().downcast_ref::<RegionScanExec>()
+            && let Some(scan_counters) = scan.query_stat_counters()
+        {
+            match &counters {
+                Some(counters)
+                    if !Arc::ptr_eq(&counters.query_cpu_time, &scan_counters.query_cpu_time)
+                        || !Arc::ptr_eq(
+                            &counters.query_scanned_bytes,
+                            &scan_counters.query_scanned_bytes,
+                        ) =>
+                {
+                    return None;
+                }
+                Some(_) => {}
+                None => counters = Some(scan_counters),
+            }
+        }
+        stack.extend(plan.children().into_iter().cloned());
+    }
+
+    counters
+}
 
 pub struct DatafusionQueryEngine {
     state: Arc<QueryEngineState>,
@@ -89,19 +155,27 @@ impl DatafusionQueryEngine {
         query_ctx: QueryContextRef,
     ) -> Result<Output> {
         let mut ctx = self.engine_context(query_ctx.clone());
+        let plan = if let Some(receiver_injector) =
+            self.plugins.get::<RemoteDynFilterReceiverInjectorRef>()
+        {
+            receiver_injector.maybe_inject(plan, query_ctx.clone())
+        } else {
+            plan
+        };
 
         // `create_physical_plan` will optimize logical plan internally
         let physical_plan = self.create_physical_plan(&mut ctx, &plan).await?;
-        let optimized_physical_plan = self.optimize_physical_plan(&mut ctx, physical_plan)?;
-
+        let physical_plan = self.optimize_physical_plan(&mut ctx, physical_plan)?;
         let physical_plan = if let Some(wrapper) = self.plugins.get::<PhysicalPlanWrapperRef>() {
-            wrapper.wrap(optimized_physical_plan, query_ctx)
+            wrapper.wrap(physical_plan, query_ctx)
         } else {
-            optimized_physical_plan
+            physical_plan
         };
 
+        let stream = self.execute_stream(&ctx, &physical_plan)?;
+
         Ok(Output::new(
-            OutputData::Stream(self.execute_stream(&ctx, &physical_plan)?),
+            OutputData::Stream(stream),
             OutputMeta::new_with_plan(physical_plan),
         ))
     }
@@ -128,10 +202,10 @@ impl DatafusionQueryEngine {
         let table_name = dml.table_name.resolve(default_catalog, default_schema);
         let table = self.find_table(&table_name, &query_ctx).await?;
 
-        let output = self
+        let Output { data, meta } = self
             .exec_query_plan((*dml.input).clone(), query_ctx.clone())
             .await?;
-        let mut stream = match output.data {
+        let mut stream = match data {
             OutputData::RecordBatches(batches) => batches.as_stream(),
             OutputData::Stream(stream) => stream,
             _ => unreachable!(),
@@ -167,7 +241,7 @@ impl DatafusionQueryEngine {
         }
         Ok(Output::new(
             OutputData::AffectedRows(affected_rows),
-            OutputMeta::new_with_cost(insert_cost),
+            OutputMeta::new(meta.plan, insert_cost),
         ))
     }
 
@@ -185,7 +259,7 @@ impl DatafusionQueryEngine {
         let table_schema = table.schema();
 
         ensure!(
-            !is_readonly_schema(&schema_name),
+            !is_readonly_table(&schema_name, &table_name),
             TableReadOnlySnafu { table: table_name }
         );
 
@@ -233,7 +307,7 @@ impl DatafusionQueryEngine {
         let table_name = table_name.table.to_string();
 
         ensure!(
-            !is_readonly_schema(&schema_name),
+            !is_readonly_table(&schema_name, &table_name),
             TableReadOnlySnafu { table: table_name }
         );
 
@@ -427,15 +501,7 @@ impl QueryEngine for DatafusionQueryEngine {
         plan: LogicalPlan,
         _query_ctx: QueryContextRef,
     ) -> Result<DescribeResult> {
-        let schema = plan
-            .schema()
-            .clone()
-            .try_into()
-            .context(ConvertSchemaSnafu)?;
-        Ok(DescribeResult {
-            schema,
-            logical_plan: plan,
-        })
+        Ok(DescribeResult { logical_plan: plan })
     }
 
     async fn execute(&self, plan: LogicalPlan, query_ctx: QueryContextRef) -> Result<Output> {
@@ -477,6 +543,7 @@ impl QueryEngine for DatafusionQueryEngine {
     fn engine_context(&self, query_ctx: QueryContextRef) -> QueryEngineContext {
         let mut state = self.state.session_state();
         state.config_mut().set_extension(query_ctx.clone());
+        state.config_mut().set_extension(self.state.clone());
         // note that hints in "x-greptime-hints" is automatically parsed
         // and set to query context's extension, so we can get it from query context.
         if let Some(parallelism) = query_ctx.extension(QUERY_PARALLELISM_HINT) {
@@ -530,11 +597,35 @@ impl QueryEngine for DatafusionQueryEngine {
                 state: self.engine_state().function_state(),
             });
 
+        // Carry scheduled Flow time through ConfigOptions.extensions so that
+        // the distributed plan analyzer can read it during expression
+        // simplification (preventing wall-clock constant-folding of `now()`).
+        state
+            .config_mut()
+            .options_mut()
+            .extensions
+            .insert(ScheduledTimeExtension {
+                scheduled_time: crate::options::scheduled_time_from_ctx(&query_ctx),
+            });
+
         let config_options = state.config_options().clone();
         let _ = state
             .execution_props_mut()
             .config_options
             .insert(config_options);
+
+        // Apply scheduled time from query context if present, so that `now()` /
+        // `current_timestamp()` functions evaluate against the logical scheduled time
+        // rather than wall-clock.
+        match crate::options::parse_scheduled_time_datetime(&query_ctx.extensions()) {
+            Ok(Some(scheduled_rt)) => {
+                state.execution_props_mut().query_execution_start_time = Some(scheduled_rt);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                common_telemetry::warn!(err; "Ignoring invalid scheduled time query extension");
+            }
+        }
 
         QueryEngineContext::new(state, query_ctx)
     }
@@ -551,7 +642,10 @@ impl QueryExecutor for DatafusionQueryEngine {
         ctx: &QueryEngineContext,
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<SendableRecordBatchStream> {
-        let explain_verbose = ctx.query_ctx().explain_verbose();
+        let query_ctx = ctx.query_ctx();
+        let explain_verbose = query_ctx.explain_verbose();
+        let should_collect_region_watermark =
+            should_collect_region_watermark_from_query_ctx(&query_ctx)?;
         let output_partitions = plan.properties().output_partitioning().partition_count();
         if explain_verbose {
             common_telemetry::info!("Executing query plan, output_partitions: {output_partitions}");
@@ -577,6 +671,8 @@ impl QueryExecutor for DatafusionQueryEngine {
                     .map_err(BoxedError::new)
                     .context(QueryExecutionSnafu)?;
                 stream.set_metrics2(plan.clone());
+                stream.set_query_load_region_id(query_load_region_id(plan));
+                stream.set_query_stat_counters(query_stat_counters(plan));
                 stream.set_explain_verbose(explain_verbose);
                 let stream = OnDone::new(Box::pin(stream), move || {
                     let exec_cost = exec_timer.stop_and_record();
@@ -587,7 +683,11 @@ impl QueryExecutor for DatafusionQueryEngine {
                         );
                     }
                 });
-                Ok(Box::pin(stream))
+                Ok(maybe_attach_region_watermark_metrics(
+                    Box::pin(stream),
+                    plan.clone(),
+                    should_collect_region_watermark,
+                ))
             }
             _ => {
                 // merge into a single partition
@@ -606,7 +706,9 @@ impl QueryExecutor for DatafusionQueryEngine {
                     .map_err(BoxedError::new)
                     .context(QueryExecutionSnafu)?;
                 stream.set_metrics2(plan.clone());
-                stream.set_explain_verbose(ctx.query_ctx().explain_verbose());
+                stream.set_query_load_region_id(query_load_region_id(plan));
+                stream.set_query_stat_counters(query_stat_counters(plan));
+                stream.set_explain_verbose(explain_verbose);
                 let stream = OnDone::new(Box::pin(stream), move || {
                     let exec_cost = exec_timer.stop_and_record();
                     if explain_verbose {
@@ -616,7 +718,11 @@ impl QueryExecutor for DatafusionQueryEngine {
                         );
                     }
                 });
-                Ok(Box::pin(stream))
+                Ok(maybe_attach_region_watermark_metrics(
+                    Box::pin(stream),
+                    plan.clone(),
+                    should_collect_region_watermark,
+                ))
             }
         }
     }
@@ -626,7 +732,7 @@ impl QueryExecutor for DatafusionQueryEngine {
 mod tests {
     use std::fmt;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use api::v1::SemanticType;
     use arrow::array::{ArrayRef, UInt64Array};
@@ -735,12 +841,166 @@ mod tests {
         fn set_logical_region(&mut self, logical_region: bool) {
             self.properties.set_logical_region(logical_region);
         }
+
+        fn set_query_load_region_id(&mut self, region_id: store_api::storage::RegionId) {
+            self.properties.set_query_load_region_id(region_id);
+        }
     }
 
     impl DisplayAs for RecordingScanner {
         fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "RecordingScanner")
         }
+    }
+
+    fn build_query_load_region_scan(
+        query_load_region_id: Option<RegionId>,
+    ) -> Arc<dyn ExecutionPlan> {
+        build_region_scan(query_load_region_id, None)
+    }
+
+    fn build_query_stat_counter_region_scan(
+        counters: RegionQueryStatCounters,
+    ) -> Arc<dyn ExecutionPlan> {
+        build_region_scan(None, Some(counters))
+    }
+
+    fn build_region_scan(
+        query_load_region_id: Option<RegionId>,
+        query_stat_counters: Option<RegionQueryStatCounters>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(datatypes::schema::Schema::new(vec![ColumnSchema::new(
+            "ts",
+            ConcreteDataType::timestamp_millisecond_datatype(),
+            false,
+        )]));
+
+        let mut metadata_builder = RegionMetadataBuilder::new(RegionId::new(1024, 1));
+        metadata_builder
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "ts",
+                    ConcreteDataType::timestamp_millisecond_datatype(),
+                    false,
+                )
+                .with_time_index(true),
+                semantic_type: SemanticType::Timestamp,
+                column_id: 1,
+            })
+            .primary_key(vec![]);
+        let metadata = Arc::new(metadata_builder.build().unwrap());
+        let mut scanner = RecordingScanner::new(
+            schema,
+            metadata,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        if let Some(region_id) = query_load_region_id {
+            scanner.set_query_load_region_id(region_id);
+        }
+        if let Some(counters) = query_stat_counters {
+            scanner.properties.set_query_stat_counters(counters);
+        }
+
+        Arc::new(RegionScanExec::new(Box::new(scanner), ScanRequest::default(), None).unwrap())
+    }
+
+    fn query_stat_counters_for_test() -> RegionQueryStatCounters {
+        RegionQueryStatCounters {
+            query_cpu_time: Arc::new(AtomicU64::new(0)),
+            query_scanned_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn query_load_region_id_ignores_scans_without_region_id() {
+        let query_load_region_id = RegionId::new(1024, 42);
+        let scan_without_region_id = build_query_load_region_scan(None);
+        let scan_with_region_id = build_query_load_region_scan(Some(query_load_region_id));
+        let on: JoinOn = vec![(
+            Arc::new(Column::new("ts", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("ts", 0)) as Arc<dyn PhysicalExpr>,
+        )];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                scan_without_region_id,
+                scan_with_region_id,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNull,
+                false,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            super::query_load_region_id(&plan),
+            Some(query_load_region_id.as_u64())
+        );
+    }
+
+    #[test]
+    fn query_stat_counters_returns_shared_counter_for_multi_scan_plan() {
+        let counters = query_stat_counters_for_test();
+        let left = build_query_stat_counter_region_scan(counters.clone());
+        let right = build_query_stat_counter_region_scan(counters.clone());
+        let on: JoinOn = vec![(
+            Arc::new(Column::new("ts", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("ts", 0)) as Arc<dyn PhysicalExpr>,
+        )];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNull,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let actual = super::query_stat_counters(&plan).unwrap();
+        assert!(Arc::ptr_eq(
+            &actual.query_cpu_time,
+            &counters.query_cpu_time
+        ));
+        assert!(Arc::ptr_eq(
+            &actual.query_scanned_bytes,
+            &counters.query_scanned_bytes
+        ));
+    }
+
+    #[test]
+    fn query_stat_counters_ignores_mixed_counter_plan() {
+        let left = build_query_stat_counter_region_scan(query_stat_counters_for_test());
+        let right = build_query_stat_counter_region_scan(query_stat_counters_for_test());
+        let on: JoinOn = vec![(
+            Arc::new(Column::new("ts", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("ts", 0)) as Arc<dyn PhysicalExpr>,
+        )];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNull,
+                false,
+            )
+            .unwrap(),
+        );
+
+        assert!(super::query_stat_counters(&plan).is_none());
     }
 
     async fn create_test_engine() -> QueryEngineRef {
@@ -784,6 +1044,22 @@ mod tests {
   Projection: sum(numbers.number)
     Aggregate: groupBy=[[]], aggr=[[sum(numbers.number)]]
       TableScan: numbers"#
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_table_is_not_available_to_select() {
+        let engine = create_test_engine().await;
+        let stmt =
+            QueryLanguageParser::parse_sql("select purge_table('numbers')", &QueryContext::arc())
+                .unwrap();
+
+        assert!(
+            engine
+                .planner()
+                .plan(&stmt, QueryContext::arc())
+                .await
+                .is_err()
         );
     }
 
@@ -876,10 +1152,10 @@ mod tests {
             .await
             .unwrap();
 
-        let DescribeResult {
-            schema,
-            logical_plan,
-        } = engine.describe(plan, QueryContext::arc()).await.unwrap();
+        let DescribeResult { logical_plan } =
+            engine.describe(plan, QueryContext::arc()).await.unwrap();
+
+        let schema: Schema = logical_plan.schema().clone().try_into().unwrap();
 
         assert_eq!(
             schema.column_schemas()[0],

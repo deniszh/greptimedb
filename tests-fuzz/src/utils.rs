@@ -18,7 +18,9 @@ pub mod crd;
 /// CSV dump writer utilities for fuzz tests.
 pub mod csv_dump_writer;
 pub mod health;
+pub mod kafka_wal_http;
 pub mod migration;
+pub mod network_chaos;
 pub mod partition;
 pub mod pod_failure;
 pub mod procedure;
@@ -52,6 +54,8 @@ const GT_MYSQL_ADDR: &str = "GT_MYSQL_ADDR";
 
 /// Connects to GreptimeDB via env variables.
 pub async fn init_greptime_connections_via_env() -> Connections {
+    crate::install_rustls_crypto_provider();
+
     let _ = dotenv::dotenv();
     let mysql = if let Ok(addr) = env::var(GT_MYSQL_ADDR) {
         Some(addr)

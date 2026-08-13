@@ -73,8 +73,8 @@ use crate::region::{
     RegionMapRef,
 };
 use crate::request::{
-    BackgroundNotify, DdlRequest, SenderBulkRequest, SenderDdlRequest, SenderWriteRequest,
-    WorkerRequest, WorkerRequestWithTime,
+    BackgroundNotify, BulkInsertRequest, DdlRequest, OptionOutputTx, SenderBulkRequest,
+    SenderDdlRequest, SenderWriteRequest, WorkerRequest, WorkerRequestWithTime,
 };
 use crate::schedule::scheduler::{LocalScheduler, SchedulerRef};
 use crate::sst::file::RegionFileId;
@@ -208,6 +208,7 @@ impl WorkerGroup {
                 .page_cache_size(config.page_cache_size.as_bytes())
                 .selector_result_cache_size(config.selector_result_cache_size.as_bytes())
                 .range_result_cache_size(config.range_result_cache_size.as_bytes())
+                .prefilter_result_cache_size(config.prefilter_result_cache_size.as_bytes())
                 .index_metadata_size(config.index.metadata_cache_size.as_bytes())
                 .index_content_size(config.index.content_cache_size.as_bytes())
                 .index_content_page_size(config.index.content_cache_page_size.as_bytes())
@@ -423,6 +424,7 @@ impl WorkerGroup {
                 .page_cache_size(config.page_cache_size.as_bytes())
                 .selector_result_cache_size(config.selector_result_cache_size.as_bytes())
                 .range_result_cache_size(config.range_result_cache_size.as_bytes())
+                .prefilter_result_cache_size(config.prefilter_result_cache_size.as_bytes())
                 .write_cache(write_cache)
                 .build(),
         );
@@ -619,6 +621,7 @@ impl<S: LogStore> WorkerStarter<S> {
             file_ref_manager: self.file_ref_manager.clone(),
             partition_expr_fetcher: self.partition_expr_fetcher,
             flush_semaphore: self.flush_semaphore,
+            plugins: self.plugins,
         };
         let handle = common_runtime::spawn_global(async move {
             worker_thread.run().await;
@@ -768,6 +771,14 @@ pub(crate) struct StalledRequests {
 }
 
 impl StalledRequests {
+    /// Returns the estimated size of stalled requests for a region.
+    pub(crate) fn estimated_size(&self, region_id: &RegionId) -> usize {
+        self.requests
+            .get(region_id)
+            .map(|(size, _, _)| *size)
+            .unwrap_or_default()
+    }
+
     /// Appends stalled requests.
     pub(crate) fn append(
         &mut self,
@@ -892,6 +903,8 @@ struct RegionWorkerLoop<S> {
     partition_expr_fetcher: PartitionExprFetcherRef,
     /// Semaphore to control flush concurrency.
     flush_semaphore: Arc<Semaphore>,
+    /// Plugins for flush hooks.
+    plugins: Plugins,
 }
 
 impl<S: LogStore> RegionWorkerLoop<S> {
@@ -919,6 +932,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             write_req_buffer.clear();
             ddl_req_buffer.clear();
             general_req_buffer.clear();
+            let mut bulk_insert_req_num = 0;
 
             let max_wait_time = self.time_provider.wait_duration(CHECK_REGION_INTERVAL);
             let sleep = tokio::time::sleep(max_wait_time);
@@ -935,6 +949,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                             match request_with_time.request {
                                 WorkerRequest::Write(sender_req) => write_req_buffer.push(sender_req),
                                 WorkerRequest::Ddl(sender_req) => ddl_req_buffer.push(sender_req),
+                                WorkerRequest::BulkInserts(bulk_insert) => {
+                                    bulk_insert_req_num += 1;
+                                    self.buffer_bulk_insert_request(bulk_insert, &mut bulk_req_buffer)
+                                        .await;
+                                }
                                 req => general_req_buffer.push(req),
                             }
                         },
@@ -983,6 +1002,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                         match request_with_time.request {
                             WorkerRequest::Write(sender_req) => write_req_buffer.push(sender_req),
                             WorkerRequest::Ddl(sender_req) => ddl_req_buffer.push(sender_req),
+                            WorkerRequest::BulkInserts(bulk_insert) => {
+                                bulk_insert_req_num += 1;
+                                self.buffer_bulk_insert_request(bulk_insert, &mut bulk_req_buffer)
+                                    .await
+                            }
                             req => general_req_buffer.push(req),
                         }
                     }
@@ -992,7 +1016,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             }
 
             self.listener.on_recv_requests(
-                write_req_buffer.len() + ddl_req_buffer.len() + general_req_buffer.len(),
+                write_req_buffer.len()
+                    + ddl_req_buffer.len()
+                    + general_req_buffer.len()
+                    + bulk_insert_req_num,
             );
 
             self.handle_requests(
@@ -1011,9 +1038,34 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         info!("Exit region worker thread {}", self.id);
     }
 
+    async fn buffer_bulk_insert_request(
+        &mut self,
+        bulk_insert: BulkInsertRequest,
+        bulk_requests: &mut Vec<SenderBulkRequest>,
+    ) {
+        let BulkInsertRequest {
+            metadata,
+            request,
+            sender,
+        } = bulk_insert;
+
+        if let Some(region_metadata) = metadata {
+            self.handle_bulk_insert_batch(region_metadata, request, bulk_requests, sender)
+                .await;
+        } else {
+            error!("Cannot find region metadata for {}", request.region_id);
+            sender.send(
+                error::RegionNotFoundSnafu {
+                    region_id: request.region_id,
+                }
+                .fail(),
+            );
+        }
+    }
+
     /// Dispatches and processes requests.
     ///
-    /// `buffer` should be empty.
+    /// `general_requests` should not contain categorized write, ddl, or bulk insert requests.
     async fn handle_requests(
         &mut self,
         write_requests: &mut Vec<SenderWriteRequest>,
@@ -1024,10 +1076,31 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         for worker_req in general_requests.drain(..) {
             match worker_req {
                 WorkerRequest::Write(_) | WorkerRequest::Ddl(_) => {
-                    // These requests are categorized into write_requests and ddl_requests.
+                    // These requests are categorized before dispatching general requests.
                     continue;
                 }
+                WorkerRequest::BulkInserts(_) => unreachable!("bulk inserts are buffered"),
                 WorkerRequest::Background { region_id, notify } => {
+                    if matches!(
+                        &notify,
+                        BackgroundNotify::RegionEdit(edit_result)
+                            if edit_result.update_region_state
+                    ) {
+                        // Region state must be Editing when reach here.
+                        // This call only moves write/bulk write request into stall queue. When region edit result
+                        // is processed inside handle_background_notify and region state is switched back to Writable,
+                        // stalled request will be processed before the next region edit is dequeued from
+                        // RegionEditQueue immediately in handle_region_edit_result. It not only ensured pending writes
+                        // are processed in time, but also prevents them from starvation.
+                        // TODO(hl): maybe we need to merge those queues for pending requests like pending_ddl,
+                        // region edits and stalled request, so we can simplify the coordination between these queues.
+                        self.handle_buffered_region_write_requests(
+                            &region_id,
+                            write_requests,
+                            bulk_requests,
+                        )
+                        .await;
+                    }
                     // For background notify, we handle it directly.
                     self.handle_background_notify(region_id, notify).await;
                 }
@@ -1047,29 +1120,6 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 }
                 WorkerRequest::SyncRegion(req) => {
                     self.handle_region_sync(req).await;
-                }
-                WorkerRequest::BulkInserts {
-                    metadata,
-                    request,
-                    sender,
-                } => {
-                    if let Some(region_metadata) = metadata {
-                        self.handle_bulk_insert_batch(
-                            region_metadata,
-                            request,
-                            bulk_requests,
-                            sender,
-                        )
-                        .await;
-                    } else {
-                        error!("Cannot find region metadata for {}", request.region_id);
-                        sender.send(
-                            error::RegionNotFoundSnafu {
-                                region_id: request.region_id,
-                            }
-                            .fail(),
-                        );
-                    }
                 }
                 WorkerRequest::RemapManifests(req) => {
                     self.handle_remap_manifests_request(req);
@@ -1098,16 +1148,22 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             let res = match ddl.request {
                 DdlRequest::Create(req) => self.handle_create_request(ddl.region_id, req).await,
                 DdlRequest::Drop(req) => {
-                    self.handle_drop_request(ddl.region_id, req.partial_drop)
-                        .await
+                    self.handle_drop_request(ddl.region_id, req, ddl.sender)
+                        .await;
+                    continue;
                 }
                 DdlRequest::Open((req, wal_entry_receiver)) => {
                     self.handle_open_request(ddl.region_id, req, wal_entry_receiver, ddl.sender)
                         .await;
                     continue;
                 }
-                DdlRequest::Close(_) => {
-                    self.handle_close_request(ddl.region_id, ddl.sender).await;
+                DdlRequest::OfflineCleanup(req) => {
+                    self.handle_offline_cleanup_request(ddl.region_id, req)
+                        .await
+                }
+                DdlRequest::Close(req) => {
+                    self.handle_close_request(ddl.region_id, req, ddl.sender)
+                        .await;
                     continue;
                 }
                 DdlRequest::Alter(req) => {
@@ -1116,7 +1172,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                     continue;
                 }
                 DdlRequest::Flush(req) => {
-                    self.handle_flush_request(ddl.region_id, req, None, ddl.sender);
+                    self.handle_flush_request(ddl.region_id, req, ddl.sender);
                     continue;
                 }
                 DdlRequest::Compact(req) => {
@@ -1180,6 +1236,9 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     /// Handles region background request
     async fn handle_background_notify(&mut self, region_id: RegionId, notify: BackgroundNotify) {
         match notify {
+            BackgroundNotify::CompactionPickFinished(req) => {
+                self.handle_compaction_pick_finished(region_id, req).await
+            }
             BackgroundNotify::FlushFinished(req) => {
                 self.handle_flush_finished(region_id, req).await
             }
@@ -1193,11 +1252,21 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             BackgroundNotify::IndexBuildFailed(req) => {
                 self.handle_index_build_failed(region_id, req).await
             }
+            BackgroundNotify::IndexBuildRetry(req) => {
+                self.handle_rebuild_index(req, OptionOutputTx::new(None))
+                    .await
+            }
             BackgroundNotify::CompactionFinished(req) => {
                 self.handle_compaction_finished(region_id, req).await
             }
+            BackgroundNotify::CompactionCancelled(req) => {
+                self.handle_compaction_cancelled(region_id, req).await
+            }
             BackgroundNotify::CompactionFailed(req) => self.handle_compaction_failure(req).await,
             BackgroundNotify::Truncate(req) => self.handle_truncate_result(req).await,
+            BackgroundNotify::DiscardUnflushed(req) => {
+                self.handle_discard_unflushed_result(req).await
+            }
             BackgroundNotify::RegionChange(req) => {
                 self.handle_manifest_region_change_result(req).await
             }
@@ -1304,6 +1373,20 @@ impl WorkerListener {
         let _ = region_id;
     }
 
+    pub(crate) async fn on_flush_commit_begin(&self, _region_id: RegionId) {
+        #[cfg(any(test, feature = "test"))]
+        if let Some(listener) = &self.listener {
+            listener.on_flush_commit_begin(_region_id).await;
+        }
+    }
+
+    pub(crate) fn on_flush_cancel_requested(&self, _region_id: RegionId) {
+        #[cfg(any(test, feature = "test"))]
+        if let Some(listener) = &self.listener {
+            listener.on_flush_cancel_requested(_region_id);
+        }
+    }
+
     pub(crate) fn on_later_drop_begin(&self, region_id: RegionId) -> Option<Duration> {
         #[cfg(any(test, feature = "test"))]
         if let Some(listener) = &self.listener {
@@ -1357,6 +1440,34 @@ impl WorkerListener {
         }
     }
 
+    pub(crate) async fn on_compaction_pick_begin(&self, _region_id: RegionId) {
+        #[cfg(any(test, feature = "test"))]
+        if let Some(listener) = &self.listener {
+            listener.on_compaction_pick_begin(_region_id).await;
+        }
+    }
+
+    pub(crate) async fn on_compaction_commit_begin(&self, _region_id: RegionId) {
+        #[cfg(any(test, feature = "test"))]
+        if let Some(listener) = &self.listener {
+            listener.on_compaction_commit_begin(_region_id).await;
+        }
+    }
+
+    pub(crate) async fn on_compaction_result_notified(&self, _region_id: RegionId) {
+        #[cfg(any(test, feature = "test"))]
+        if let Some(listener) = &self.listener {
+            listener.on_compaction_result_notified(_region_id).await;
+        }
+    }
+
+    pub(crate) fn on_compaction_cancel_requested(&self, _region_id: RegionId) {
+        #[cfg(any(test, feature = "test"))]
+        if let Some(listener) = &self.listener {
+            listener.on_compaction_cancel_requested(_region_id);
+        }
+    }
+
     pub(crate) async fn on_notify_region_change_result_begin(&self, _region_id: RegionId) {
         #[cfg(any(test, feature = "test"))]
         if let Some(listener) = &self.listener {
@@ -1391,6 +1502,27 @@ impl WorkerListener {
         #[cfg(any(test, feature = "test"))]
         if let Some(listener) = &self.listener {
             listener.on_index_build_abort(_region_file_id).await;
+        }
+    }
+
+    pub(crate) async fn on_index_build_before_manifest_commit(
+        &self,
+        _region_file_id: RegionFileId,
+    ) {
+        #[cfg(any(test, feature = "test"))]
+        if let Some(listener) = &self.listener {
+            listener
+                .on_index_build_before_manifest_commit(_region_file_id)
+                .await;
+        }
+    }
+
+    pub(crate) async fn on_index_build_manifest_committed(&self, _region_file_id: RegionFileId) {
+        #[cfg(any(test, feature = "test"))]
+        if let Some(listener) = &self.listener {
+            listener
+                .on_index_build_manifest_committed(_region_file_id)
+                .await;
         }
     }
 }

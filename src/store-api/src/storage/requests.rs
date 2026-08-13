@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
 use common_error::ext::BoxedError;
@@ -19,6 +20,8 @@ use common_recordbatch::OrderOption;
 use datafusion_expr::expr::Expr;
 // Re-export vector types from datatypes to avoid duplication
 pub use datatypes::schema::{VectorDistanceMetric, VectorIndexEngineType};
+use datatypes::types::json_type::JsonNativeType;
+use itertools::Itertools;
 use strum::Display;
 
 use crate::storage::{ColumnId, SequenceNumber};
@@ -95,8 +98,8 @@ pub enum TimeSeriesDistribution {
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct ScanRequest {
-    /// Indices of columns to read, `None` to read all columns. This indices is
-    /// based on table schema.
+    /// Optional projection information for the scan. `None` reads all root
+    /// columns.
     pub projection: Option<Vec<usize>>,
     /// Filters pushed down
     pub filters: Vec<Expr>,
@@ -121,6 +124,9 @@ pub struct ScanRequest {
     /// Optional constraint on the minimal sequence number in the SST files.
     /// If set, only the SST files that contain sequences greater than this value will be scanned.
     pub sst_min_sequence: Option<SequenceNumber>,
+    /// Whether to skip all SST files.
+    /// This is stronger than `sst_min_sequence` and also skips SST files without sequence metadata.
+    pub skip_sst_files: bool,
     /// Whether to bind the effective snapshot upper bound when opening the scan.
     pub snapshot_on_scan: bool,
     /// Optional hint for the distribution of time-series data.
@@ -128,6 +134,10 @@ pub struct ScanRequest {
     /// Optional hint for KNN vector search. When set, the scan should use
     /// vector index to find the k nearest neighbors.
     pub vector_search: Option<VectorSearchRequest>,
+    /// Optional hint from query-driven JSON type concretization.
+    pub json_type_hint: HashMap<String, JsonNativeType>,
+    /// Whether Mito should keep string primary-key columns dictionary encoded in its output.
+    pub preserve_pk_dictionary_encoding: bool,
 }
 
 impl Display for ScanRequest {
@@ -197,12 +207,27 @@ impl Display for ScanRequest {
                 sst_min_sequence
             )?;
         }
+        if self.skip_sst_files {
+            write!(
+                f,
+                "{}skip_sst_files: {}",
+                delimiter.as_str(),
+                self.skip_sst_files
+            )?;
+        }
         if self.snapshot_on_scan {
             write!(
                 f,
                 "{}snapshot_on_scan: {}",
                 delimiter.as_str(),
                 self.snapshot_on_scan
+            )?;
+        }
+        if self.preserve_pk_dictionary_encoding {
+            write!(
+                f,
+                "{}preserve_pk_dictionary_encoding: true",
+                delimiter.as_str()
             )?;
         }
         if let Some(distribution) = &self.distribution {
@@ -216,6 +241,17 @@ impl Display for ScanRequest {
                 vector_search.column_id,
                 vector_search.k,
                 vector_search.metric
+            )?;
+        }
+        if !self.json_type_hint.is_empty() {
+            write!(
+                f,
+                "{}json_type_hint: {}",
+                delimiter.as_str(),
+                self.json_type_hint
+                    .iter()
+                    .map(|(column, json_type)| format!("({column}: {json_type})"))
+                    .join(", ")
             )?;
         }
         write!(f, " }}")
@@ -235,8 +271,9 @@ mod tests {
         };
         assert_eq!(request.to_string(), "ScanRequest {  }");
 
+        let projection = Some(vec![1, 2]);
         let request = ScanRequest {
-            projection: Some(vec![1, 2]),
+            projection,
             filters: vec![
                 binary_expr(col("i"), Operator::Gt, lit(1)),
                 binary_expr(col("s"), Operator::Eq, lit("x")),
@@ -262,8 +299,9 @@ mod tests {
             r#"ScanRequest { filters: [i > Int32(1), s = Utf8("x")], limit: 10 }"#
         );
 
+        let projection = Some(vec![1, 2]);
         let request = ScanRequest {
-            projection: Some(vec![1, 2]),
+            projection,
             limit: Some(10),
             ..Default::default()
         };
@@ -280,5 +318,11 @@ mod tests {
             request.to_string(),
             "ScanRequest { snapshot_on_scan: true }"
         );
+
+        let request = ScanRequest {
+            skip_sst_files: true,
+            ..Default::default()
+        };
+        assert_eq!(request.to_string(), "ScanRequest { skip_sst_files: true }");
     }
 }

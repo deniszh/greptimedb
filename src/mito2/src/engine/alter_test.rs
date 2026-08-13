@@ -17,20 +17,26 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use api::v1::bulk_wal_entry::Body;
 use api::v1::helper::{row, tag_column_schema};
 use api::v1::value::ValueData;
-use api::v1::{ColumnDataType, Row, Rows, SemanticType};
+use api::v1::{ArrowIpc, BulkWalEntry, ColumnDataType, Row, Rows, SemanticType, Value, WalEntry};
 use common_error::ext::ErrorExt;
 use common_meta::ddl::utils::{parse_column_metadatas, parse_manifest_infos_from_extensions};
-use common_recordbatch::RecordBatches;
+use common_recordbatch::{DfRecordBatch, RecordBatches};
+use common_test_util::flight::encode_to_flight_data;
+use datafusion_expr::col;
+use datatypes::arrow::array::{ArrayRef, Float64Array, StringArray, TimestampMillisecondArray};
+use datatypes::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{ColumnSchema, FulltextAnalyzer, FulltextBackend, FulltextOptions};
+use store_api::logstore::provider::Provider;
 use store_api::metadata::ColumnMetadata;
 use store_api::metric_engine_consts::TABLE_COLUMN_METADATA_EXTENSION_KEY;
 use store_api::region_engine::{RegionEngine, RegionManifestInfo, RegionRole};
 use store_api::region_request::{
-    AddColumn, AddColumnLocation, AlterKind, PathType, RegionAlterRequest, RegionOpenRequest,
-    RegionRequest, SetIndexOption, SetRegionOption,
+    AddColumn, AddColumnLocation, AlterKind, PathType, RegionAlterRequest,
+    RegionBulkInsertsRequest, RegionOpenRequest, RegionRequest, SetIndexOption, SetRegionOption,
 };
 use store_api::storage::{ColumnId, RegionId, ScanRequest};
 
@@ -41,9 +47,10 @@ use crate::error;
 use crate::sst::FormatType;
 use crate::test_util::batch_util::sort_batches_and_print;
 use crate::test_util::{
-    CreateRequestBuilder, TestEnv, build_rows, build_rows_for_key, flush_region, put_rows,
-    rows_schema,
+    CreateRequestBuilder, LogStoreImpl, TestEnv, build_rows, build_rows_for_key,
+    column_metadata_to_column_schema, flush_region, put_rows, reopen_region, rows_schema,
 };
+use crate::wal::Wal;
 
 async fn scan_check_after_alter(engine: &MitoEngine, region_id: RegionId, expected: &str) {
     let request = ScanRequest::default();
@@ -100,6 +107,54 @@ fn alter_column_fulltext_options() -> RegionAlterRequest {
             }],
         },
     }
+}
+
+fn add_nullable_field1() -> RegionAlterRequest {
+    RegionAlterRequest {
+        kind: AlterKind::AddColumns {
+            columns: vec![AddColumn {
+                column_metadata: ColumnMetadata {
+                    column_schema: ColumnSchema::new(
+                        "field_1",
+                        ConcreteDataType::float64_datatype(),
+                        true,
+                    ),
+                    semantic_type: SemanticType::Field,
+                    column_id: 3,
+                },
+                location: None,
+            }],
+        },
+    }
+}
+
+fn build_row_with_added_field(
+    metadata: &[ColumnMetadata],
+    tag_0: &str,
+    field_0: f64,
+    field_1: Option<f64>,
+    ts_millis: i64,
+) -> Row {
+    let values = metadata
+        .iter()
+        .map(|column| match column.column_schema.name.as_str() {
+            "tag_0" => Value {
+                value_data: Some(ValueData::StringValue(tag_0.to_string())),
+            },
+            "field_0" => Value {
+                value_data: Some(ValueData::F64Value(field_0)),
+            },
+            "field_1" => Value {
+                value_data: field_1.map(ValueData::F64Value),
+            },
+            "ts" => Value {
+                value_data: Some(ValueData::TimestampMillisecondValue(ts_millis)),
+            },
+            name => panic!("unexpected column {name}"),
+        })
+        .collect();
+
+    Row { values }
 }
 
 fn check_region_version(
@@ -228,12 +283,112 @@ async fn test_alter_region_with_format(flat_format: bool) {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
         .unwrap();
     scan_check_after_alter(&engine, region_id, expected).await;
     check_region_version(&engine, region_id, 1, 3, 1, 3);
+}
+
+#[tokio::test]
+async fn test_filter_is_null_after_alter_add_field() {
+    test_filter_is_null_after_alter_add_field_with_format(false).await;
+    test_filter_is_null_after_alter_add_field_with_format(true).await;
+}
+
+async fn test_filter_is_null_after_alter_add_field_with_format(flat_format: bool) {
+    common_telemetry::init_default_ut_logging();
+
+    let mut env = TestEnv::new().await;
+    let engine = env
+        .create_engine(MitoConfig {
+            default_flat_format: flat_format,
+            ..Default::default()
+        })
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new().build();
+
+    env.get_schema_metadata_manager()
+        .register_region_table_info(
+            region_id.table_id(),
+            "test_table",
+            "test_catalog",
+            "test_schema",
+            None,
+            env.get_kv_backend(),
+        )
+        .await;
+
+    let column_schemas = rows_schema(&request);
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    put_rows(
+        &engine,
+        region_id,
+        Rows {
+            schema: column_schemas,
+            rows: vec![build_rows_for_key("a", 0, 1, 1).into_iter().next().unwrap()],
+        },
+    )
+    .await;
+    flush_region(&engine, region_id, None).await;
+
+    engine
+        .handle_request(region_id, RegionRequest::Alter(add_nullable_field1()))
+        .await
+        .unwrap();
+
+    let region = engine.get_region(region_id).unwrap();
+    let metadata = region.metadata().column_metadatas.clone();
+    let schema = metadata
+        .iter()
+        .map(column_metadata_to_column_schema)
+        .collect();
+
+    put_rows(
+        &engine,
+        region_id,
+        Rows {
+            schema,
+            rows: vec![build_row_with_added_field(
+                &metadata,
+                "a",
+                1.0,
+                Some(10.0),
+                0,
+            )],
+        },
+    )
+    .await;
+    flush_region(&engine, region_id, None).await;
+
+    // We skip field filters under merge mode because the flushed field values may be stale before
+    // the row is merged with newer field data.
+    let stream = engine
+        .scan_to_stream(
+            region_id,
+            ScanRequest {
+                filters: vec![col("field_1").is_null()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let batches = RecordBatches::try_collect(stream).await.unwrap();
+    let expected = "\
++-------+---------+---------------------+---------+
+| tag_0 | field_0 | ts                  | field_1 |
++-------+---------+---------------------+---------+
+| a     | 1.0     | 1970-01-01T00:00:00 | 10.0    |
++-------+---------+---------------------+---------+";
+    assert_eq!(expected, batches.pretty_print().unwrap());
 }
 
 /// Build rows with schema (string, f64, ts_millis, string).
@@ -333,6 +488,7 @@ async fn test_put_after_alter_with_format(flat_format: bool) {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -696,6 +852,7 @@ async fn test_alter_column_fulltext_options_with_format(flat_format: bool) {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -831,6 +988,7 @@ async fn test_alter_column_set_inverted_index_with_format(flat_format: bool) {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -900,6 +1058,72 @@ async fn test_alter_region_ttl_options_with_format(flat_format: bool) {
     };
     // Verify the ttl.
     check_ttl(&engine, &Duration::from_secs(500));
+}
+
+#[tokio::test]
+async fn test_mixed_region_options_are_published_after_flush() {
+    let mut env = TestEnv::new().await;
+    let listener = Arc::new(AlterFlushListener::default());
+    let engine = env
+        .create_engine_with(MitoConfig::default(), None, Some(listener.clone()), None)
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new().build();
+    env.get_schema_metadata_manager()
+        .register_region_table_info(
+            region_id.table_id(),
+            "test_table",
+            "test_catalog",
+            "test_schema",
+            None,
+            env.get_kv_backend(),
+        )
+        .await;
+    let column_schemas = rows_schema(&request);
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+    put_rows(
+        &engine,
+        region_id,
+        Rows {
+            schema: column_schemas,
+            rows: build_rows(0, 3),
+        },
+    )
+    .await;
+
+    let engine_cloned = engine.clone();
+    let alter_job = tokio::spawn(async move {
+        engine_cloned
+            .handle_request(
+                region_id,
+                RegionRequest::Alter(RegionAlterRequest {
+                    kind: AlterKind::SetRegionOptions {
+                        options: vec![
+                            SetRegionOption::Ttl(Some(Duration::from_secs(500).into())),
+                            SetRegionOption::MaxRowGroupRowCount(Some(1024)),
+                        ],
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+    });
+
+    listener.wait_flush_begin().await;
+    let version = engine.get_region(region_id).unwrap().version();
+    assert_eq!(None, version.options.ttl);
+    assert_eq!(None, version.options.max_row_group_row_count);
+
+    listener.wake_flush();
+    alter_job.await.unwrap();
+
+    let version = engine.get_region(region_id).unwrap().version();
+    assert_eq!(Some(Duration::from_secs(500).into()), version.options.ttl);
+    assert_eq!(Some(1024), version.options.max_row_group_row_count);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1100,6 +1324,7 @@ async fn test_alter_region_sst_format_with_flush() {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -1218,6 +1443,7 @@ async fn test_alter_region_sst_format_without_flush() {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -1344,6 +1570,7 @@ async fn test_alter_region_sst_format_flat_to_pk_with_flush() {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -1462,6 +1689,7 @@ async fn test_alter_region_sst_format_flat_to_pk_without_flush() {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -1577,6 +1805,7 @@ async fn test_alter_region_append_mode_with_flush() {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -1695,6 +1924,7 @@ async fn test_alter_region_append_mode_without_flush() {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -1753,4 +1983,200 @@ async fn test_alter_region_append_mode_invalid() {
 
     // append_mode should still be true
     check_append_mode(&engine, true);
+}
+
+/// Builds a batch against the schema before [add_nullable_field1]
+/// (schema version 0): `(tag_0, field_0, ts)`.
+fn build_schema_v0_batch() -> DfRecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("tag_0", DataType::Utf8, true),
+        Field::new("field_0", DataType::Float64, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    let tag = Arc::new(StringArray::from_iter_values(
+        (0..3).map(|v| format!("a{v}")),
+    )) as ArrayRef;
+    let field = Arc::new(Float64Array::from_iter_values((0..3).map(|v| v as f64))) as ArrayRef;
+    let ts = Arc::new(TimestampMillisecondArray::from_iter_values(
+        (0..3).map(|v| v as i64 * 1000),
+    )) as ArrayRef;
+    DfRecordBatch::try_new(schema, vec![tag, field, ts]).unwrap()
+}
+
+fn encode_arrow_ipc(batch: &DfRecordBatch) -> ArrowIpc {
+    let (schema, record_batch) = encode_to_flight_data(batch.clone());
+    ArrowIpc {
+        schema: schema.data_header,
+        data_header: record_batch.data_header,
+        payload: record_batch.data_body,
+    }
+}
+
+/// Builds a bulk insert request whose batch was built against the schema
+/// before [add_nullable_field1] (schema version 0): `(tag_0, field_0, ts)`.
+fn build_schema_v0_bulk_request(region_id: RegionId) -> RegionBulkInsertsRequest {
+    let payload = build_schema_v0_batch();
+    let raw_data = encode_arrow_ipc(&payload);
+
+    RegionBulkInsertsRequest {
+        region_id,
+        payload,
+        raw_data,
+        partition_expr_version: None,
+        // The writer only knows schema version 0 while the region is already
+        // at version 1, so the worker has to fill the missing columns.
+        aligned_schema_version: Some(0),
+    }
+}
+
+async fn scan_all_sorted(engine: &MitoEngine, region_id: RegionId) -> String {
+    let stream = engine
+        .scan_to_stream(region_id, ScanRequest::default())
+        .await
+        .unwrap();
+    let batches = RecordBatches::try_collect(stream).await.unwrap();
+    sort_batches_and_print(&batches, &["tag_0", "ts"])
+}
+
+const SCHEMA_V0_BULK_ROWS: &str = "\
++-------+---------+---------------------+---------+
+| tag_0 | field_0 | ts                  | field_1 |
++-------+---------+---------------------+---------+
+| a0    | 0.0     | 1970-01-01T00:00:00 |         |
+| a1    | 1.0     | 1970-01-01T00:00:01 |         |
+| a2    | 2.0     | 1970-01-01T00:00:02 |         |
++-------+---------+---------------------+---------+";
+
+#[tokio::test]
+async fn test_bulk_insert_stale_schema_wal_replay() {
+    test_bulk_insert_stale_schema_wal_replay_with_format(false).await;
+    test_bulk_insert_stale_schema_wal_replay_with_format(true).await;
+}
+
+async fn test_bulk_insert_stale_schema_wal_replay_with_format(flat_format: bool) {
+    common_telemetry::init_default_ut_logging();
+
+    let mut env = TestEnv::new().await;
+    let engine = env
+        .create_engine(MitoConfig {
+            default_flat_format: flat_format,
+            ..Default::default()
+        })
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new().build();
+    let table_dir = request.table_dir.clone();
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    // Bumps the region schema version to 1.
+    engine
+        .handle_request(region_id, RegionRequest::Alter(add_nullable_field1()))
+        .await
+        .unwrap();
+
+    // Bulk insert whose batch misses `field_1`. The worker fills the missing
+    // column before writing to the memtable and the WAL.
+    let response = engine
+        .handle_request(
+            region_id,
+            RegionRequest::BulkInserts(build_schema_v0_bulk_request(region_id)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(3, response.affected_rows);
+
+    assert_eq!(
+        SCHEMA_V0_BULK_ROWS,
+        scan_all_sorted(&engine, region_id).await,
+        "flat_format: {flat_format}"
+    );
+
+    // Reopens the region to replay the WAL. The rows must survive the replay.
+    reopen_region(&engine, region_id, table_dir, true, HashMap::new()).await;
+
+    assert_eq!(
+        SCHEMA_V0_BULK_ROWS,
+        scan_all_sorted(&engine, region_id).await,
+        "flat_format: {flat_format}"
+    );
+}
+
+/// Replays a bulk WAL entry that misses columns added by an alter. This
+/// simulates entries written by old versions that keep the stale raw data
+/// when filling missing columns.
+#[tokio::test]
+async fn test_bulk_insert_stale_wal_entry_replay() {
+    test_bulk_insert_stale_wal_entry_replay_with_format(false).await;
+    test_bulk_insert_stale_wal_entry_replay_with_format(true).await;
+}
+
+async fn test_bulk_insert_stale_wal_entry_replay_with_format(flat_format: bool) {
+    common_telemetry::init_default_ut_logging();
+
+    let mut env = TestEnv::new().await;
+    let engine = env
+        .create_engine(MitoConfig {
+            default_flat_format: flat_format,
+            ..Default::default()
+        })
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new().build();
+    let table_dir = request.table_dir.clone();
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    // Bumps the region schema version to 1.
+    engine
+        .handle_request(region_id, RegionRequest::Alter(add_nullable_field1()))
+        .await
+        .unwrap();
+
+    // Writes a bulk entry whose batch misses `field_1` to the WAL directly.
+    let batch = build_schema_v0_batch();
+    let entry = WalEntry {
+        mutations: vec![],
+        bulk_entries: vec![BulkWalEntry {
+            sequence: 1,
+            max_ts: 2000,
+            min_ts: 0,
+            timestamp_index: 2,
+            body: Some(Body::ArrowIpc(encode_arrow_ipc(&batch))),
+        }],
+    };
+    let LogStoreImpl::RaftEngine(log_store) = env.get_log_store().unwrap() else {
+        unreachable!()
+    };
+    let wal = Wal::new(log_store);
+    let mut writer = wal.writer();
+    writer
+        .add_entry(
+            region_id,
+            1,
+            &entry,
+            &Provider::raft_engine_provider(region_id.as_u64()),
+        )
+        .unwrap();
+    writer.write_to_wal().await.unwrap();
+
+    // Reopens the region to replay the WAL. The replay must fill the missing
+    // column instead of losing the rows.
+    reopen_region(&engine, region_id, table_dir, true, HashMap::new()).await;
+
+    assert_eq!(
+        SCHEMA_V0_BULK_ROWS,
+        scan_all_sorted(&engine, region_id).await,
+        "flat_format: {flat_format}"
+    );
 }

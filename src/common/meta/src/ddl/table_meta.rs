@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use common_telemetry::{debug, info};
@@ -25,8 +24,9 @@ use crate::ddl::allocator::resource_id::ResourceIdAllocatorRef;
 use crate::ddl::allocator::wal_options::WalOptionsAllocatorRef;
 use crate::error::{Result, UnsupportedSnafu};
 use crate::key::table_route::PhysicalTableRouteValue;
-use crate::peer::{NoopPeerAllocator, PeerAllocatorRef};
+use crate::peer::{NoopPeerAllocator, PeerAllocContext, PeerAllocatorRef};
 use crate::rpc::ddl::CreateTableTask;
+use crate::wal_provider::RegionWalOptions;
 
 pub type TableMetadataAllocatorRef = Arc<TableMetadataAllocator>;
 
@@ -98,7 +98,7 @@ impl TableMetadataAllocator {
         &self,
         region_numbers: &[RegionNumber],
         skip_wal: bool,
-    ) -> Result<HashMap<RegionNumber, String>> {
+    ) -> Result<RegionWalOptions> {
         self.wal_options_allocator
             .allocate(region_numbers, skip_wal)
             .await
@@ -108,6 +108,7 @@ impl TableMetadataAllocator {
         &self,
         table_id: TableId,
         partition_exprs: &[&str],
+        alloc_context: &PeerAllocContext,
     ) -> Result<PhysicalTableRouteValue> {
         let region_number_and_partition_exprs = partition_exprs
             .iter()
@@ -116,7 +117,7 @@ impl TableMetadataAllocator {
             .collect::<Vec<_>>();
         let region_routes = self
             .region_routes_allocator
-            .allocate(table_id, &region_number_and_partition_exprs)
+            .allocate(table_id, &region_number_and_partition_exprs, alloc_context)
             .await?;
 
         Ok(PhysicalTableRouteValue::new(region_routes))
@@ -133,13 +134,24 @@ impl TableMetadataAllocator {
     }
 
     pub async fn create(&self, task: &CreateTableTask) -> Result<TableMetadata> {
+        self.create_with_context(task, &PeerAllocContext::default())
+            .await
+    }
+
+    pub async fn create_with_context(
+        &self,
+        task: &CreateTableTask,
+        alloc_context: &PeerAllocContext,
+    ) -> Result<TableMetadata> {
         let table_id = self.allocate_table_id(&task.create_table.table_id).await?;
         let partition_exprs = task
             .partitions
             .iter()
             .map(|p| p.expression.as_str())
             .collect::<Vec<_>>();
-        let table_route = self.create_table_route(table_id, &partition_exprs).await?;
+        let table_route = self
+            .create_table_route(table_id, &partition_exprs, alloc_context)
+            .await?;
         let region_numbers = table_route
             .region_routes
             .iter()

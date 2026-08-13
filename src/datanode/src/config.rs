@@ -14,6 +14,8 @@
 
 //! Datanode configurations
 
+use std::time::Duration;
+
 use common_base::readable_size::ReadableSize;
 use common_config::{Configurable, DEFAULT_DATA_HOME};
 use common_options::memory::MemoryOptions;
@@ -37,6 +39,11 @@ use servers::http::HttpOptions;
 pub struct StorageConfig {
     /// The working directory of database
     pub data_home: String,
+    /// Root directory for standalone SQL access to local files.
+    ///
+    /// Defaults to `<data_home>/copy` when `data_home` is a local path.
+    /// Distributed deployments always disable SQL access to local files.
+    pub copy_root: Option<String>,
     #[serde(flatten)]
     pub store: ObjectStoreConfig,
     /// Object storage providers
@@ -54,6 +61,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             data_home: DEFAULT_DATA_HOME.to_string(),
+            copy_root: None,
             store: ObjectStoreConfig::default(),
             providers: vec![],
         }
@@ -75,6 +83,10 @@ pub struct DatanodeOptions {
     pub wal: DatanodeWalConfig,
     pub storage: StorageConfig,
     pub max_concurrent_queries: usize,
+    /// Timeout to acquire a permit from the concurrent query limiter when
+    /// `max_concurrent_queries` is reached. Only effective when the limiter is enabled.
+    #[serde(with = "humantime_serde")]
+    pub concurrent_query_limiter_timeout: Duration,
     /// Options for different store engines.
     pub region_engine: Vec<RegionEngineConfig>,
     pub logging: LoggingOptions,
@@ -83,10 +95,14 @@ pub struct DatanodeOptions {
     pub query: QueryOptions,
     pub memory: MemoryOptions,
 
+    /// Environment variable keys to read and report in heartbeat messages.
+    /// The values of these env vars at startup will be sent to metasrv.
+    pub heartbeat_env_vars: Vec<String>,
+
     /// Deprecated options, please use the new options instead.
-    #[deprecated(note = "Please use `grpc.addr` instead.")]
+    #[deprecated(note = "Please use `grpc.bind_addr` instead.")]
     pub rpc_addr: Option<String>,
-    #[deprecated(note = "Please use `grpc.hostname` instead.")]
+    #[deprecated(note = "Please use `grpc.server_addr` instead.")]
     pub rpc_hostname: Option<String>,
     #[deprecated(note = "Please use `grpc.runtime_size` instead.")]
     pub rpc_runtime_size: Option<usize>,
@@ -127,6 +143,7 @@ impl Default for DatanodeOptions {
             wal: DatanodeWalConfig::default(),
             storage: StorageConfig::default(),
             max_concurrent_queries: 0,
+            concurrent_query_limiter_timeout: Duration::from_millis(100),
             region_engine: vec![
                 RegionEngineConfig::Mito(MitoConfig::default()),
                 RegionEngineConfig::File(FileEngineConfig::default()),
@@ -136,6 +153,7 @@ impl Default for DatanodeOptions {
             tracing: TracingOptions::default(),
             query: QueryOptions::default(),
             memory: MemoryOptions::default(),
+            heartbeat_env_vars: vec![],
 
             // Deprecated options
             rpc_addr: None,
@@ -149,7 +167,11 @@ impl Default for DatanodeOptions {
 
 impl Configurable for DatanodeOptions {
     fn env_list_keys() -> Option<&'static [&'static str]> {
-        Some(&["meta_client.metasrv_addrs", "wal.broker_endpoints"])
+        Some(&[
+            "heartbeat_env_vars",
+            "meta_client.metasrv_addrs",
+            "wal.broker_endpoints",
+        ])
     }
 }
 

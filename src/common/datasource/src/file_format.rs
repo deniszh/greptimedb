@@ -42,7 +42,6 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
-use object_store_opendal::OpendalStore;
 use snafu::ResultExt;
 use tokio::io::AsyncWriteExt;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
@@ -61,7 +60,10 @@ use crate::share_buffer::SharedBuffer;
 pub const FORMAT_COMPRESSION_TYPE: &str = "compression_type";
 pub const FORMAT_DELIMITER: &str = "delimiter";
 pub const FORMAT_SCHEMA_INFER_MAX_RECORD: &str = "schema_infer_max_record";
+pub const FORMAT_HEADERS: &str = "headers";
 pub const FORMAT_HAS_HEADER: &str = "has_header";
+pub const FORMAT_SKIP_BAD_RECORDS: &str = "skip_bad_records";
+pub const FORMAT_STRICT_HEADERS: &str = "strict_headers";
 pub const FORMAT_TYPE: &str = "format";
 pub const FILE_PATTERN: &str = "pattern";
 pub const TIMESTAMP_FORMAT: &str = "timestamp_format";
@@ -317,7 +319,7 @@ pub async fn file_to_stream(
             .with_file_compression_type(df_compression)
             .build();
 
-    let store = Arc::new(OpendalStore::new(store.clone()));
+    let store = Arc::new(object_store_opendal::OpendalStore::new(store.clone()));
     let file_opener = config.file_source().create_file_opener(store, &config, 0)?;
     let stream = FileStream::new(&config, 0, file_opener, &ExecutionPlanMetricsSet::new())?;
 

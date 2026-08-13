@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::assert_matches;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use api::region::RegionResponse;
@@ -26,14 +26,16 @@ use common_procedure::{Context as ProcedureContext, Procedure, ProcedureId, Stat
 use common_procedure_test::{
     MockContextProvider, execute_procedure_until, execute_procedure_until_done,
 };
+use common_wal::options::{KafkaWalOptions, WalOptions};
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::ColumnSchema;
 use store_api::metadata::ColumnMetadata;
 use store_api::metric_engine_consts::TABLE_COLUMN_METADATA_EXTENSION_KEY;
+use store_api::region_engine::RegionRole;
 use store_api::storage::RegionId;
 use tokio::sync::mpsc;
 
-use crate::ddl::create_table::{CreateTableProcedure, CreateTableState};
+use crate::ddl::create_table::{CreateTableData, CreateTableProcedure, CreateTableState};
 use crate::ddl::test_util::columns::TestColumnDefBuilder;
 use crate::ddl::test_util::create_table::{
     TestCreateTableExprBuilder, build_raw_table_info_from_expr,
@@ -42,7 +44,7 @@ use crate::ddl::test_util::datanode_handler::{
     DatanodeWatcher, NaiveDatanodeHandler, RetryErrorDatanodeHandler,
     UnexpectedErrorDatanodeHandler,
 };
-use crate::ddl::test_util::{assert_column_name, get_raw_table_info};
+use crate::ddl::test_util::{assert_column_name, get_raw_table_info, put_datanode_address};
 use crate::error::{Error, Result};
 use crate::key::table_route::TableRouteValue;
 use crate::kv_backend::memory::MemoryKvBackend;
@@ -104,6 +106,31 @@ fn assert_create_request(
         unreachable!();
     };
     assert_eq!(req.region_id, expected_region_id);
+}
+
+#[test]
+fn test_deserialize_legacy_create_table_data_region_wal_options() {
+    let mut json = serde_json::to_value(CreateTableData::new(
+        test_create_table_task("foo"),
+        Default::default(),
+    ))
+    .unwrap();
+    json["region_wal_options"] = serde_json::json!({
+        "0": serde_json::to_string(&WalOptions::Kafka(KafkaWalOptions::new(
+            "topic_a".to_string(),
+        )))
+        .unwrap(),
+    });
+
+    let data: CreateTableData = serde_json::from_value(json).unwrap();
+
+    assert_eq!(
+        data.region_wal_options.unwrap(),
+        HashMap::from([(
+            0,
+            WalOptions::Kafka(KafkaWalOptions::new("topic_a".to_string())),
+        )])
+    );
 }
 
 pub(crate) fn test_create_table_task(name: &str) -> CreateTableTask {
@@ -222,6 +249,7 @@ async fn test_on_datanode_create_regions_should_retry() {
     let ctx = ProcedureContext {
         procedure_id: ProcedureId::random(),
         provider: Arc::new(MockContextProvider::default()),
+        event_context: None,
     };
     let error = procedure.execute(&ctx).await.unwrap_err();
     assert!(error.is_retry_later());
@@ -239,9 +267,31 @@ async fn test_on_datanode_create_regions_should_not_retry() {
     let ctx = ProcedureContext {
         procedure_id: ProcedureId::random(),
         provider: Arc::new(MockContextProvider::default()),
+        event_context: None,
     };
     let error = procedure.execute(&ctx).await.unwrap_err();
     assert!(!error.is_retry_later());
+}
+
+#[tokio::test]
+async fn test_on_datanode_create_regions_remaps_addresses_when_retrying() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let datanode_handler = DatanodeWatcher::new(tx).with_handler(create_request_handler);
+    let node_manager = Arc::new(MockDatanodeManager::new(datanode_handler));
+    let ddl_context = new_ddl_context(node_manager);
+    let task = test_create_table_task("foo");
+    let mut procedure = CreateTableProcedure::new(task, ddl_context.clone()).unwrap();
+    procedure.on_prepare().await.unwrap();
+
+    let table_route = procedure.data.table_route.as_mut().unwrap();
+    let leader = table_route.region_routes[0].leader_peer.as_mut().unwrap();
+    leader.addr = "old-addr".to_string();
+    put_datanode_address(&ddl_context, leader.id, "new-addr").await;
+
+    procedure.on_datanode_create_regions(true).await.unwrap();
+
+    let (peer, _) = rx.try_recv().unwrap();
+    assert_eq!(peer.addr, "new-addr");
 }
 
 #[tokio::test]
@@ -256,6 +306,7 @@ async fn test_on_create_metadata_error() {
     let ctx = ProcedureContext {
         procedure_id: ProcedureId::random(),
         provider: Arc::new(MockContextProvider::default()),
+        event_context: None,
     };
     procedure.execute(&ctx).await.unwrap();
     let mut task = task;
@@ -289,6 +340,7 @@ async fn test_on_create_metadata() {
     let ctx = ProcedureContext {
         procedure_id: ProcedureId::random(),
         provider: Arc::new(MockContextProvider::default()),
+        event_context: None,
     };
     procedure.execute(&ctx).await.unwrap();
     // Triggers procedure to create table metadata
@@ -330,6 +382,10 @@ async fn test_memory_region_keeper_guard_dropped_on_procedure_done() {
             .memory_region_keeper
             .contains(datanode_id, region_id)
     );
+    let roles = ddl_context
+        .memory_region_keeper
+        .extract_operating_region_roles(datanode_id, &HashSet::from([region_id]));
+    assert_eq!(roles.get(&region_id), Some(&RegionRole::Leader));
 
     execute_procedure_until_done(&mut procedure).await;
 

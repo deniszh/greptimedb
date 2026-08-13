@@ -200,6 +200,15 @@ impl TableContext {
                 partitions.remove_bound(removed_idx)?;
                 partition_def.exprs = partitions.generate()?;
             }
+            RepartitionExpr::AlterPartitions(partition) => {
+                ensure!(
+                    self.partition.is_none(),
+                    error::UnexpectedSnafu {
+                        violated: format!("Table {} already has partition", self.name),
+                    }
+                );
+                self.partition = Some(partition.partition);
+            }
         }
 
         Ok(self)
@@ -376,6 +385,7 @@ mod tests {
                 table_name: expr.table_name.clone(),
                 target: partitions.last().unwrap().clone(),
                 into: vec![expected_exprs[2].clone(), expected_exprs[3].clone()],
+                wait: true,
             }))
             .unwrap();
         let partition_def = table_ctx.partition.as_ref().unwrap();
@@ -417,6 +427,7 @@ mod tests {
             .repartition(RepartitionExpr::Merge(MergePartitionExpr {
                 table_name: expr.table_name.clone(),
                 targets: vec![partitions[1].clone(), partitions[2].clone()],
+                wait: true,
             }))
             .unwrap();
         let partition_def = table_ctx.partition.as_ref().unwrap();

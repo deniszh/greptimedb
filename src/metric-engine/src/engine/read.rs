@@ -25,7 +25,8 @@ use store_api::storage::{RegionId, ScanRequest, SequenceNumber};
 
 use crate::engine::MetricEngineInner;
 use crate::error::{
-    InvalidMetadataSnafu, LogicalRegionNotFoundSnafu, MitoReadOperationSnafu, Result,
+    InvalidMetadataSnafu, InvalidRequestSnafu, LogicalRegionNotFoundSnafu, MitoReadOperationSnafu,
+    Result,
 };
 use crate::metrics::MITO_OPERATION_ELAPSED;
 use crate::utils;
@@ -85,6 +86,7 @@ impl MetricEngineInner {
             .await
             .context(MitoReadOperationSnafu)?;
         scanner.set_logical_region(true);
+        scanner.set_query_load_region_id(data_region_id);
 
         Ok(scanner)
     }
@@ -143,17 +145,21 @@ impl MetricEngineInner {
         mut request: ScanRequest,
     ) -> Result<ScanRequest> {
         // transform projection
-        let physical_projection = if let Some(projection) = &request.projection {
-            self.transform_projection(physical_region_id, logical_region_id, projection)
-                .await?
-        } else {
-            self.default_projection(physical_region_id, logical_region_id)
-                .await?
+        let physical_projection = match request.projection.as_ref() {
+            Some(projection) => {
+                self.transform_projection(physical_region_id, logical_region_id, projection)
+                    .await?
+            }
+            None => {
+                self.default_projection(physical_region_id, logical_region_id)
+                    .await?
+            }
         };
 
+        // Rewrite the projection from logical-region schema indices to
+        // physical-region schema indices.
         request.projection = Some(physical_projection);
 
-        // add table filter
         request
             .filters
             .push(self.table_id_filter(logical_region_id));
@@ -182,8 +188,16 @@ impl MetricEngineInner {
             .await?;
         let projected_logical_names = origin_projection
             .iter()
-            .map(|i| all_logical_columns[*i].clone())
-            .collect::<Vec<_>>();
+            .map(|&index| {
+                all_logical_columns
+                    .get(index)
+                    .map(String::as_str)
+                    .with_context(|| InvalidRequestSnafu {
+                        region_id: logical_region_id,
+                        reason: format!("projection index {index} is out of bounds"),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // generate physical projection
         let mut physical_projection = Vec::with_capacity(origin_projection.len());
@@ -196,7 +210,7 @@ impl MetricEngineInner {
 
         for name in projected_logical_names {
             // Safety: logical columns is a strict subset of physical columns
-            physical_projection.push(physical_metadata.column_index_by_name(&name).unwrap());
+            physical_projection.push(physical_metadata.column_index_by_name(name).unwrap());
         }
 
         Ok(physical_projection)
@@ -292,12 +306,41 @@ impl MetricEngineInner {
 
 #[cfg(test)]
 mod test {
+    use common_error::ext::ErrorExt;
+    use common_error::status_code::StatusCode;
     use store_api::region_request::RegionRequest;
 
     use super::*;
     use crate::test_util::{
         TestEnv, alter_logical_region_add_tag_columns, create_logical_region_request,
     };
+
+    #[tokio::test]
+    async fn test_invalid_logical_projection() {
+        let env = TestEnv::new().await;
+        env.init_metric_region().await;
+
+        let logical_region_id = env.default_logical_region_id();
+        let invalid_index = usize::MAX;
+        let request = ScanRequest {
+            projection: Some(vec![invalid_index]),
+            ..Default::default()
+        };
+
+        let error =
+            match RegionEngine::handle_query(&env.metric(), logical_region_id, request).await {
+                Ok(_) => panic!("invalid logical projection unexpectedly succeeded"),
+                Err(error) => error,
+            };
+
+        assert_eq!(error.status_code(), StatusCode::InvalidArguments);
+        assert!(
+            error.to_string().contains(&format!(
+                "projection index {invalid_index} is out of bounds"
+            )),
+            "unexpected error: {error}"
+        );
+    }
 
     #[tokio::test]
     async fn test_transform_scan_req() {
@@ -325,8 +368,9 @@ mod test {
             .unwrap();
 
         // check explicit projection
+        let projection = Some(vec![0, 1, 2, 3, 4, 5, 6]);
         let scan_req = ScanRequest {
-            projection: Some(vec![0, 1, 2, 3, 4, 5, 6]),
+            projection,
             filters: vec![],
             ..Default::default()
         };
@@ -338,7 +382,10 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(scan_req.projection.unwrap(), vec![11, 10, 9, 8, 0, 1, 4]);
+        assert_eq!(
+            scan_req.projection.as_deref().unwrap(),
+            &[11, 10, 9, 8, 0, 1, 4]
+        );
         assert_eq!(scan_req.filters.len(), 1);
         assert_eq!(
             scan_req.filters[0],
@@ -354,6 +401,9 @@ mod test {
             .transform_request(physical_region_id, logical_region_id, scan_req)
             .await
             .unwrap();
-        assert_eq!(scan_req.projection.unwrap(), vec![11, 10, 9, 8, 0, 1, 4]);
+        assert_eq!(
+            scan_req.projection.as_deref().unwrap(),
+            &[11, 10, 9, 8, 0, 1, 4]
+        );
     }
 }

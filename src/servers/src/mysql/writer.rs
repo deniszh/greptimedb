@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Write as FmtWrite;
 use std::io;
 use std::time::Duration;
 
@@ -22,11 +23,14 @@ use arrow::datatypes::{
     UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_schema::{DataType, IntervalUnit};
+use chrono::{Datelike, NaiveDateTime};
 use common_decimal::Decimal128;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_query::{Output, OutputData};
-use common_recordbatch::{RecordBatch, SendableRecordBatchStream};
+use common_recordbatch::{
+    RecordBatch, SendableRecordBatchStream, map_dictionary_to_values_data_type,
+};
 use common_telemetry::{debug, error};
 use common_time::{Date, IntervalDayTime, IntervalMonthDayNano, IntervalYearMonth};
 use datafusion_common::ScalarValue;
@@ -36,18 +40,25 @@ use datatypes::types::jsonb_to_string;
 use futures::StreamExt;
 use opensrv_mysql::{
     Column, ColumnFlags, ColumnType, ErrorKind, OkResponse, QueryResultWriter, RowWriter,
+    ToMysqlValue,
 };
 use session::SessionRef;
 use session::context::QueryContextRef;
 use snafu::prelude::*;
 use tokio::io::AsyncWrite;
 
-use crate::error::{self, ConvertSqlValueSnafu, DataFusionSnafu, NotSupportedSnafu, Result};
+use crate::error::{
+    self, ConvertSqlValueSnafu, DataFusionSnafu, InternalSnafu, NotSupportedSnafu, Result,
+    TimestampOverflowSnafu,
+};
 use crate::metrics::*;
+
+const MYSQL_DATETIME_MIN_YEAR: i32 = 1000;
+const MYSQL_DATETIME_MAX_YEAR: i32 = 9999;
 
 /// Try to write multiple output to the writer if possible.
 pub async fn write_output<W: AsyncWrite + Send + Sync + Unpin>(
-    w: QueryResultWriter<'_, W>,
+    mut writer: QueryResultWriter<'_, W>,
     query_context: QueryContextRef,
     session: SessionRef,
     outputs: Vec<Result<Output>>,
@@ -56,21 +67,87 @@ pub async fn write_output<W: AsyncWrite + Send + Sync + Unpin>(
         session.add_warning(warning);
     }
 
-    let mut writer = Some(MysqlResultWriter::new(
-        w,
-        query_context.clone(),
-        session.clone(),
-    ));
-    for output in outputs {
-        let result_writer = writer.take().context(error::InternalSnafu {
-            err_msg: "Sending multiple result set is unsupported",
-        })?;
-        writer = result_writer.try_write_one(output).await?;
+    enum Response {
+        ResultSet {
+            columns: Vec<Column>,
+            stream: SendableRecordBatchStream,
+        },
+        AffectedRows(usize),
     }
 
-    if let Some(result_writer) = writer {
-        result_writer.finish().await?;
+    let mut responses = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        match output {
+            Ok(x) => {
+                let output = match x.data {
+                    OutputData::Stream(stream) => either::Left(stream),
+                    OutputData::RecordBatches(record_batches) => {
+                        either::Left(record_batches.as_stream())
+                    }
+                    OutputData::AffectedRows(rows) => either::Right(rows),
+                };
+                responses.push(match output {
+                    either::Left(stream) => {
+                        let schema = stream.schema();
+                        let columns = match create_mysql_column_def(&schema) {
+                            Ok(columns) => columns,
+                            Err(e) => {
+                                MysqlResultWriter::write_query_error(
+                                    e,
+                                    writer,
+                                    query_context.clone(),
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                        };
+                        Response::ResultSet { columns, stream }
+                    }
+                    either::Right(rows) => Response::AffectedRows(rows),
+                });
+            }
+            Err(e) => {
+                MysqlResultWriter::write_query_error(e, writer, query_context.clone()).await?;
+                return Ok(());
+            }
+        }
     }
+
+    for response in &mut responses {
+        writer = match response {
+            Response::ResultSet { columns, stream } => {
+                let mut row_writer = writer.start(columns).await?;
+                while let Some(record_batch) = stream.next().await {
+                    match record_batch {
+                        Ok(record_batch) => {
+                            if let Err(e) = MysqlResultWriter::write_recordbatch(
+                                &mut row_writer,
+                                record_batch,
+                                query_context.clone(),
+                            )
+                            .await
+                            {
+                                let (kind, err) = handle_err(e, query_context);
+                                row_writer.finish_error(kind, &err.as_bytes()).await?;
+                                return Ok(());
+                            }
+                        }
+                        Err(e) => {
+                            let (kind, err) = handle_err(e, query_context);
+                            row_writer.finish_error(kind, &err.as_bytes()).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                row_writer.finish_one().await?
+            }
+            Response::AffectedRows(rows) => {
+                MysqlResultWriter::write_affected_rows(writer, *rows, &session).await?
+            }
+        }
+    }
+
+    writer.no_more_results().await?;
     Ok(())
 }
 
@@ -97,75 +174,39 @@ pub fn handle_err(e: impl ErrorExt, query_ctx: QueryContextRef) -> (ErrorKind, S
     (kind, err_msg)
 }
 
-struct QueryResult {
-    schema: SchemaRef,
-    stream: SendableRecordBatchStream,
+struct MysqlResultWriter;
+
+struct PrecisionTimestamp<'a> {
+    formatted: &'a str,
+    datetime: chrono::NaiveDateTime,
 }
 
-pub struct MysqlResultWriter<'a, W: AsyncWrite + Unpin> {
-    writer: QueryResultWriter<'a, W>,
-    query_context: QueryContextRef,
-    session: SessionRef,
+struct StagedTimestamp {
+    datetime: Option<NaiveDateTime>,
+    formatted: String,
 }
 
-impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
-    pub fn new(
-        writer: QueryResultWriter<'a, W>,
-        query_context: QueryContextRef,
-        session: SessionRef,
-    ) -> MysqlResultWriter<'a, W> {
-        MysqlResultWriter::<'a, W> {
-            writer,
-            query_context,
-            session,
+impl StagedTimestamp {
+    fn new() -> Self {
+        Self {
+            datetime: None,
+            formatted: String::with_capacity(32),
         }
     }
+}
 
-    /// Try to write one result set. If there are more than one result set, return `Some`.
-    pub async fn try_write_one(
-        self,
-        output: Result<Output>,
-    ) -> io::Result<Option<MysqlResultWriter<'a, W>>> {
-        // We don't support sending multiple query result because the RowWriter's lifetime is bound to
-        // a local variable.
-        match output {
-            Ok(output) => match output.data {
-                OutputData::Stream(stream) => {
-                    let query_result = QueryResult {
-                        schema: stream.schema(),
-                        stream,
-                    };
-                    Self::write_query_result(query_result, self.writer, self.query_context).await?;
-                }
-                OutputData::RecordBatches(recordbatches) => {
-                    let query_result = QueryResult {
-                        schema: recordbatches.schema(),
-                        stream: recordbatches.as_stream(),
-                    };
-                    Self::write_query_result(query_result, self.writer, self.query_context).await?;
-                }
-                OutputData::AffectedRows(rows) => {
-                    let next_writer =
-                        Self::write_affected_rows(self.writer, rows, &self.session).await?;
-                    return Ok(Some(MysqlResultWriter::new(
-                        next_writer,
-                        self.query_context,
-                        self.session,
-                    )));
-                }
-            },
-            Err(error) => Self::write_query_error(error, self.writer, self.query_context).await?,
-        }
-        Ok(None)
+impl<'a> ToMysqlValue for PrecisionTimestamp<'a> {
+    fn to_mysql_text<W: std::io::Write>(&self, w: &mut W) -> io::Result<()> {
+        self.formatted.to_mysql_text(w)
     }
 
-    /// Indicate no more result set to write. No need to call this if there is only one result set.
-    pub async fn finish(self) -> Result<()> {
-        self.writer.no_more_results().await?;
-        Ok(())
+    fn to_mysql_bin<W: std::io::Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
+        self.datetime.to_mysql_bin(w, c)
     }
+}
 
-    async fn write_affected_rows(
+impl MysqlResultWriter {
+    async fn write_affected_rows<'a, W: AsyncWrite + Unpin>(
         w: QueryResultWriter<'a, W>,
         rows: usize,
         session: &SessionRef,
@@ -182,56 +223,70 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
         Ok(next_writer)
     }
 
-    async fn write_query_result(
-        mut query_result: QueryResult,
-        writer: QueryResultWriter<'a, W>,
-        query_context: QueryContextRef,
-    ) -> io::Result<()> {
-        match create_mysql_column_def(&query_result.schema) {
-            Ok(column_def) => {
-                // The RowWriter's lifetime is bound to `column_def` thus we can't use finish_one()
-                // to return a new QueryResultWriter.
-                let mut row_writer = writer.start(&column_def).await?;
-                while let Some(record_batch) = query_result.stream.next().await {
-                    match record_batch {
-                        Ok(record_batch) => {
-                            if let Err(e) = Self::write_recordbatch(
-                                &mut row_writer,
-                                record_batch,
-                                query_context.clone(),
-                                &query_result.schema,
-                            )
-                            .await
-                            {
-                                let (kind, err) = handle_err(e, query_context);
-                                row_writer.finish_error(kind, &err.as_bytes()).await?;
-                                return Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            let (kind, err) = handle_err(e, query_context);
-                            debug!("Failed to get result, kind: {:?}, err: {}", kind, err);
-                            row_writer.finish_error(kind, &err.as_bytes()).await?;
-
-                            return Ok(());
-                        }
-                    }
-                }
-                row_writer.finish().await?;
-                Ok(())
-            }
-            Err(error) => Self::write_query_error(error, writer, query_context).await,
-        }
-    }
-
-    async fn write_recordbatch(
-        row_writer: &mut RowWriter<'_, W>,
+    async fn write_recordbatch<W: AsyncWrite + Unpin>(
+        row_writer: &mut RowWriter<'_, '_, W>,
         record_batch: RecordBatch,
         query_context: QueryContextRef,
-        schema: &SchemaRef,
     ) -> Result<()> {
+        let schema = record_batch.schema.clone();
         let record_batch = record_batch.into_df_record_batch();
+        let mut timestamp_slots = vec![None; record_batch.num_columns()];
+        let mut staged_timestamps = record_batch
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| matches!(column.data_type(), DataType::Timestamp(_, _)))
+            .enumerate()
+            .map(|(slot, (column_index, column))| {
+                timestamp_slots[column_index] = Some(slot);
+                (column, StagedTimestamp::new())
+            })
+            .collect::<Vec<_>>();
         for i in 0..record_batch.num_rows() {
+            for (column, staged_timestamp) in &mut staged_timestamps {
+                let column = *column;
+                staged_timestamp.datetime = None;
+                staged_timestamp.formatted.clear();
+                if !column.is_null(i) {
+                    let timestamp = datatypes::arrow_array::timestamp_array_value(column, i);
+                    let datetime = timestamp
+                        .to_chrono_datetime_with_timezone(Some(&query_context.timezone()))
+                        .with_context(|| TimestampOverflowSnafu {
+                            error: format!(
+                                "timestamp {} overflow with unit {}",
+                                timestamp.value(),
+                                timestamp.unit()
+                            ),
+                        })?;
+                    let year = datetime.year();
+                    if !(MYSQL_DATETIME_MIN_YEAR..=MYSQL_DATETIME_MAX_YEAR).contains(&year) {
+                        return TimestampOverflowSnafu {
+                            error: format!(
+                                "timestamp {} with unit {} has local year {}, outside MySQL DATETIME range {}..={}",
+                                timestamp.value(),
+                                timestamp.unit(),
+                                year,
+                                MYSQL_DATETIME_MIN_YEAR,
+                                MYSQL_DATETIME_MAX_YEAR,
+                            ),
+                        }
+                        .fail();
+                    }
+                    write!(
+                        &mut staged_timestamp.formatted,
+                        "{}",
+                        datetime.format("%Y-%m-%d %H:%M:%S%.f")
+                    )
+                    .map_err(|_| {
+                        InternalSnafu {
+                            err_msg: "timestamp formatting failed",
+                        }
+                        .build()
+                    })?;
+                    staged_timestamp.datetime = Some(datetime);
+                }
+            }
+
             for (j, column) in record_batch.columns().iter().enumerate() {
                 if column.is_null(i) {
                     row_writer.write_col(None::<u8>)?;
@@ -305,9 +360,26 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
                         row_writer.write_col(v.to_chrono_date())?;
                     }
                     DataType::Timestamp(_, _) => {
-                        let v = datatypes::arrow_array::timestamp_array_value(column, i);
-                        let v = v.to_chrono_datetime_with_timezone(Some(&query_context.timezone()));
-                        row_writer.write_col(v)?;
+                        let slot = timestamp_slots
+                            .get(j)
+                            .context(InternalSnafu {
+                                err_msg: "timestamp column index is invalid",
+                            })?
+                            .as_ref()
+                            .context(InternalSnafu {
+                                err_msg: "timestamp column has no staging slot",
+                            })?;
+                        let (_, staged_timestamp) =
+                            staged_timestamps.get(*slot).context(InternalSnafu {
+                                err_msg: "timestamp staging slot is missing",
+                            })?;
+                        let datetime = staged_timestamp.datetime.context(InternalSnafu {
+                            err_msg: "timestamp staging value is missing",
+                        })?;
+                        row_writer.write_col(PrecisionTimestamp {
+                            formatted: staged_timestamp.formatted.as_str(),
+                            datetime,
+                        })?;
                     }
                     DataType::Interval(interval_unit) => match interval_unit {
                         IntervalUnit::YearMonth => {
@@ -358,7 +430,7 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
         Ok(())
     }
 
-    async fn write_query_error(
+    async fn write_query_error<'a, W: AsyncWrite + Unpin>(
         error: impl ErrorExt,
         w: QueryResultWriter<'a, W>,
         query_context: QueryContextRef,
@@ -374,10 +446,8 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
     }
 }
 
-pub(crate) fn create_mysql_column(
-    data_type: &ConcreteDataType,
-    column_name: &str,
-) -> Result<Column> {
+pub fn create_mysql_column(data_type: &ConcreteDataType, column_name: &str) -> Result<Column> {
+    let data_type = &map_dictionary_to_values_data_type(data_type);
     let column_type = match data_type {
         ConcreteDataType::Null(_) => Ok(ColumnType::MYSQL_TYPE_NULL),
         ConcreteDataType::Boolean(_) | ConcreteDataType::Int8(_) | ConcreteDataType::UInt8(_) => {

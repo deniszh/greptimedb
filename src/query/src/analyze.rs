@@ -33,10 +33,11 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, accept,
 };
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::{DataFusionError, internal_err};
+use datafusion_common::{DataFusionError, assert_eq_or_internal_err, internal_err};
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use futures::StreamExt;
 use serde::Serialize;
+use serde_json::{Value, json};
 use sqlparser::ast::AnalyzeFormat;
 
 use crate::dist_plan::MergeScanExec;
@@ -84,6 +85,52 @@ impl DistAnalyzeExec {
             properties.boundedness,
         )
     }
+
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+}
+
+/// Returns verbose analyze metrics as JSON values using the same `JsonMetrics` shape
+/// as `EXPLAIN ANALYZE VERBOSE FORMAT JSON`.
+///
+/// This reads metrics directly from a running physical plan for the experimental
+/// HTTP analyze stream. It is a best-effort diagnostic live snapshot, not a
+/// transactionally consistent snapshot; metric values may change while this
+/// function traverses the plan.
+pub fn analyze_plan_metrics_to_json_value(
+    plan: &Arc<dyn ExecutionPlan>,
+    verbose: bool,
+) -> serde_json::Result<Value> {
+    let input = plan
+        .as_any()
+        .downcast_ref::<DistAnalyzeExec>()
+        .map(|exec| exec.input().clone())
+        .unwrap_or_else(|| plan.clone());
+
+    let mut stages = Vec::new();
+    let mut collector = MetricCollector::new(verbose);
+    accept(input.as_ref(), &mut collector).unwrap();
+    stages.push(json!({
+        "stage": 0,
+        "node": 0,
+        "plan": JsonMetrics::from_record_batch_metrics(collector.record_batch_metrics),
+    }));
+
+    let _ = input.apply(|plan| {
+        if let Some(merge_scan) = plan.as_any().downcast_ref::<MergeScanExec>() {
+            for (node, metric) in merge_scan.sub_stage_metrics().into_iter().enumerate() {
+                stages.push(json!({
+                    "stage": 1,
+                    "node": node,
+                    "plan": JsonMetrics::from_record_batch_metrics(metric),
+                }));
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+
+    Ok(Value::Array(stages))
 }
 
 impl DisplayAs for DistAnalyzeExec {
@@ -125,8 +172,13 @@ impl ExecutionPlan for DistAnalyzeExec {
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        assert_eq_or_internal_err!(
+            children.len(),
+            1,
+            "DistAnalyzeExec requires exactly one child"
+        );
         Ok(Arc::new(Self::new(
-            children.pop().unwrap(),
+            children.swap_remove(0),
             self.verbose,
             self.format,
         )))
@@ -303,7 +355,7 @@ impl JsonMetrics {
         let mut elapsed_compute = 0;
         let mut output_rows = 0;
         let mut other_metrics = HashMap::default();
-        let (name, param) = raw_name.split_once(": ").unwrap_or_default();
+        let (name, param) = raw_name.split_once(": ").unwrap_or((raw_name, ""));
 
         for (name, value) in plan_metrics.metrics.into_iter() {
             if name == "elapsed_compute" {
@@ -332,5 +384,111 @@ impl JsonMetrics {
 impl Display for JsonMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", serde_json::to_string(self).unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    use super::*;
+
+    fn empty_plan(name: &str) -> Arc<dyn ExecutionPlan> {
+        Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![Field::new(
+            name,
+            DataType::Utf8,
+            true,
+        )]))))
+    }
+
+    #[test]
+    fn qbs_dist_analyze_rejects_zero_children() {
+        let analyze = Arc::new(DistAnalyzeExec::new(
+            empty_plan("original"),
+            false,
+            AnalyzeFormat::TEXT,
+        ));
+
+        assert!(ExecutionPlan::with_new_children(analyze, vec![]).is_err());
+    }
+
+    #[test]
+    fn qbs_dist_analyze_rejects_multiple_children() {
+        let analyze = Arc::new(DistAnalyzeExec::new(
+            empty_plan("original"),
+            false,
+            AnalyzeFormat::TEXT,
+        ));
+
+        let result = ExecutionPlan::with_new_children(
+            analyze,
+            vec![empty_plan("first"), empty_plan("second")],
+        );
+
+        if let Ok(plan) = result {
+            let retained = plan
+                .as_any()
+                .downcast_ref::<DistAnalyzeExec>()
+                .unwrap()
+                .input()
+                .schema()
+                .field(0)
+                .name()
+                .clone();
+            panic!("expected an arity error for multiple children, but retained `{retained}`");
+        }
+    }
+
+    #[test]
+    fn qbs_dist_analyze_accepts_exactly_one_child() {
+        let analyze = Arc::new(DistAnalyzeExec::new(
+            empty_plan("original"),
+            false,
+            AnalyzeFormat::TEXT,
+        ));
+        let replacement = empty_plan("replacement");
+
+        let rebuilt = ExecutionPlan::with_new_children(analyze, vec![replacement]).unwrap();
+        let rebuilt = rebuilt.as_any().downcast_ref::<DistAnalyzeExec>().unwrap();
+
+        assert_eq!(rebuilt.input().schema().field(0).name(), "replacement");
+    }
+
+    #[test]
+    fn qbs_analyze_json_preserves_plan_name_without_parameters() {
+        let input = empty_plan("input");
+        let mut collector = MetricCollector::new(false);
+        accept(input.as_ref(), &mut collector).unwrap();
+
+        let plan_metrics = &collector.record_batch_metrics.plan_metrics;
+        assert_eq!(plan_metrics.len(), 1);
+        assert_eq!(plan_metrics[0].level, 0);
+        assert_eq!(plan_metrics[0].plan, input.name());
+
+        let analyze: Arc<dyn ExecutionPlan> = Arc::new(DistAnalyzeExec::new(
+            input.clone(),
+            false,
+            AnalyzeFormat::JSON,
+        ));
+        let metrics = analyze_plan_metrics_to_json_value(&analyze, false).unwrap();
+        let plan_name = metrics[0]["plan"]["name"].as_str().unwrap();
+        let plan_param = metrics[0]["plan"]["param"].as_str().unwrap();
+
+        assert!(!plan_name.is_empty());
+        assert_eq!(plan_name, input.name());
+        assert!(plan_param.is_empty());
+    }
+
+    #[test]
+    fn qbs_analyze_json_splits_plan_name_and_parameters() {
+        let (_, metrics) = JsonMetrics::from_plan_metrics(PlanMetrics {
+            plan: "FilterExec: predicate".to_string(),
+            plan_name: "FilterExec".to_string(),
+            level: 0,
+            metrics: vec![],
+        });
+
+        assert_eq!(metrics.name, "FilterExec");
+        assert_eq!(metrics.param, "predicate");
     }
 }

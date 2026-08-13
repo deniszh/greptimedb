@@ -28,6 +28,7 @@ use common_telemetry::tracing_context::TracingContext;
 use futures::future::{join_all, try_join_all};
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, ensure};
+use store_api::region_request::RegionFlushReason;
 use store_api::storage::RegionId;
 
 use crate::error::{self, Error, Result};
@@ -37,8 +38,8 @@ use crate::procedure::repartition::group::utils::{
     HandleMultipleResult, group_region_routes_by_peer, handle_multiple_results,
 };
 use crate::procedure::repartition::group::{Context, GroupId, GroupPrepareResult, State};
-use crate::procedure::repartition::plan::RegionDescriptor;
-use crate::procedure::utils::{self, ErrorStrategy};
+use crate::procedure::repartition::plan::TargetRegionDescriptor;
+use crate::procedure::utils::{self, ErrorStrategy, instruction_error_result};
 use crate::service::mailbox::{Channel, MailboxRef};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,7 +77,7 @@ impl EnterStagingRegion {
     fn build_enter_staging_instructions(
         group_id: GroupId,
         prepare_result: &GroupPrepareResult,
-        targets: &[RegionDescriptor],
+        targets: &[TargetRegionDescriptor],
         pending_deallocate_region_ids: &[RegionId],
     ) -> Result<HashMap<Peer, Vec<common_meta::instruction::EnterStagingRegion>>> {
         let target_partition_expr_by_region = targets
@@ -315,7 +316,14 @@ impl EnterStagingRegion {
                 );
 
                 Ok(())
-            }
+            },
+            Err(error::Error::MailboxChannelClosed {..})=> error::RetryLaterSnafu {
+                reason: format!(
+                    "Mailbox closed when sending enter staging regions to datanode {:?}, elapsed: {:?}",
+                    peer,
+                    now.elapsed()
+                ),
+            }.fail()?,
             Err(error::Error::MailboxTimeout { .. }) => {
                 let reason = format!(
                     "Mailbox received timeout for enter staging regions on datanode {:?}, elapsed: {:?}",
@@ -350,14 +358,17 @@ impl EnterStagingRegion {
             }
         );
 
-        if error.is_some() {
-            return error::RetryLaterSnafu {
-                reason: format!(
+        if let Some(error) = error {
+            return instruction_error_result(
+                error,
+                format!(
                     "Failed to enter staging region {} on datanode {:?}, error: {:?}, elapsed: {:?}",
-                    region_id, peer, error, now.elapsed()
+                    region_id,
+                    peer,
+                    error,
+                    now.elapsed()
                 ),
-            }
-            .fail();
+            );
         }
 
         ensure!(
@@ -411,6 +422,7 @@ impl EnterStagingRegion {
                     peer,
                     operation_timeout,
                     ErrorStrategy::Retry,
+                    Some(RegionFlushReason::Repartition),
                 )
             })
             .collect::<Vec<_>>();
@@ -445,7 +457,7 @@ mod tests {
     use crate::error::{self, Error};
     use crate::procedure::repartition::group::GroupPrepareResult;
     use crate::procedure::repartition::group::enter_staging_region::EnterStagingRegion;
-    use crate::procedure::repartition::plan::RegionDescriptor;
+    use crate::procedure::repartition::plan::TargetRegionDescriptor;
     use crate::procedure::repartition::test_util::{
         TestingEnv, new_persistent_context, range_expr,
     };
@@ -711,13 +723,13 @@ mod tests {
         }
     }
 
-    fn test_targets() -> Vec<RegionDescriptor> {
+    fn test_targets() -> Vec<TargetRegionDescriptor> {
         vec![
-            RegionDescriptor {
+            TargetRegionDescriptor {
                 region_id: RegionId::new(1024, 1),
                 partition_expr: range_expr("x", 0, 10),
             },
-            RegionDescriptor {
+            TargetRegionDescriptor {
                 region_id: RegionId::new(1024, 2),
                 partition_expr: range_expr("x", 10, 20),
             },

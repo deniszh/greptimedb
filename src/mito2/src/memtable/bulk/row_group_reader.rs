@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use datatypes::extension::json::is_json2_extension_type;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
@@ -27,13 +28,12 @@ use crate::error;
 use crate::error::ReadDataPartSnafu;
 use crate::memtable::bulk::chunk_reader::MemtableChunkReader;
 use crate::memtable::bulk::context::BulkIterContextRef;
-use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 
 pub(crate) struct MemtableRowGroupReaderBuilder {
     projection: ProjectionMask,
-    parquet_metadata: Arc<ParquetMetaData>,
     arrow_metadata: ArrowReaderMetadata,
     data: Bytes,
+    batch_size: usize,
 }
 
 impl MemtableRowGroupReaderBuilder {
@@ -44,16 +44,33 @@ impl MemtableRowGroupReaderBuilder {
         data: Bytes,
     ) -> error::Result<Self> {
         // Create ArrowReaderMetadata for building the reader.
-        let arrow_reader_options =
-            ArrowReaderOptions::new().with_schema(context.read_format().arrow_schema().clone());
+        let mut arrow_reader_options = ArrowReaderOptions::new();
+
+        // JSON2 columns in region metadata are not concretized with nested
+        // fields here, so let parquet use its embedded Arrow schema instead.
+        //
+        // TODO: Pass the encoded part's concrete schema into this builder. It
+        // avoids parsing the Arrow schema from parquet metadata while keeping
+        // JSON2 nested fields exact.
+        if !context
+            .read_format()
+            .arrow_schema()
+            .fields()
+            .iter()
+            .any(is_json2_extension_type)
+        {
+            arrow_reader_options =
+                arrow_reader_options.with_schema(context.read_format().arrow_schema().clone());
+        }
+
         let arrow_metadata =
             ArrowReaderMetadata::try_new(parquet_metadata.clone(), arrow_reader_options)
                 .context(ReadDataPartSnafu)?;
         Ok(Self {
             projection,
-            parquet_metadata,
             arrow_metadata,
             data,
+            batch_size: context.batch_size(),
         })
     }
 
@@ -71,31 +88,12 @@ impl MemtableRowGroupReaderBuilder {
         )
         .with_row_groups(vec![row_group_idx])
         .with_projection(self.projection.clone())
-        .with_batch_size(DEFAULT_READ_BATCH_SIZE);
+        .with_batch_size(self.batch_size);
 
         if let Some(selection) = row_selection {
             builder = builder.with_row_selection(selection);
         }
 
         builder.build().context(ReadDataPartSnafu)
-    }
-
-    /// Computes whether to skip field filters for a specific row group based on PreFilterMode.
-    pub(crate) fn compute_skip_fields(
-        &self,
-        context: &BulkIterContextRef,
-        row_group_idx: usize,
-    ) -> bool {
-        use crate::sst::parquet::file_range::{PreFilterMode, row_group_contains_delete};
-
-        match context.pre_filter_mode() {
-            PreFilterMode::All => false,
-            PreFilterMode::SkipFields => true,
-            PreFilterMode::SkipFieldsOnDelete => {
-                // Check if this specific row group contains delete op
-                row_group_contains_delete(&self.parquet_metadata, row_group_idx, "memtable")
-                    .unwrap_or(true)
-            }
-        }
     }
 }

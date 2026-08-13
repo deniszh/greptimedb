@@ -13,12 +13,16 @@
 // limitations under the License.
 
 pub(crate) mod bare;
+pub(crate) mod compat;
+pub(crate) mod compat_case;
+pub(crate) mod datanode_overlay;
 pub(crate) mod kube;
 
 use std::path::PathBuf;
 
 use bare::BareCommand;
 use clap::Parser;
+use compat::CompatCommand;
 use kube::KubeCommand;
 
 #[derive(Parser)]
@@ -31,6 +35,7 @@ pub struct Command {
 #[derive(Parser)]
 pub enum SubCommand {
     Bare(BareCommand),
+    Compat(CompatCommand),
     Kube(KubeCommand),
 }
 

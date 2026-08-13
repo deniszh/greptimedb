@@ -18,12 +18,14 @@
 
 #![feature(debug_closure_helpers)]
 #![feature(duration_constructors)]
+#![feature(binary_heap_pop_if)]
 
 #[cfg(any(test, feature = "test"))]
 #[cfg_attr(feature = "test", allow(unused))]
 pub mod test_util;
 
 pub mod access_layer;
+pub mod batch_size;
 pub mod cache;
 pub mod compaction;
 pub mod config;

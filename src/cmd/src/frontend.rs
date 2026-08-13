@@ -23,7 +23,7 @@ use catalog::information_extension::DistributedInformationExtension;
 use catalog::information_schema::InformationExtensionRef;
 use catalog::kvbackend::{
     CachedKvBackendBuilder, CatalogManagerConfiguratorRef, KvBackendCatalogManagerBuilder,
-    MetaKvBackend,
+    new_read_only_meta_kv_backend,
 };
 use catalog::process_manager::ProcessManager;
 use clap::Parser;
@@ -31,12 +31,7 @@ use client::client_manager::NodeClients;
 use common_base::Plugins;
 use common_config::{Configurable, DEFAULT_DATA_HOME};
 use common_error::ext::BoxedError;
-use common_grpc::channel_manager::ChannelConfig;
 use common_meta::cache::{CacheRegistryBuilder, LayeredCacheRegistryBuilder};
-use common_meta::heartbeat::handler::HandlerGroupExecutor;
-use common_meta::heartbeat::handler::invalidate_table_cache::InvalidateCacheHandler;
-use common_meta::heartbeat::handler::parse_mailbox_message::ParseMailboxMessageHandler;
-use common_meta::heartbeat::handler::suspend::SuspendHandler;
 use common_query::prelude::set_default_prefix;
 use common_stat::ResourceStatImpl;
 use common_telemetry::info;
@@ -44,7 +39,9 @@ use common_telemetry::logging::{DEFAULT_LOGGING_DIR, TracingOptions};
 use common_time::timezone::set_default_timezone;
 use common_version::{short_version, verbose_version};
 use frontend::frontend::Frontend;
-use frontend::heartbeat::HeartbeatTask;
+use frontend::heartbeat::{
+    FrontendHeartbeatExtensions, HeartbeatTask, heartbeat_response_handler_executor,
+};
 use frontend::instance::builder::FrontendBuilder;
 use frontend::server::Services;
 use meta_client::{MetaClientOptions, MetaClientRef, MetaClientType};
@@ -52,7 +49,6 @@ use plugins::PluginOptions;
 use plugins::frontend::context::{
     CatalogManagerConfigureContext, DistributedCatalogManagerConfigureContext,
 };
-use plugins::frontend::setup_frontend_dynamic_plugins;
 use plugins::options::PluginOptionsDeserializerImpl;
 use servers::addrs;
 use servers::grpc::GrpcOptions;
@@ -95,8 +91,7 @@ impl App for Instance {
     }
 
     async fn start(&mut self) -> Result<()> {
-        let plugins = self.frontend.instance.plugins().clone();
-        plugins::start_frontend_plugins(plugins)
+        plugins::start_frontend_plugins(&self.frontend.instance)
             .await
             .context(error::StartFrontendSnafu)?;
 
@@ -152,21 +147,33 @@ impl SubCommand {
 #[derive(Debug, Default, Parser)]
 pub struct StartCommand {
     /// The address to bind the gRPC server.
-    #[clap(long, alias = "rpc-addr")]
-    rpc_bind_addr: Option<String>,
+    #[clap(long = "grpc-bind-addr", alias = "rpc-bind-addr", alias = "rpc-addr")]
+    grpc_bind_addr: Option<String>,
     /// The address advertised to the metasrv, and used for connections from outside the host.
     /// If left empty or unset, the server will automatically use the IP address of the first network interface
-    /// on the host, with the same port number as the one specified in `rpc_bind_addr`.
-    #[clap(long, alias = "rpc-hostname")]
-    rpc_server_addr: Option<String>,
+    /// on the host, with the same port number as the one specified in `grpc_bind_addr`.
+    #[clap(
+        long = "grpc-server-addr",
+        alias = "rpc-server-addr",
+        alias = "rpc-hostname"
+    )]
+    grpc_server_addr: Option<String>,
     /// The address to bind the internal gRPC server.
-    #[clap(long, alias = "internal-rpc-addr")]
-    internal_rpc_bind_addr: Option<String>,
+    #[clap(
+        long = "internal-grpc-bind-addr",
+        alias = "internal-rpc-bind-addr",
+        alias = "internal-rpc-addr"
+    )]
+    internal_grpc_bind_addr: Option<String>,
     /// The address advertised to the metasrv, and used for connections from outside the host.
     /// If left empty or unset, the server will automatically use the IP address of the first network interface
-    /// on the host, with the same port number as the one specified in `internal_rpc_bind_addr`.
-    #[clap(long, alias = "internal-rpc-hostname")]
-    internal_rpc_server_addr: Option<String>,
+    /// on the host, with the same port number as the one specified in `internal_grpc_bind_addr`.
+    #[clap(
+        long = "internal-grpc-server-addr",
+        alias = "internal-rpc-server-addr",
+        alias = "internal-rpc-hostname"
+    )]
+    internal_grpc_server_addr: Option<String>,
     #[clap(long)]
     http_addr: Option<String>,
     #[clap(long)]
@@ -258,16 +265,16 @@ impl StartCommand {
             opts.http.disable_dashboard = disable_dashboard;
         }
 
-        if let Some(addr) = &self.rpc_bind_addr {
+        if let Some(addr) = &self.grpc_bind_addr {
             opts.grpc.bind_addr.clone_from(addr);
             opts.grpc.tls = merge_tls_option(&opts.grpc.tls, tls_opts.clone());
         }
 
-        if let Some(addr) = &self.rpc_server_addr {
+        if let Some(addr) = &self.grpc_server_addr {
             opts.grpc.server_addr.clone_from(addr);
         }
 
-        if let Some(addr) = &self.internal_rpc_bind_addr {
+        if let Some(addr) = &self.internal_grpc_bind_addr {
             if let Some(internal_grpc) = &mut opts.internal_grpc {
                 internal_grpc.bind_addr = addr.clone();
             } else {
@@ -280,7 +287,7 @@ impl StartCommand {
             }
         }
 
-        if let Some(addr) = &self.internal_rpc_server_addr {
+        if let Some(addr) = &self.internal_grpc_server_addr {
             if let Some(internal_grpc) = &mut opts.internal_grpc {
                 internal_grpc.server_addr = addr.clone();
             } else {
@@ -333,6 +340,7 @@ impl StartCommand {
             Some(&opts.component.slow_query),
         );
 
+        crate::options::flush_dropped_plugin_warnings();
         log_versions(verbose_version(), short_version(), APP_NAME);
         maybe_activate_heap_profile(&opts.component.memory);
         create_resource_limit_metrics(APP_NAME);
@@ -343,10 +351,6 @@ impl StartCommand {
         let plugin_opts = opts.plugins;
         let mut opts = opts.component;
         opts.grpc.detect_server_addr();
-        let mut plugins = Plugins::new();
-        plugins::setup_frontend_plugins(&mut plugins, &plugin_opts, &opts)
-            .await
-            .context(error::StartFrontendSnafu)?;
 
         set_default_timezone(opts.default_timezone.as_deref()).context(error::InitTimezoneSnafu)?;
         set_default_prefix(opts.default_column_prefix.as_deref())
@@ -364,6 +368,29 @@ impl StartCommand {
         let cache_ttl = meta_client_options.metadata_cache_ttl;
         let cache_tti = meta_client_options.metadata_cache_tti;
 
+        let meta_config: Vec<PluginOptions> = meta_client::create_meta_client(
+            MetaClientType::Frontend,
+            meta_client_options,
+            None,
+            None,
+        )
+        .await
+        .context(error::MetaClientInitSnafu)?
+        .pull_config(PluginOptionsDeserializerImpl)
+        .await
+        .context(error::MetaClientInitSnafu)?;
+
+        let mut plugins = Plugins::new();
+        plugins::setup_frontend_plugins_pre_build(
+            &mut plugins,
+            &plugin_opts,
+            &opts,
+            Some(&meta_config),
+        )
+        .await
+        .context(error::StartFrontendSnafu)?;
+
+        // now initialize the meta_client with plugins
         let meta_client = meta_client::create_meta_client(
             MetaClientType::Frontend,
             meta_client_options,
@@ -373,21 +400,14 @@ impl StartCommand {
         .await
         .context(error::MetaClientInitSnafu)?;
 
-        let meta_config: Vec<PluginOptions> = meta_client
-            .pull_config(PluginOptionsDeserializerImpl)
-            .await
-            .context(error::MetaClientInitSnafu)?;
-        setup_frontend_dynamic_plugins(meta_config, &mut plugins)
-            .await
-            .context(error::StartFrontendSnafu)?;
+        let readonly_meta_backend = new_read_only_meta_kv_backend(meta_client.clone());
 
         // TODO(discord9): add helper function to ease the creation of cache registry&such
-        let cached_meta_backend =
-            CachedKvBackendBuilder::new(Arc::new(MetaKvBackend::new(meta_client.clone())))
-                .cache_max_capacity(cache_max_capacity)
-                .cache_ttl(cache_ttl)
-                .cache_tti(cache_tti)
-                .build();
+        let cached_meta_backend = CachedKvBackendBuilder::new(readonly_meta_backend.clone())
+            .cache_max_capacity(cache_max_capacity)
+            .cache_ttl(cache_ttl)
+            .cache_tti(cache_tti)
+            .build();
         let cached_meta_backend = Arc::new(cached_meta_backend);
 
         // Builds cache registry
@@ -397,23 +417,23 @@ impl StartCommand {
                 .build(),
         );
         let fundamental_cache_registry =
-            build_fundamental_cache_registry(Arc::new(MetaKvBackend::new(meta_client.clone())));
-        let layered_cache_registry = Arc::new(
-            with_default_composite_cache_registry(
-                layered_cache_builder.add_cache_registry(fundamental_cache_registry),
-            )
-            .context(error::BuildCacheRegistrySnafu)?
-            .build(),
-        );
+            build_fundamental_cache_registry(readonly_meta_backend.clone());
+        let mut layered_cache_builder = with_default_composite_cache_registry(
+            layered_cache_builder.add_cache_registry(fundamental_cache_registry),
+        )
+        .context(error::BuildCacheRegistrySnafu)?;
+
+        if let Some(plugin_cache_builder) = plugins::frontend::configure_cache_registry(&plugins) {
+            layered_cache_builder =
+                layered_cache_builder.add_cache_registry(plugin_cache_builder.build());
+        }
+
+        let layered_cache_registry = Arc::new(layered_cache_builder.build());
 
         // frontend to datanode need not timeout.
         // Some queries are expected to take long time.
-        let mut channel_config = ChannelConfig {
-            timeout: None,
-            tcp_nodelay: opts.datanode.client.tcp_nodelay,
-            connect_timeout: Some(opts.datanode.client.connect_timeout),
-            ..Default::default()
-        };
+        let mut channel_config = opts.datanode.client.channel_config();
+        channel_config.timeout = None;
         if opts.grpc.flight_compression.transport_compression() {
             channel_config.accept_compression = true;
             channel_config.send_compression = true;
@@ -454,7 +474,7 @@ impl StartCommand {
         };
         let catalog_manager = builder.build();
 
-        let instance = FrontendBuilder::new(
+        let builder = FrontendBuilder::new(
             opts.clone(),
             cached_meta_backend.clone(),
             layered_cache_registry.clone(),
@@ -462,16 +482,33 @@ impl StartCommand {
             client,
             meta_client.clone(),
             process_manager,
-        )
-        .with_plugin(plugins.clone())
-        .with_local_cache_invalidator(layered_cache_registry)
-        .try_build()
-        .await
-        .context(error::StartFrontendSnafu)?;
+        );
 
-        let heartbeat_task = Some(create_heartbeat_task(&opts, meta_client, &instance));
+        plugins::setup_frontend_plugins_post_build(&mut plugins, &plugin_opts, &builder)
+            .await
+            .context(error::StartFrontendSnafu)?;
+
+        let instance = builder
+            .with_plugin(plugins.clone())
+            .with_local_cache_invalidator(layered_cache_registry)
+            .try_build()
+            .await
+            .context(error::StartFrontendSnafu)?;
 
         let instance = Arc::new(instance);
+
+        plugins::setup_frontend_heartbeat_extensions(&mut plugins, &plugin_opts, &instance)
+            .await
+            .context(error::StartFrontendSnafu)?;
+        let heartbeat_extensions = plugins
+            .get::<FrontendHeartbeatExtensions>()
+            .unwrap_or_default();
+        let heartbeat_task = Some(create_heartbeat_task_with_extensions(
+            &opts,
+            meta_client,
+            &instance,
+            heartbeat_extensions,
+        ));
 
         let servers = Services::new(opts, instance.clone(), plugins)
             .build()
@@ -492,13 +529,20 @@ pub fn create_heartbeat_task(
     meta_client: MetaClientRef,
     instance: &frontend::instance::Instance,
 ) -> HeartbeatTask {
-    let executor = Arc::new(HandlerGroupExecutor::new(vec![
-        Arc::new(ParseMailboxMessageHandler),
-        Arc::new(SuspendHandler::new(instance.suspend_state())),
-        Arc::new(InvalidateCacheHandler::new(
-            instance.cache_invalidator().clone(),
-        )),
-    ]));
+    create_heartbeat_task_with_extensions(options, meta_client, instance, Default::default())
+}
+
+fn create_heartbeat_task_with_extensions(
+    options: &frontend::frontend::FrontendOptions,
+    meta_client: MetaClientRef,
+    instance: &frontend::instance::Instance,
+    extensions: FrontendHeartbeatExtensions,
+) -> HeartbeatTask {
+    let executor = heartbeat_response_handler_executor(
+        &extensions,
+        instance.suspend_state(),
+        instance.cache_invalidator().clone(),
+    );
 
     let stat = {
         let mut stat = ResourceStatImpl::default();
@@ -506,7 +550,14 @@ pub fn create_heartbeat_task(
         Arc::new(stat)
     };
 
-    HeartbeatTask::new(options, meta_client, executor, stat)
+    HeartbeatTask::new(
+        instance.frontend_peer_addr().to_string(),
+        options,
+        meta_client,
+        executor,
+        stat,
+    )
+    .with_extensions(extensions)
 }
 
 #[cfg(test)]
@@ -515,6 +566,7 @@ mod tests {
     use std::time::Duration;
 
     use auth::{Identity, Password, UserProviderRef};
+    use clap::{CommandFactory, Parser};
     use common_base::readable_size::ReadableSize;
     use common_config::ENV_VAR_SEP;
     use common_test_util::temp_dir::create_named_temp_file;
@@ -530,8 +582,8 @@ mod tests {
             http_addr: Some("127.0.0.1:1234".to_string()),
             mysql_addr: Some("127.0.0.1:5678".to_string()),
             postgres_addr: Some("127.0.0.1:5432".to_string()),
-            internal_rpc_bind_addr: Some("127.0.0.1:4010".to_string()),
-            internal_rpc_server_addr: Some("10.0.0.24:4010".to_string()),
+            internal_grpc_bind_addr: Some("127.0.0.1:4010".to_string()),
+            internal_grpc_server_addr: Some("10.0.0.24:4010".to_string()),
             influxdb_enable: Some(false),
             disable_dashboard: Some(false),
             ..Default::default()
@@ -609,12 +661,13 @@ mod tests {
                 disable_dashboard: false,
                 ..Default::default()
             },
+            meta_client: Some(MetaClientOptions::default()),
             user_provider: Some("static_user_provider:cmd:test=test".to_string()),
             ..Default::default()
         };
 
         let mut plugins = Plugins::new();
-        plugins::setup_frontend_plugins(&mut plugins, &[], &fe_opts)
+        plugins::setup_frontend_plugins_pre_build(&mut plugins, &[], &fe_opts, None)
             .await
             .unwrap();
 
@@ -743,5 +796,98 @@ mod tests {
                 assert_eq!(fe_opts.grpc.bind_addr, GrpcOptions::default().bind_addr);
             },
         );
+    }
+
+    #[test]
+    fn test_parse_grpc_cli_aliases() {
+        let command = StartCommand::try_parse_from([
+            "frontend",
+            "--grpc-bind-addr",
+            "127.0.0.1:14001",
+            "--grpc-server-addr",
+            "10.0.0.1:14001",
+            "--internal-grpc-bind-addr",
+            "127.0.0.1:14010",
+            "--internal-grpc-server-addr",
+            "10.0.0.1:14010",
+        ])
+        .unwrap();
+        assert_eq!(command.grpc_bind_addr.as_deref(), Some("127.0.0.1:14001"));
+        assert_eq!(command.grpc_server_addr.as_deref(), Some("10.0.0.1:14001"));
+        assert_eq!(
+            command.internal_grpc_bind_addr.as_deref(),
+            Some("127.0.0.1:14010")
+        );
+        assert_eq!(
+            command.internal_grpc_server_addr.as_deref(),
+            Some("10.0.0.1:14010")
+        );
+
+        let command = StartCommand::try_parse_from([
+            "frontend",
+            "--rpc-bind-addr",
+            "127.0.0.1:24001",
+            "--rpc-server-addr",
+            "10.0.0.2:24001",
+            "--internal-rpc-bind-addr",
+            "127.0.0.1:24010",
+            "--internal-rpc-server-addr",
+            "10.0.0.2:24010",
+        ])
+        .unwrap();
+        assert_eq!(command.grpc_bind_addr.as_deref(), Some("127.0.0.1:24001"));
+        assert_eq!(command.grpc_server_addr.as_deref(), Some("10.0.0.2:24001"));
+        assert_eq!(
+            command.internal_grpc_bind_addr.as_deref(),
+            Some("127.0.0.1:24010")
+        );
+        assert_eq!(
+            command.internal_grpc_server_addr.as_deref(),
+            Some("10.0.0.2:24010")
+        );
+
+        let command = StartCommand::try_parse_from([
+            "frontend",
+            "--rpc-addr",
+            "127.0.0.1:34001",
+            "--rpc-hostname",
+            "10.0.0.3:34001",
+            "--internal-rpc-addr",
+            "127.0.0.1:34010",
+            "--internal-rpc-hostname",
+            "10.0.0.3:34010",
+        ])
+        .unwrap();
+        assert_eq!(command.grpc_bind_addr.as_deref(), Some("127.0.0.1:34001"));
+        assert_eq!(command.grpc_server_addr.as_deref(), Some("10.0.0.3:34001"));
+        assert_eq!(
+            command.internal_grpc_bind_addr.as_deref(),
+            Some("127.0.0.1:34010")
+        );
+        assert_eq!(
+            command.internal_grpc_server_addr.as_deref(),
+            Some("10.0.0.3:34010")
+        );
+    }
+
+    #[test]
+    fn test_help_uses_grpc_option_names() {
+        let mut cmd = StartCommand::command();
+        let mut help = Vec::new();
+        cmd.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("--grpc-bind-addr"));
+        assert!(help.contains("--grpc-server-addr"));
+        assert!(help.contains("--internal-grpc-bind-addr"));
+        assert!(help.contains("--internal-grpc-server-addr"));
+        assert!(!help.contains("--rpc-bind-addr"));
+        assert!(!help.contains("--rpc-server-addr"));
+        assert!(!help.contains("--rpc-addr"));
+        assert!(!help.contains("--rpc-hostname"));
+        assert!(!help.contains("--internal-rpc-bind-addr"));
+        assert!(!help.contains("--internal-rpc-server-addr"));
+        assert!(!help.contains("--internal-rpc-addr"));
+        assert!(!help.contains("--internal-rpc-hostname"));
     }
 }

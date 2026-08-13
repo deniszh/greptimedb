@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use arrow_schema::extension::ExtensionType;
 use common_meta::SchemaOptions;
-use datatypes::extension::json::JsonExtensionType;
+use datatypes::extension::json::{Json2ExtensionType, parse_legacy_json2_settings};
 use datatypes::schema::{
     COLUMN_FULLTEXT_OPT_KEY_ANALYZER, COLUMN_FULLTEXT_OPT_KEY_BACKEND,
     COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE, COLUMN_FULLTEXT_OPT_KEY_FALSE_POSITIVE_RATE,
@@ -29,16 +29,18 @@ use datatypes::schema::{
     COLUMN_VECTOR_INDEX_OPT_KEY_METRIC, COMMENT_KEY, ColumnDefaultConstraint, ColumnSchema,
     FulltextBackend, SchemaRef,
 };
+use datatypes::types::JsonFormat;
 use snafu::ResultExt;
-use sql::ast::{ColumnDef, ColumnOption, ColumnOptionDef, Expr, Ident, ObjectName};
+use sql::ast::{ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, Ident, ObjectName};
 use sql::dialect::GreptimeDbDialect;
 use sql::parser::ParserContext;
 use sql::statements::create::{Column, ColumnExtensions, CreateTable, TableConstraint};
-use sql::statements::{self, OptionMap};
+use sql::statements::{self, OptionMap, concrete_data_type_to_sql_data_type};
 use store_api::metric_engine_consts::{is_metric_engine, is_metric_engine_internal_column};
 use table::metadata::{TableInfoRef, TableMeta};
 use table::requests::{
-    COMMENT_KEY as TABLE_COMMENT_KEY, FILE_TABLE_META_KEY, TTL_KEY, WRITE_BUFFER_SIZE_KEY,
+    COMMENT_KEY as TABLE_COMMENT_KEY, FILE_TABLE_META_KEY, SKIP_WAL_KEY, TTL_KEY,
+    WRITE_BUFFER_SIZE_KEY,
 };
 
 use crate::error::{
@@ -65,13 +67,15 @@ fn create_sql_options(table_meta: &TableMeta, schema_options: Option<SchemaOptio
     {
         options.insert(TTL_KEY.to_string(), database_ttl);
     };
-
     for (k, v) in table_opts
         .extra_options
         .iter()
         .filter(|(k, _)| k != &FILE_TABLE_META_KEY)
     {
         options.insert(k.clone(), v.clone());
+    }
+    if table_opts.skip_wal {
+        options.insert(SKIP_WAL_KEY.to_string(), true.to_string());
     }
     options
 }
@@ -197,22 +201,32 @@ fn create_column(column_schema: &ColumnSchema, quote_style: char) -> Result<Colu
         extensions.inverted_index_options = Some(HashMap::new().into());
     }
 
-    if let Some(json_extension) = column_schema.extension_type::<JsonExtensionType>()? {
-        let settings = json_extension
-            .metadata()
-            .json_structure_settings
-            .clone()
-            .unwrap_or_default();
-        extensions.set_json_structure_settings(settings);
+    let mut data_type = concrete_data_type_to_sql_data_type(&column_schema.data_type)
+        .with_context(|_| ConvertSqlTypeSnafu {
+            datatype: column_schema.data_type.clone(),
+        })?;
+
+    if matches!(
+        &column_schema.data_type,
+        datatypes::data_type::ConcreteDataType::Json(json_type)
+            if matches!(json_type.format, JsonFormat::Json2(_))
+    ) {
+        data_type = DataType::Custom(ObjectName::from(vec![Ident::new("JSON2")]), vec![]);
+    }
+
+    let settings = if let Some(extension) = column_schema.extension_type::<Json2ExtensionType>()? {
+        Some(extension.metadata().json_settings().clone())
+    } else {
+        parse_legacy_json2_settings(column_schema.metadata())?
+    };
+    if let Some(settings) = settings {
+        extensions.set_json_settings(settings).context(SqlSnafu)?;
     }
 
     Ok(Column {
         column_def: ColumnDef {
             name: Ident::with_quote(quote_style, name),
-            data_type: statements::concrete_data_type_to_sql_data_type(&column_schema.data_type)
-                .with_context(|_| ConvertSqlTypeSnafu {
-                    datatype: column_schema.data_type.clone(),
-                })?,
+            data_type,
             options,
         },
         extensions,
@@ -310,6 +324,7 @@ mod tests {
     use std::time::Duration;
 
     use common_time::timestamp::TimeUnit;
+    use datatypes::extension::json::JsonExtensionType;
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::{
         FulltextOptions, Schema, SchemaRef, SkippingIndexOptions, VectorIndexOptions,
@@ -362,6 +377,7 @@ mod tests {
 
         let mut options = table::requests::TableOptions {
             ttl: Some(Duration::from_secs(30).into()),
+            skip_wal: true,
             ..Default::default()
         };
 
@@ -413,8 +429,84 @@ CREATE TABLE IF NOT EXISTS "system_metrics" (
 ENGINE=mito
 WITH(
   'compaction.type' = 'twcs',
+  skip_wal = 'true',
   ttl = '30s'
 )"#,
+            sql
+        );
+
+        let mut table_meta = info.meta.clone();
+        table_meta.options.skip_wal = false;
+        table_meta
+            .options
+            .extra_options
+            .insert(SKIP_WAL_KEY.to_string(), false.to_string());
+        assert_eq!(
+            Some("false"),
+            create_sql_options(&table_meta, None).get(SKIP_WAL_KEY)
+        );
+
+        let mut schema_options = SchemaOptions::default();
+        schema_options
+            .extra_options
+            .insert(SKIP_WAL_KEY.to_string(), true.to_string());
+        assert_eq!(
+            Some("false"),
+            create_sql_options(&table_meta, Some(schema_options)).get(SKIP_WAL_KEY)
+        );
+    }
+
+    #[test]
+    fn test_show_create_legacy_json_with_json_extension() {
+        let mut json_column = ColumnSchema::new("j", ConcreteDataType::json_datatype(), true);
+        json_column.with_extension_type(&JsonExtensionType);
+
+        let table_schema = SchemaRef::new(Schema::new(vec![
+            json_column,
+            ColumnSchema::new(
+                "ts",
+                ConcreteDataType::timestamp_datatype(TimeUnit::Millisecond),
+                false,
+            )
+            .with_time_index(true),
+        ]));
+        let table_name = "legacy_json";
+        let meta = TableMetaBuilder::empty()
+            .schema(table_schema)
+            .primary_key_indices(vec![])
+            .value_indices(vec![0])
+            .engine("mito".to_string())
+            .next_column_id(0)
+            .options(Default::default())
+            .created_on(Default::default())
+            .build()
+            .unwrap();
+
+        let info = Arc::new(
+            TableInfoBuilder::default()
+                .table_id(1024)
+                .table_version(0 as TableVersion)
+                .name(table_name)
+                .schema_name("public")
+                .catalog_name("greptime")
+                .desc(None)
+                .table_type(TableType::Base)
+                .meta(meta)
+                .build()
+                .unwrap(),
+        );
+
+        let stmt = create_table_stmt(&info, None, '"').unwrap();
+        let sql = format!("\n{}", stmt);
+        assert_eq!(
+            r#"
+CREATE TABLE IF NOT EXISTS "legacy_json" (
+  "j" JSON NULL,
+  "ts" TIMESTAMP(3) NOT NULL,
+  TIME INDEX ("ts")
+)
+ENGINE=mito
+"#,
             sql
         );
     }

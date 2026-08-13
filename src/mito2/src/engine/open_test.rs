@@ -18,24 +18,32 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use api::v1::Rows;
+use common_base::Plugins;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_recordbatch::RecordBatches;
 use either::Either;
+use store_api::logstore::LogStore;
+use store_api::logstore::provider::Provider;
 use store_api::region_engine::{RegionEngine, RegionRole, SettableRegionRoleState};
 use store_api::region_request::{
-    PathType, RegionCloseRequest, RegionOpenRequest, RegionPutRequest, RegionRequest,
+    PathType, RegionCleanUpRequest, RegionCloseRequest, RegionOpenRequest, RegionPutRequest,
+    RegionRequest,
 };
 use store_api::storage::{RegionId, ScanRequest};
 use tokio::sync::oneshot;
 
 use crate::compaction::compactor::{OpenCompactionRegionRequest, open_compaction_region};
 use crate::config::MitoConfig;
+use crate::engine::flush_test::MockRegionHook;
+use crate::engine::region_hook::RegionHookRef;
 use crate::error;
 use crate::region::opener::{PartitionExprFetcher, PartitionExprFetcherRef};
 use crate::region::options::RegionOptions;
+use crate::sst::location::region_dir_from_table_dir;
 use crate::test_util::{
-    CreateRequestBuilder, TestEnv, build_rows, flush_region, put_rows, reopen_region, rows_schema,
+    CreateRequestBuilder, LogStoreImpl, TestEnv, build_rows, flush_region, put_rows, reopen_region,
+    rows_schema,
 };
 
 #[tokio::test]
@@ -64,6 +72,7 @@ async fn test_engine_open_empty_with_format(flat_format: bool) {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -75,6 +84,278 @@ async fn test_engine_open_empty_with_format(flat_format: bool) {
     assert_eq!(StatusCode::RegionNotFound, err.status_code());
     let role = engine.role(region_id);
     assert_eq!(role, None);
+}
+
+#[tokio::test]
+async fn test_engine_offline_cleanup_closed_region() {
+    let mut env = TestEnv::with_prefix("offline-cleanup").await;
+    let engine = env.create_engine(MitoConfig::default()).await;
+
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new().build();
+    let table_dir = request.table_dir.clone();
+    let path_type = request.path_type;
+    let options = request.options.clone();
+    let region_dir = region_dir_from_table_dir(&table_dir, region_id, path_type);
+    let object_store = env.get_object_store().unwrap();
+
+    engine
+        .handle_request(region_id, RegionRequest::Create(request.clone()))
+        .await
+        .unwrap();
+    assert!(object_store.exists(&region_dir).await.unwrap());
+
+    put_rows(
+        &engine,
+        region_id,
+        Rows {
+            schema: rows_schema(&request),
+            rows: build_rows(0, 3),
+        },
+    )
+    .await;
+    let Some(LogStoreImpl::RaftEngine(log_store)) = env.get_log_store() else {
+        unreachable!()
+    };
+    let provider = Provider::raft_engine_provider(region_id.as_u64());
+    assert!(log_store.latest_entry_id(&provider).unwrap() > 0);
+
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::Close(RegionCloseRequest::default()),
+        )
+        .await
+        .unwrap();
+    assert!(!engine.is_region_exists(region_id));
+
+    let cleanup_request = RegionCleanUpRequest {
+        engine: String::new(),
+        table_dir,
+        path_type,
+        options,
+    };
+    for _ in 0..2 {
+        engine
+            .handle_request(region_id, RegionRequest::CleanUp(cleanup_request.clone()))
+            .await
+            .unwrap();
+    }
+
+    assert!(!engine.is_region_exists(region_id));
+    assert!(!object_store.exists(&region_dir).await.unwrap());
+    assert_eq!(0, log_store.latest_entry_id(&provider).unwrap());
+}
+
+#[tokio::test]
+async fn test_engine_offline_cleanup_rejects_opened_region() {
+    let mut env = TestEnv::with_prefix("offline-cleanup-opened").await;
+    let engine = env.create_engine(MitoConfig::default()).await;
+
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new().build();
+    let table_dir = request.table_dir.clone();
+    let path_type = request.path_type;
+    let options = request.options.clone();
+    let region_dir = region_dir_from_table_dir(&table_dir, region_id, path_type);
+    let object_store = env.get_object_store().unwrap();
+
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    let err = engine
+        .handle_request(
+            region_id,
+            RegionRequest::CleanUp(RegionCleanUpRequest {
+                engine: String::new(),
+                table_dir,
+                path_type,
+                options,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(StatusCode::RegionBusy, err.status_code());
+    assert!(engine.is_region_exists(region_id));
+    assert!(object_store.exists(&region_dir).await.unwrap());
+}
+
+/// Offline cleanup (soft-drop PURGE) removes the region directory directly,
+/// bypassing the drop GC worker, so it must notify extensions via
+/// `on_region_gc` — otherwise sidecar state (e.g. an Iceberg export) leaks.
+///
+/// Covers the wiring: `handle_offline_cleanup_request` fires `on_region_gc`
+/// with `is_region_dropped = true` and `full_file_listing = true` once the
+/// region dir is physically removed, and does NOT fire `on_region_files_removed`
+/// (the region is offline and carries no `RegionMetadataRef`).
+#[tokio::test]
+async fn test_engine_offline_cleanup_fires_on_region_gc() {
+    common_telemetry::init_default_ut_logging();
+    let mut env = TestEnv::with_prefix("offline-cleanup-gc-hook").await;
+
+    let hook = Arc::new(MockRegionHook::new());
+    let plugins = Plugins::new();
+    plugins.insert(hook.clone() as RegionHookRef);
+    let engine = env
+        .create_engine_with_plugins(MitoConfig::default(), plugins)
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new().build();
+    let table_dir = request.table_dir.clone();
+    let path_type = request.path_type;
+    let options = request.options.clone();
+    let region_dir = region_dir_from_table_dir(&table_dir, region_id, path_type);
+    let object_store = env.get_object_store().unwrap();
+
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+    assert!(object_store.exists(&region_dir).await.unwrap());
+
+    // Close the region first — offline cleanup refuses a still-registered region.
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::Close(RegionCloseRequest::default()),
+        )
+        .await
+        .unwrap();
+    assert!(!engine.is_region_exists(region_id));
+
+    let gc_before = hook.gc_count.load(Ordering::Relaxed);
+    let files_removed_before = hook.files_removed_count.load(Ordering::Relaxed);
+
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::CleanUp(RegionCleanUpRequest {
+                engine: String::new(),
+                table_dir,
+                path_type,
+                options,
+            }),
+        )
+        .await
+        .unwrap();
+
+    // The region directory is gone …
+    assert!(!engine.is_region_exists(region_id));
+    assert!(!object_store.exists(&region_dir).await.unwrap());
+
+    // … and the extension was notified exactly once via `on_region_gc`, with the
+    // flags that authorize full sidecar reclamation. `on_region_files_removed`
+    // must NOT fire for the offline path (no region metadata is available).
+    assert_eq!(
+        hook.gc_count.load(Ordering::Relaxed),
+        gc_before + 1,
+        "offline cleanup must fire on_region_gc"
+    );
+    assert!(
+        hook.last_gc_is_region_dropped.load(Ordering::Relaxed),
+        "on_region_gc during offline cleanup must report is_region_dropped = true"
+    );
+    assert!(
+        hook.last_gc_full_file_listing.load(Ordering::Relaxed),
+        "on_region_gc during offline cleanup must report full_file_listing = true"
+    );
+    assert_eq!(
+        hook.files_removed_count.load(Ordering::Relaxed),
+        files_removed_before,
+        "offline cleanup must not fire on_region_files_removed"
+    );
+}
+
+/// A failing `on_region_gc` during offline cleanup must surface as an error so
+/// the caller (`PurgeDroppedTableProcedure`) retries the `CleanUp`, and the
+/// retry must succeed once the hook stops failing — the handler is idempotent
+/// (it re-runs the directory removal, WAL obsolete and the hook safely).
+#[tokio::test]
+async fn test_engine_offline_cleanup_propagates_on_region_gc_error() {
+    common_telemetry::init_default_ut_logging();
+    let mut env = TestEnv::with_prefix("offline-cleanup-gc-hook-retry").await;
+
+    let hook = Arc::new(MockRegionHook::new());
+    let plugins = Plugins::new();
+    plugins.insert(hook.clone() as RegionHookRef);
+    let engine = env
+        .create_engine_with_plugins(MitoConfig::default(), plugins)
+        .await;
+
+    let region_id = RegionId::new(2, 1);
+    let request = CreateRequestBuilder::new().build();
+    let table_dir = request.table_dir.clone();
+    let path_type = request.path_type;
+    let options = request.options.clone();
+    let region_dir = region_dir_from_table_dir(&table_dir, region_id, path_type);
+    let object_store = env.get_object_store().unwrap();
+
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::Close(RegionCloseRequest::default()),
+        )
+        .await
+        .unwrap();
+
+    // Force the extension hook to fail: the offline cleanup must return the
+    // error so the caller retries, instead of swallowing it.
+    hook.gc_should_fail.store(true, Ordering::Relaxed);
+    let gc_before = hook.gc_count.load(Ordering::Relaxed);
+    let err = engine
+        .handle_request(
+            region_id,
+            RegionRequest::CleanUp(RegionCleanUpRequest {
+                engine: String::new(),
+                table_dir: table_dir.clone(),
+                path_type,
+                options: options.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.status_code(),
+        StatusCode::Unexpected,
+        "offline cleanup must propagate the on_region_gc error"
+    );
+    assert_eq!(
+        hook.gc_count.load(Ordering::Relaxed),
+        gc_before + 1,
+        "on_region_gc must fire even when it fails"
+    );
+
+    // Retry: clear the failure and the same CleanUp must now succeed. The
+    // directory removal and WAL obsolete are idempotent, so the second attempt
+    // re-runs them and the hook without complaint.
+    hook.gc_should_fail.store(false, Ordering::Relaxed);
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::CleanUp(RegionCleanUpRequest {
+                engine: String::new(),
+                table_dir,
+                path_type,
+                options,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!engine.is_region_exists(region_id));
+    assert!(!object_store.exists(&region_dir).await.unwrap());
+    assert_eq!(
+        hook.gc_count.load(Ordering::Relaxed),
+        gc_before + 2,
+        "on_region_gc must fire again on the successful retry"
+    );
 }
 
 #[tokio::test]
@@ -110,6 +391,7 @@ async fn test_engine_open_existing_with_format(flat_format: bool) {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -134,13 +416,31 @@ async fn test_engine_reopen_region_with_format(flat_format: bool) {
     let region_id = RegionId::new(1, 1);
     let request = CreateRequestBuilder::new().build();
     let table_dir = request.table_dir.clone();
+    let column_schemas = rows_schema(&request);
     engine
         .handle_request(region_id, RegionRequest::Create(request))
         .await
         .unwrap();
+    put_rows(
+        &engine,
+        region_id,
+        Rows {
+            schema: column_schemas,
+            rows: build_rows(0, 2),
+        },
+    )
+    .await;
 
     reopen_region(&engine, region_id, table_dir, false, Default::default()).await;
     assert!(engine.is_region_exists(region_id));
+
+    let scanner = engine
+        .scanner(region_id, ScanRequest::default())
+        .await
+        .unwrap();
+    let stream = scanner.scan().await.unwrap();
+    let batches = RecordBatches::try_collect(stream).await.unwrap();
+    assert_eq!(2, batches.iter().map(|b| b.num_rows()).sum::<usize>());
 }
 
 #[tokio::test]
@@ -222,7 +522,10 @@ async fn test_engine_region_open_with_options_with_format(flat_format: bool) {
 
     // Close the region.
     engine
-        .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Close(RegionCloseRequest::default()),
+        )
         .await
         .unwrap();
 
@@ -237,6 +540,7 @@ async fn test_engine_region_open_with_options_with_format(flat_format: bool) {
                 options: HashMap::from([("ttl".to_string(), "4d".to_string())]),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -282,7 +586,10 @@ async fn test_engine_region_open_with_custom_store_with_format(flat_format: bool
 
     // Close the custom region.
     engine
-        .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Close(RegionCloseRequest::default()),
+        )
         .await
         .unwrap();
 
@@ -297,6 +604,7 @@ async fn test_engine_region_open_with_custom_store_with_format(flat_format: bool
                 options: HashMap::from([("storage".to_string(), "Gcs".to_string())]),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -392,6 +700,7 @@ async fn test_open_region_skip_wal_replay_with_format(flat_format: bool) {
                 options: Default::default(),
                 skip_wal_replay: true,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -431,6 +740,7 @@ async fn test_open_region_skip_wal_replay_with_format(flat_format: bool) {
                 options: Default::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -484,6 +794,7 @@ async fn test_open_region_wait_for_opening_region_ok_with_format(flat_format: bo
                     options: HashMap::default(),
                     skip_wal_replay: false,
                     checkpoint: None,
+                    requirements: Default::default(),
                 }),
             )
             .await
@@ -535,6 +846,7 @@ async fn test_open_region_wait_for_opening_region_err_with_format(flat_format: b
                     options: HashMap::default(),
                     skip_wal_replay: false,
                     checkpoint: None,
+                    requirements: Default::default(),
                 }),
             )
             .await
@@ -599,7 +911,10 @@ async fn test_open_compaction_region_with_format(flat_format: bool) {
 
     // Close the region.
     engine
-        .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Close(RegionCloseRequest::default()),
+        )
         .await
         .unwrap();
 
@@ -611,6 +926,7 @@ async fn test_open_compaction_region_with_format(flat_format: bool) {
         path_type: PathType::Bare,
         region_options: RegionOptions::default(),
         max_parallelism: 1,
+        plugins: Plugins::new(),
     };
 
     let compaction_region = open_compaction_region(
@@ -678,7 +994,10 @@ async fn test_open_backfills_partition_expr_with_fetcher() {
 
     // close and reopen to trigger backfill in opener
     engine
-        .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Close(RegionCloseRequest::default()),
+        )
         .await
         .unwrap();
     engine
@@ -691,6 +1010,7 @@ async fn test_open_backfills_partition_expr_with_fetcher() {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -711,7 +1031,10 @@ async fn test_open_backfills_partition_expr_with_fetcher() {
 
     // reopen again to ensure no further changes and still Some
     engine
-        .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Close(RegionCloseRequest::default()),
+        )
         .await
         .unwrap();
     let engine = env.reopen_engine(engine, MitoConfig::default()).await;
@@ -725,6 +1048,7 @@ async fn test_open_backfills_partition_expr_with_fetcher() {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -752,7 +1076,10 @@ async fn test_open_keeps_none_without_fetcher() {
     assert!(meta.partition_expr.is_none());
 
     engine
-        .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Close(RegionCloseRequest::default()),
+        )
         .await
         .unwrap();
     let engine = env.reopen_engine(engine, MitoConfig::default()).await;
@@ -766,6 +1093,7 @@ async fn test_open_keeps_none_without_fetcher() {
                 options: HashMap::default(),
                 skip_wal_replay: false,
                 checkpoint: None,
+                requirements: Default::default(),
             }),
         )
         .await
@@ -773,4 +1101,37 @@ async fn test_open_keeps_none_without_fetcher() {
 
     let meta = engine.get_region(region_id).unwrap().metadata();
     assert!(meta.partition_expr.is_none());
+}
+
+#[tokio::test]
+async fn test_region_hook_on_open() {
+    common_telemetry::init_default_ut_logging();
+    let mut env = TestEnv::with_prefix("open_hook").await;
+
+    let hook = Arc::new(MockRegionHook::new());
+    let plugins = Plugins::new();
+    plugins.insert(hook.clone() as RegionHookRef);
+
+    let engine = env
+        .create_engine_with_plugins(MitoConfig::default(), plugins)
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new().build();
+    let table_dir = request.table_dir.clone();
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    // Creating a region fires on_region_opened exactly once.
+    assert_eq!(hook.opened_count.load(Ordering::Relaxed), 1);
+    assert_eq!(hook.closed_count.load(Ordering::Relaxed), 0);
+
+    // `reopen_region` closes then opens; the open must fire the hook again.
+    reopen_region(&engine, region_id, table_dir, false, Default::default()).await;
+
+    assert_eq!(hook.opened_count.load(Ordering::Relaxed), 2);
+    assert_eq!(hook.closed_count.load(Ordering::Relaxed), 1);
+    assert_eq!(hook.dropped_count.load(Ordering::Relaxed), 0);
 }

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common_meta::peer::Peer;
+use common_procedure::ProcedureContext;
 use common_telemetry::init_default_ut_logging;
 use store_api::region_engine::RegionRole;
 use store_api::storage::{FileId, FileRefsManifest, GcReport, RegionId};
@@ -68,6 +69,7 @@ async fn test_full_file_listing_first_time_gc() {
 
     let scheduler = GcScheduler {
         ctx: ctx.clone(),
+        runtime_switch_manager: crate::gc::scheduler::new_test_runtime_switch_manager(),
         receiver: GcScheduler::channel().1,
         config,
         region_gc_tracker: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -81,6 +83,7 @@ async fn test_full_file_listing_first_time_gc() {
             vec![(table_id, mock_candidate(region_id))],
             HashSet::new(),
             HashMap::new(),
+            ProcedureContext::default(),
         )
         .await
         .unwrap();
@@ -140,6 +143,7 @@ async fn test_full_file_listing_interval_enforcement() {
 
     let scheduler = GcScheduler {
         ctx: ctx.clone(),
+        runtime_switch_manager: crate::gc::scheduler::new_test_runtime_switch_manager(),
         receiver: GcScheduler::channel().1,
         config,
         region_gc_tracker: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -153,6 +157,7 @@ async fn test_full_file_listing_interval_enforcement() {
             vec![(table_id, mock_candidate(region_id))],
             HashSet::new(),
             HashMap::new(),
+            ProcedureContext::default(),
         )
         .await
         .unwrap();
@@ -179,6 +184,7 @@ async fn test_full_file_listing_interval_enforcement() {
             vec![(table_id, mock_candidate(region_id))],
             HashSet::new(),
             HashMap::new(),
+            ProcedureContext::default(),
         )
         .await
         .unwrap();
@@ -240,6 +246,7 @@ async fn test_full_file_listing_no_interval_passed() {
 
     let scheduler = GcScheduler {
         ctx: ctx.clone(),
+        runtime_switch_manager: crate::gc::scheduler::new_test_runtime_switch_manager(),
         receiver: GcScheduler::channel().1,
         config,
         region_gc_tracker: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -253,6 +260,7 @@ async fn test_full_file_listing_no_interval_passed() {
             vec![(table_id, mock_candidate(region_id))],
             HashSet::new(),
             HashMap::new(),
+            ProcedureContext::default(),
         )
         .await
         .unwrap();
@@ -276,6 +284,7 @@ async fn test_full_file_listing_no_interval_passed() {
             vec![(table_id, mock_candidate(region_id))],
             HashSet::new(),
             HashMap::new(),
+            ProcedureContext::default(),
         )
         .await
         .unwrap();

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use api::v1::meta::{DatanodeWorkloads, HeartbeatRequest, RequestHeader};
@@ -100,6 +100,14 @@ pub struct RegionStat {
     pub region_manifest: RegionManifestInfo,
     /// The total bytes written of the region since region opened.
     pub written_bytes: u64,
+    /// The total query CPU time of the region since region opened.
+    ///
+    /// Unit: nanoseconds.
+    #[serde(default)]
+    pub query_cpu_time: u64,
+    /// The total scanned bytes of the region since region opened.
+    #[serde(default)]
+    pub query_scanned_bytes: u64,
     /// The latest entry id of topic used by data.
     /// **Only used by remote WAL prune.**
     pub data_topic_latest_entry_id: u64,
@@ -317,6 +325,8 @@ impl From<&api::v1::meta::RegionStat> for RegionStat {
             index_size: region_stat.index_size,
             region_manifest: region_stat.manifest.into(),
             written_bytes: region_stat.written_bytes,
+            query_cpu_time: region_stat.query_cpu_time,
+            query_scanned_bytes: region_stat.query_scanned_bytes,
             data_topic_latest_entry_id: region_stat.data_topic_latest_entry_id,
             metadata_topic_latest_entry_id: region_stat.metadata_topic_latest_entry_id,
         }
@@ -362,6 +372,48 @@ impl GcStat {
     ) -> Result<Option<Self>> {
         extensions
             .get(Self::GC_STAT_KEY)
+            .map(|bytes| {
+                serde_json::from_slice(bytes).with_context(|_| DeserializeFromJsonSnafu {
+                    input: String::from_utf8_lossy(bytes).to_string(),
+                })
+            })
+            .transpose()
+    }
+}
+
+/// Environment variables reported by a node in heartbeat messages.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EnvVars {
+    pub vars: HashMap<String, String>,
+}
+
+impl EnvVars {
+    pub const ENV_VARS_KEY: &str = "__env_vars";
+
+    pub fn new(vars: HashMap<String, String>) -> Self {
+        Self { vars }
+    }
+
+    /// Read the configured env var keys from the environment and build an EnvVars.
+    pub fn from_config(keys: &[String]) -> Self {
+        let vars = keys
+            .iter()
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key.clone(), value)))
+            .collect();
+        Self { vars }
+    }
+
+    pub fn into_extensions(&self, extensions: &mut HashMap<String, Vec<u8>>) {
+        if self.vars.is_empty() {
+            return;
+        }
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        extensions.insert(Self::ENV_VARS_KEY.to_string(), bytes);
+    }
+
+    pub fn from_extensions(extensions: &HashMap<String, Vec<u8>>) -> Result<Option<Self>> {
+        extensions
+            .get(Self::ENV_VARS_KEY)
             .map(|bytes| {
                 serde_json::from_slice(bytes).with_context(|_| DeserializeFromJsonSnafu {
                     input: String::from_utf8_lossy(bytes).to_string(),
@@ -514,6 +566,48 @@ mod tests {
     }
 
     #[test]
+    fn test_stat_val_deserializes_without_query_stats() {
+        let stat = Stat {
+            region_stats: vec![RegionStat {
+                id: RegionId::new(1024, 1),
+                rcus: 0,
+                wcus: 0,
+                approximate_bytes: 0,
+                engine: "mito".to_string(),
+                role: RegionRole::Leader,
+                num_rows: 0,
+                memtable_size: 0,
+                manifest_size: 0,
+                sst_size: 0,
+                sst_num: 0,
+                index_size: 0,
+                region_manifest: RegionManifestInfo::Mito {
+                    manifest_version: 0,
+                    flushed_entry_id: 0,
+                    file_removed_cnt: 0,
+                },
+                written_bytes: 0,
+                query_cpu_time: 10,
+                query_scanned_bytes: 20,
+                data_topic_latest_entry_id: 0,
+                metadata_topic_latest_entry_id: 0,
+            }],
+            ..Default::default()
+        };
+        let stat_val = DatanodeStatValue { stats: vec![stat] };
+        let mut value = serde_json::to_value(stat_val).unwrap();
+        let region_stat = value[0]["region_stats"][0].as_object_mut().unwrap();
+        region_stat.remove("query_cpu_time");
+        region_stat.remove("query_scanned_bytes");
+
+        let stat_val: DatanodeStatValue = serde_json::from_value(value).unwrap();
+        let region_stat = &stat_val.stats[0].region_stats[0];
+
+        assert_eq!(region_stat.query_cpu_time, 0);
+        assert_eq!(region_stat.query_scanned_bytes, 0);
+    }
+
+    #[test]
     fn test_get_addr_from_stat_val() {
         let empty = DatanodeStatValue { stats: vec![] };
         let addr = empty.node_addr();
@@ -572,5 +666,58 @@ mod tests {
         };
         let region_num = stat_val.region_num().unwrap();
         assert_eq!(2, region_num);
+    }
+
+    #[test]
+    fn test_region_stat_from_heartbeat_preserves_staging_leader_role() {
+        let request = HeartbeatRequest {
+            header: Some(RequestHeader::default()),
+            peer: Some(api::v1::meta::Peer {
+                id: 1,
+                addr: "127.0.0.1:3001".to_string(),
+            }),
+            region_stats: vec![api::v1::meta::RegionStat {
+                region_id: RegionId::new(1024, 1).as_u64(),
+                engine: "mito".to_string(),
+                role: api::v1::meta::RegionRole::StagingLeader.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let stat = Stat::try_from(&request).unwrap();
+
+        assert_eq!(stat.region_stats.len(), 1);
+        assert_eq!(stat.region_stats[0].role, RegionRole::StagingLeader);
+    }
+
+    #[test]
+    fn test_env_vars_round_trip() {
+        let mut vars = HashMap::new();
+        vars.insert("AZ".to_string(), "us-east-1a".to_string());
+        vars.insert("REGION".to_string(), "us-east-1".to_string());
+        let env_vars = EnvVars::new(vars);
+
+        let mut extensions = HashMap::new();
+        env_vars.into_extensions(&mut extensions);
+
+        let extracted = EnvVars::from_extensions(&extensions).unwrap().unwrap();
+        assert_eq!(extracted.vars.get("AZ").unwrap(), "us-east-1a");
+        assert_eq!(extracted.vars.get("REGION").unwrap(), "us-east-1");
+    }
+
+    #[test]
+    fn test_env_vars_empty_not_written() {
+        let env_vars = EnvVars::default();
+        let mut extensions = HashMap::new();
+        env_vars.into_extensions(&mut extensions);
+        assert!(extensions.is_empty());
+    }
+
+    #[test]
+    fn test_env_vars_from_extensions_missing() {
+        let extensions = HashMap::new();
+        let result = EnvVars::from_extensions(&extensions).unwrap();
+        assert!(result.is_none());
     }
 }

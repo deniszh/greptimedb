@@ -39,8 +39,7 @@ use api::helper::ColumnDataTypeWrapper;
 use api::v1::SemanticType;
 use common_sql::default_constraint::parse_column_default_constraint;
 use common_time::timezone::Timezone;
-use datatypes::extension::json::{JsonExtensionType, JsonMetadata};
-use datatypes::json::JsonStructureSettings;
+use datatypes::extension::json::{Json2ExtensionType, JsonMetadata};
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{COMMENT_KEY, ColumnDefaultConstraint, ColumnSchema};
 use datatypes::types::json_type::JsonNativeType;
@@ -55,14 +54,15 @@ use crate::ast::{
 };
 use crate::error::{
     self, ConvertToGrpcDataTypeSnafu, ConvertValueSnafu, Result,
-    SerializeColumnDefaultConstraintSnafu, SetFulltextOptionSnafu, SetJsonStructureSettingsSnafu,
-    SetSkippingIndexOptionSnafu, SetVectorIndexOptionSnafu, SqlCommonSnafu,
+    SerializeColumnDefaultConstraintSnafu, SetFulltextOptionSnafu, SetSkippingIndexOptionSnafu,
+    SetVectorIndexOptionSnafu, SqlCommonSnafu,
 };
-use crate::statements::create::{Column, ColumnExtensions};
+use crate::statements::create::Column;
 pub use crate::statements::option_map::OptionMap;
 pub(crate) use crate::statements::transform::transform_statements;
 
 const VECTOR_TYPE_NAME: &str = "VECTOR";
+const JSON2_TYPE_NAME: &str = "JSON2";
 
 pub fn value_to_sql_value(val: &Value) -> Result<SqlValue> {
     Ok(match val {
@@ -109,7 +109,7 @@ pub fn column_to_schema(
         && !is_time_index;
 
     let name = column.name().value.clone();
-    let data_type = sql_data_type_to_concrete_data_type(column.data_type(), &column.extensions)?;
+    let data_type = sql_data_type_to_concrete_data_type(column.data_type())?;
     let default_constraint =
         parse_column_default_constraint(&name, &data_type, column.options(), timezone)
             .context(SqlCommonSnafu)?;
@@ -153,19 +153,19 @@ pub fn column_to_schema(
 
     column_schema.set_inverted_index(column.extensions.inverted_index_options.is_some());
 
-    if matches!(column.data_type(), SqlDataType::JSON) {
-        let settings = column
-            .extensions
-            .build_json_structure_settings()?
-            .unwrap_or_default();
-        let extension = JsonExtensionType::new(Arc::new(JsonMetadata {
-            json_structure_settings: Some(settings.clone()),
-        }));
-        column_schema
-            .with_extension_type(&extension)
-            .with_context(|_| SetJsonStructureSettingsSnafu {
-                value: format!("{settings:?}"),
-            })?;
+    let is_json2_column = if let SqlDataType::Custom(object_name, _) = column.data_type() {
+        object_name
+            .0
+            .first()
+            .map(|x| x.to_string_unquoted().eq_ignore_ascii_case(JSON2_TYPE_NAME))
+            .unwrap_or_default()
+    } else {
+        false
+    };
+    if is_json2_column {
+        let settings = column.extensions.build_json_settings()?.unwrap_or_default();
+        let extension = Json2ExtensionType::new(Arc::new(JsonMetadata::new(settings)));
+        column_schema.with_extension_type(&extension);
     }
 
     Ok(column_schema)
@@ -177,7 +177,7 @@ pub fn sql_column_def_to_grpc_column_def(
     timezone: Option<&Timezone>,
 ) -> Result<api::v1::ColumnDef> {
     let name = col.name.value.clone();
-    let data_type = sql_data_type_to_concrete_data_type(&col.data_type, &Default::default())?;
+    let data_type = sql_data_type_to_concrete_data_type(&col.data_type)?;
 
     let is_nullable = col
         .options
@@ -218,10 +218,7 @@ pub fn sql_column_def_to_grpc_column_def(
     })
 }
 
-pub fn sql_data_type_to_concrete_data_type(
-    data_type: &SqlDataType,
-    column_extensions: &ColumnExtensions,
-) -> Result<ConcreteDataType> {
+pub fn sql_data_type_to_concrete_data_type(data_type: &SqlDataType) -> Result<ConcreteDataType> {
     match data_type {
         SqlDataType::BigInt(_) | SqlDataType::Int64 => Ok(ConcreteDataType::int64_datatype()),
         SqlDataType::BigIntUnsigned(_) => Ok(ConcreteDataType::uint64_datatype()),
@@ -273,39 +270,32 @@ pub fn sql_data_type_to_concrete_data_type(
                 Ok(ConcreteDataType::decimal128_datatype(*p as u8, *s as i8))
             }
         },
-        SqlDataType::JSON => {
-            let format = if let Some(x) = column_extensions.build_json_structure_settings()? {
-                if let Some(fields) = match x {
-                    JsonStructureSettings::Structured(fields) => fields,
-                    JsonStructureSettings::UnstructuredRaw => None,
-                    JsonStructureSettings::PartialUnstructuredByKey { fields, .. } => fields,
-                } {
-                    let datatype = &ConcreteDataType::Struct(fields);
-                    JsonFormat::Native(Box::new(datatype.into()))
-                } else {
-                    JsonFormat::Native(Box::new(JsonNativeType::Null))
+        SqlDataType::JSON => Ok(ConcreteDataType::Json(JsonType::new(JsonFormat::Jsonb))),
+        // Vector type and JSON2 type
+        SqlDataType::Custom(name, args) if name.0.len() == 1 => {
+            let name = name.0[0].to_string_unquoted().to_ascii_uppercase();
+            match name.as_str() {
+                VECTOR_TYPE_NAME if args.len() == 1 => {
+                    let dim = &args[0];
+                    let dim = dim.parse().map_err(|e| {
+                        error::ParseSqlValueSnafu {
+                            msg: format!("Failed to parse vector dimension '{}': {}", dim, e),
+                        }
+                        .build()
+                    })?;
+                    Ok(ConcreteDataType::vector_datatype(dim))
                 }
-            } else {
-                JsonFormat::Jsonb
-            };
-            Ok(ConcreteDataType::Json(JsonType::new(format)))
-        }
-        // Vector type
-        SqlDataType::Custom(name, d)
-            if name.0.as_slice().len() == 1
-                && name.0.as_slice()[0]
-                    .to_string_unquoted()
-                    .to_ascii_uppercase()
-                    == VECTOR_TYPE_NAME
-                && d.len() == 1 =>
-        {
-            let dim = d[0].parse().map_err(|e| {
-                error::ParseSqlValueSnafu {
-                    msg: format!("Failed to parse vector dimension: {}", e),
+                JSON2_TYPE_NAME if args.is_empty() => {
+                    // Currently, JSON2 is not inferred as any native type initially.
+                    // TODO(fys): infer it later from type hints.
+                    let format = JsonFormat::Json2(Arc::new(JsonNativeType::Null));
+                    Ok(ConcreteDataType::Json(JsonType::new(format)))
                 }
-                .build()
-            })?;
-            Ok(ConcreteDataType::vector_datatype(dim))
+                _ => error::SqlTypeNotSupportedSnafu {
+                    t: data_type.clone(),
+                }
+                .fail(),
+            }
         }
         _ => error::SqlTypeNotSupportedSnafu {
             t: data_type.clone(),
@@ -377,7 +367,7 @@ mod tests {
     fn check_type(sql_type: SqlDataType, data_type: ConcreteDataType) {
         assert_eq!(
             data_type,
-            sql_data_type_to_concrete_data_type(&sql_type, &Default::default()).unwrap()
+            sql_data_type_to_concrete_data_type(&sql_type).unwrap()
         );
     }
 
@@ -731,7 +721,7 @@ mod tests {
                 vector_options: None,
                 skipping_index_options: None,
                 inverted_index_options: None,
-                json_datatype_options: None,
+                json_type_hints: vec![],
                 vector_index_options: None,
             },
         };
@@ -763,7 +753,7 @@ mod tests {
                 vector_options: None,
                 skipping_index_options: None,
                 inverted_index_options: None,
-                json_datatype_options: None,
+                json_type_hints: vec![],
                 vector_index_options: Some(OptionMap::from([
                     ("metric".to_string(), "cosine".to_string()),
                     ("connectivity".to_string(), "32".to_string()),
@@ -804,7 +794,7 @@ mod tests {
                 vector_options: None,
                 skipping_index_options: None,
                 inverted_index_options: None,
-                json_datatype_options: None,
+                json_type_hints: vec![],
                 vector_index_options: Some(OptionMap::default()),
             },
         };

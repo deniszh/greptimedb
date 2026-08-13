@@ -37,7 +37,8 @@ use crate::procedure::repartition::group::utils::{
     HandleMultipleResult, group_region_routes_by_peer, handle_multiple_results,
 };
 use crate::procedure::repartition::group::{Context, State};
-use crate::procedure::repartition::plan::RegionDescriptor;
+use crate::procedure::repartition::plan::TargetRegionDescriptor;
+use crate::procedure::utils::instruction_error_result;
 use crate::service::mailbox::{Channel, MailboxRef};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -75,7 +76,7 @@ impl ApplyStagingManifest {
     fn build_apply_staging_manifest_instructions(
         staging_manifest_paths: &HashMap<RegionId, String>,
         target_routes: &[RegionRoute],
-        targets: &[RegionDescriptor],
+        targets: &[TargetRegionDescriptor],
         central_region_id: RegionId,
     ) -> Result<ApplyStagingManifestInstructions> {
         let target_partition_expr_by_region = targets
@@ -332,7 +333,14 @@ impl ApplyStagingManifest {
                 );
 
                 Ok(())
-            }
+            },
+            Err(error::Error::MailboxChannelClosed {..})=> error::RetryLaterSnafu {
+                reason: format!(
+                    "Mailbox closed when sending apply staging manifests to datanode {:?}, elapsed: {:?}",
+                    peer,
+                    now.elapsed()
+                ),
+            }.fail()?,
             Err(error::Error::MailboxTimeout { .. }) => {
                 let reason = format!(
                     "Mailbox received timeout for apply staging manifests on datanode {:?}, elapsed: {:?}",
@@ -367,16 +375,16 @@ impl ApplyStagingManifest {
             }
         );
 
-        if error.is_some() {
-            return error::RetryLaterSnafu {
-                reason: format!(
+        if let Some(error) = error {
+            return instruction_error_result(
+                error,
+                format!(
                     "Failed to apply staging manifest on datanode {:?}, error: {:?}, elapsed: {:?}",
                     peer,
                     error,
                     now.elapsed()
                 ),
-            }
-            .fail();
+            );
         }
 
         ensure!(

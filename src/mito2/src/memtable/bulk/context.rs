@@ -25,10 +25,11 @@ use store_api::storage::ColumnId;
 use table::predicate::Predicate;
 
 use crate::error::Result;
+use crate::read::read_columns::ReadColumns;
+use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::file_range::{PreFilterMode, RangeBase};
-use crate::sst::parquet::format::ReadFormat;
-use crate::sst::parquet::prefilter::CachedPrimaryKeyFilter;
-use crate::sst::parquet::reader::SimpleFilterContext;
+use crate::sst::parquet::flat_format::FlatReadFormat;
+use crate::sst::parquet::prefilter::{CachedPrimaryKeyFilter, build_bulk_filter_plan};
 use crate::sst::parquet::stats::RowGroupPruningStats;
 
 pub(crate) type BulkIterContextRef = Arc<BulkIterContext>;
@@ -39,6 +40,7 @@ pub struct BulkIterContext {
     /// Pre-extracted primary key filters for PK prefiltering.
     /// `None` if PK prefiltering is not applicable.
     pk_filters: Option<Arc<Vec<SimpleFilterEvaluator>>>,
+    batch_size: usize,
 }
 
 impl BulkIterContext {
@@ -47,6 +49,7 @@ impl BulkIterContext {
         projection: Option<&[ColumnId]>,
         predicate: Option<Predicate>,
         skip_auto_convert: bool,
+        batch_size: usize,
     ) -> Result<Self> {
         Self::new_with_pre_filter_mode(
             region_metadata,
@@ -54,6 +57,7 @@ impl BulkIterContext {
             predicate,
             skip_auto_convert,
             PreFilterMode::All,
+            batch_size,
         )
     }
 
@@ -63,24 +67,23 @@ impl BulkIterContext {
         predicate: Option<Predicate>,
         skip_auto_convert: bool,
         pre_filter_mode: PreFilterMode,
+        batch_size: usize,
     ) -> Result<Self> {
         let codec = build_primary_key_codec(&region_metadata);
 
-        let simple_filters: Vec<SimpleFilterContext> = predicate
-            .as_ref()
-            .iter()
-            .flat_map(|predicate| {
-                predicate
-                    .exprs()
+        let read_cols = if let Some(col_ids) = projection {
+            ReadColumns::from_deduped_column_ids(col_ids.iter().copied())
+        } else {
+            ReadColumns::from_deduped_column_ids(
+                region_metadata
+                    .column_metadatas
                     .iter()
-                    .filter_map(|expr| SimpleFilterContext::new_opt(&region_metadata, None, expr))
-            })
-            .collect();
-
-        let read_format = ReadFormat::new(
+                    .map(|col| col.column_id),
+            )
+        };
+        let read_format = FlatReadFormat::new(
             region_metadata.clone(),
-            projection,
-            true,
+            read_cols,
             None,
             "memtable",
             skip_auto_convert,
@@ -91,12 +94,11 @@ impl BulkIterContext {
             .map(|pred| pred.dyn_filters().as_ref().clone())
             .unwrap_or_default();
 
-        // Pre-extract PK filters if applicable.
-        let pk_filters = Self::extract_pk_filters(&read_format, &simple_filters);
+        let filter_plan = build_bulk_filter_plan(&read_format, predicate.as_ref());
 
         Ok(Self {
             base: RangeBase {
-                filters: simple_filters,
+                filters: filter_plan.remaining_simple_filters,
                 dyn_filters,
                 read_format,
                 prune_schema: region_metadata.schema.clone(),
@@ -109,8 +111,13 @@ impl BulkIterContext {
                 partition_filter: None,
             },
             predicate,
-            pk_filters,
+            pk_filters: filter_plan.pk_filters,
+            batch_size: batch_size.clamp(1, DEFAULT_READ_BATCH_SIZE),
         })
+    }
+
+    pub(crate) fn batch_size(&self) -> usize {
+        self.batch_size
     }
 
     /// Prunes row groups by stats.
@@ -141,45 +148,19 @@ impl BulkIterContext {
         }
     }
 
-    /// Extracts PK filters if flat format with dictionary-encoded PKs is used.
-    fn extract_pk_filters(
-        read_format: &ReadFormat,
-        filters: &[SimpleFilterContext],
-    ) -> Option<Arc<Vec<SimpleFilterEvaluator>>> {
-        let flat_format = read_format.as_flat()?;
-        if flat_format.batch_has_raw_pk_columns() {
-            return None;
-        }
-        let metadata = read_format.metadata();
-        if metadata.primary_key.is_empty() {
-            return None;
-        }
-
-        let pk_filters: Vec<_> = filters
-            .iter()
-            .filter_map(|f| f.primary_key_prefilter())
-            .collect();
-        if pk_filters.is_empty() {
-            return None;
-        }
-
-        Some(Arc::new(pk_filters))
-    }
-
     /// Builds a fresh PK filter for a new iterator. Returns `None` if PK
     /// prefiltering is not applicable.
     pub(crate) fn build_pk_filter(&self) -> Option<CachedPrimaryKeyFilter> {
         let pk_filters = self.pk_filters.as_ref()?;
         let metadata = self.base.read_format.metadata();
-        // Parquet PK prefilter always supports the partition column.
         let inner = self
             .base
             .codec
-            .primary_key_filter(metadata, Arc::clone(pk_filters), false);
+            .primary_key_filter(metadata, Arc::clone(pk_filters));
         Some(CachedPrimaryKeyFilter::new(inner))
     }
 
-    pub(crate) fn read_format(&self) -> &ReadFormat {
+    pub(crate) fn read_format(&self) -> &FlatReadFormat {
         &self.base.read_format
     }
 

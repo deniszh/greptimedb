@@ -28,6 +28,7 @@ use crate::error::{self, Result};
 use crate::handler::HeartbeatMailbox;
 use crate::procedure::region_migration::migration_end::RegionMigrationEnd;
 use crate::procedure::region_migration::{Context, State};
+use crate::procedure::utils::instruction_error_result;
 use crate::service::mailbox::Channel;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -39,7 +40,7 @@ impl State for CloseDowngradedRegion {
     async fn next(
         &mut self,
         ctx: &mut Context,
-        _procedure_ctx: &ProcedureContext,
+        procedure_ctx: &ProcedureContext,
     ) -> Result<(Box<dyn State>, Status)> {
         if let Err(err) = self.close_downgraded_leader_region(ctx).await {
             let downgrade_leader_datanode = &ctx.persistent_ctx.from_peer;
@@ -51,7 +52,7 @@ impl State for CloseDowngradedRegion {
             ctx.persistent_ctx.region_ids,
             ctx.persistent_ctx.from_peer,
             ctx.persistent_ctx.to_peer,
-            ctx.persistent_ctx.trigger_reason,
+            ctx.trigger_reason(procedure_ctx.event_context.as_ref()),
             ctx.volatile_ctx.metrics,
         );
         Ok((Box::new(RegionMigrationEnd), Status::done()))
@@ -131,10 +132,18 @@ impl CloseDowngradedRegion {
 
                 if result {
                     Ok(())
+                } else if let Some(error) = error {
+                    instruction_error_result(
+                        &error,
+                        format!(
+                            "Failed to close downgraded leader region: {region_ids:?} on datanode {:?}, error: {error:?}",
+                            downgrade_leader_datanode,
+                        ),
+                    )
                 } else {
                     error::UnexpectedSnafu {
                         violated: format!(
-                            "Failed to close downgraded leader region: {region_ids:?} on datanode {:?}, error: {error:?}",
+                            "Failed to close downgraded leader region: {region_ids:?} on datanode {:?}",
                             downgrade_leader_datanode,
                         ),
                     }

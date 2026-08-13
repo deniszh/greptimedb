@@ -15,10 +15,11 @@
 use std::any::Any;
 
 use arrow_schema::ArrowError;
-use common_error::ext::ErrorExt;
+use common_error::ext::{ErrorExt, RetryHint, retry_hint_from_io_error};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use datafusion::parquet::errors::ParquetError;
+use object_store::error::retry_hint_from_opendal_error;
 use snafu::{Location, Snafu};
 use url::ParseError;
 
@@ -60,6 +61,62 @@ pub enum Error {
         url: String,
         #[snafu(source)]
         error: ParseError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "SQL access to the local filesystem is disabled for '{}'; use S3, OSS, GCS, or AzBlob instead",
+        path
+    ))]
+    LocalFileAccessDisabled {
+        path: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Local filesystem path '{}' is outside the configured copy root or is unsafe: {}; use a path relative to the copy root or use S3, OSS, GCS, or AzBlob",
+        path,
+        reason
+    ))]
+    LocalFileAccessDenied {
+        path: String,
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Local filesystem path '{}' does not exist within the configured copy root",
+        path
+    ))]
+    LocalFilePathNotFound {
+        path: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Location must include a file or object name: '{}'", path))]
+    MissingObjectName {
+        path: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Invalid local filesystem root '{}'", root))]
+    InvalidLocalFileRoot {
+        root: String,
+        #[snafu(source)]
+        error: std::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Invalid local filesystem root '{}': {}", root, reason))]
+    InvalidLocalFileRootConfig {
+        root: String,
+        reason: String,
         #[snafu(implicit)]
         location: Location,
     },
@@ -230,6 +287,12 @@ impl ErrorExt for Error {
             | UnsupportedFormat { .. }
             | InvalidConnection { .. }
             | InvalidUrl { .. }
+            | LocalFileAccessDisabled { .. }
+            | LocalFileAccessDenied { .. }
+            | LocalFilePathNotFound { .. }
+            | MissingObjectName { .. }
+            | InvalidLocalFileRoot { .. }
+            | InvalidLocalFileRootConfig { .. }
             | EmptyHostPath { .. }
             | InferSchema { .. }
             | ReadParquetSnafu { .. }
@@ -249,5 +312,19 @@ impl ErrorExt for Error {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn retry_hint(&self) -> RetryHint {
+        use Error::*;
+
+        match self {
+            BuildBackend { error, .. }
+            | ListObjects { error, .. }
+            | ReadObject { error, .. }
+            | WriteObject { error, .. } => retry_hint_from_opendal_error(error),
+            AsyncWrite { error, .. } => retry_hint_from_io_error(error),
+            WriteParquet { .. } => RetryHint::Retryable,
+            _ => RetryHint::NonRetryable,
+        }
     }
 }

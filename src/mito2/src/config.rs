@@ -29,7 +29,6 @@ use serde_with::serde_as;
 use crate::cache::file_cache::DEFAULT_INDEX_CACHE_PERCENT;
 use crate::error::Result;
 use crate::gc::GcConfig;
-use crate::memtable::MemtableConfig;
 use crate::sst::DEFAULT_WRITE_BUFFER_SIZE;
 
 const MULTIPART_UPLOAD_MINIMUM_SIZE: ReadableSize = ReadableSize::mb(5);
@@ -39,7 +38,11 @@ pub(crate) const DEFAULT_MAX_CONCURRENT_SCAN_FILES: usize = 384;
 // Use `1/GLOBAL_WRITE_BUFFER_SIZE_FACTOR` of OS memory as global write buffer size in default mode
 const GLOBAL_WRITE_BUFFER_SIZE_FACTOR: u64 = 8;
 /// Use `1/SST_META_CACHE_SIZE_FACTOR` of OS memory size as SST meta cache size in default mode
-const SST_META_CACHE_SIZE_FACTOR: u64 = 32;
+const SST_META_CACHE_SIZE_FACTOR: u64 = 8;
+/// Use `1/PREFILTER_RESULT_CACHE_SIZE_FACTOR` of OS memory size as prefilter result cache size in default mode
+const PREFILTER_RESULT_CACHE_SIZE_FACTOR: u64 = 32;
+/// Use `1/INDEX_METADATA_CACHE_SIZE_FACTOR` of OS memory size as index metadata cache size in default mode
+const INDEX_METADATA_CACHE_SIZE_FACTOR: u64 = 32;
 /// Use `1/MEM_CACHE_SIZE_FACTOR` of OS memory size as mem cache size in default mode
 const MEM_CACHE_SIZE_FACTOR: u64 = 16;
 /// Use `1/PAGE_CACHE_SIZE_FACTOR` of OS memory size as page cache size in default mode
@@ -91,7 +94,9 @@ pub struct MitoConfig {
     pub max_background_compactions: usize,
     /// Max number of running background purge jobs (default: number of cpu cores).
     pub max_background_purges: usize,
-    /// Memory budget for compaction tasks. Setting it to 0 or "unlimited" disables the limit.
+    /// Memory budget for compaction tasks.
+    /// Supports absolute size (e.g., "2GiB", "512MB") or percentage of system memory (e.g., "50%").
+    /// Setting it to 0 or "unlimited" disables the limit.
     pub experimental_compaction_memory_limit: MemoryLimit,
     /// Behavior when compaction cannot acquire memory from the budget.
     pub experimental_compaction_on_exhausted: OnExhaustedPolicy,
@@ -104,6 +109,10 @@ pub struct MitoConfig {
     pub global_write_buffer_size: ReadableSize,
     /// Global write buffer size threshold to reject write requests.
     pub global_write_buffer_reject_size: ReadableSize,
+    /// Default write buffer size for each region. Regions stall at this size and
+    /// reject writes at twice this size. Setting it to 0 disables both limits
+    /// unless the table specifies `write_buffer_size`.
+    pub default_region_write_buffer_size: ReadableSize,
 
     // Cache configs:
     /// Cache size for SST metadata. Setting it to 0 to disable the cache.
@@ -116,6 +125,8 @@ pub struct MitoConfig {
     pub selector_result_cache_size: ReadableSize,
     /// Cache size for flat range scan results. Setting it to 0 to disable the cache.
     pub range_result_cache_size: ReadableSize,
+    /// Cache size for prefilter results. Setting it to 0 to disable the cache.
+    pub prefilter_result_cache_size: ReadableSize,
     /// Whether to enable the write cache.
     pub enable_write_cache: bool,
     /// File system path for write cache dir's root, defaults to `{data_home}`.
@@ -144,8 +155,9 @@ pub struct MitoConfig {
     pub max_concurrent_scan_files: usize,
     /// Whether to allow stale entries read during replay.
     pub allow_stale_entries: bool,
-    /// Memory limit for table scans across all queries. Setting it to 0 disables the limit.
-    /// Supports absolute size (e.g., "2GB") or percentage (e.g., "50%").
+    /// Memory limit for table scans across all queries.
+    /// Setting it to 0 or "unlimited" disables the limit.
+    /// Supports absolute size (e.g., "2GB") or percentage of system memory (e.g., "50%").
     pub scan_memory_limit: MemoryLimit,
     /// Behavior when scan memory tracking cannot acquire memory from the budget.
     /// `wait` means `wait(10s)`, not unlimited waiting.
@@ -165,13 +177,12 @@ pub struct MitoConfig {
     #[cfg(feature = "vector_index")]
     pub vector_index: VectorIndexConfig,
 
-    /// Memtable config
-    pub memtable: MemtableConfig,
-
     /// Minimum time interval between two compactions.
     /// To align with the old behavior, the default value is 0 (no restrictions).
     #[serde(with = "humantime_serde")]
     pub min_compaction_interval: Duration,
+    /// Whether to schedule compaction after applying a region edit.
+    pub schedule_compaction_after_edit: bool,
 
     /// Whether to enable flat format as the default SST format.
     /// When enabled, forces using BulkMemtable and BulkMemtableBuilder.
@@ -199,11 +210,13 @@ impl Default for MitoConfig {
             auto_flush_interval: Duration::from_secs(30 * 60),
             global_write_buffer_size: ReadableSize::gb(1),
             global_write_buffer_reject_size: ReadableSize::gb(2),
+            default_region_write_buffer_size: ReadableSize::mb(0),
             sst_meta_cache_size: ReadableSize::mb(128),
             vector_cache_size: ReadableSize::mb(512),
             page_cache_size: ReadableSize::mb(512),
             selector_result_cache_size: ReadableSize::mb(512),
             range_result_cache_size: ReadableSize::mb(512),
+            prefilter_result_cache_size: ReadableSize::mb(128),
             enable_write_cache: false,
             write_cache_path: String::new(),
             write_cache_size: ReadableSize::gb(5),
@@ -223,8 +236,8 @@ impl Default for MitoConfig {
             bloom_filter_index: BloomFilterConfig::default(),
             #[cfg(feature = "vector_index")]
             vector_index: VectorIndexConfig::default(),
-            memtable: MemtableConfig::default(),
             min_compaction_interval: Duration::from_secs(0),
+            schedule_compaction_after_edit: true,
             default_flat_format: true,
             gc: GcConfig::default(),
         };
@@ -317,9 +330,14 @@ impl MitoConfig {
         );
         // Use 2x of global write buffer size as global write buffer reject size.
         let global_write_buffer_reject_size = global_write_buffer_size * 2;
-        // shouldn't be greater than 128MB in default mode.
+        // Page-index-bearing SST metadata can be much larger than footers alone.
+        // Keep the auto-sized default bounded, but allow a larger warm working set.
         let sst_meta_cache_size = cmp::min(
             sys_memory / SST_META_CACHE_SIZE_FACTOR,
+            ReadableSize::mb(512),
+        );
+        let prefilter_result_cache_size = cmp::min(
+            sys_memory / PREFILTER_RESULT_CACHE_SIZE_FACTOR,
             ReadableSize::mb(128),
         );
         // shouldn't be greater than 512MB in default mode.
@@ -333,6 +351,8 @@ impl MitoConfig {
         self.page_cache_size = page_cache_size;
         self.selector_result_cache_size = mem_cache_size;
         self.range_result_cache_size = mem_cache_size;
+        // Use a smaller cache size because prefilter result usually should be small.
+        self.prefilter_result_cache_size = prefilter_result_cache_size;
 
         self.index.adjust_buffer_and_cache_size(sys_memory);
     }
@@ -350,6 +370,24 @@ impl MitoConfig {
         self.write_cache_size = size;
         self.write_cache_ttl = ttl;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_adjust_sst_metadata_and_prefilter_cache_caps_independently() {
+        let mut config = MitoConfig::default();
+
+        config.adjust_buffer_and_cache_size(ReadableSize::gb(1));
+        assert_eq!(ReadableSize::mb(128), config.sst_meta_cache_size);
+        assert_eq!(ReadableSize::mb(32), config.prefilter_result_cache_size);
+
+        config.adjust_buffer_and_cache_size(ReadableSize::gb(64));
+        assert_eq!(ReadableSize::mb(512), config.sst_meta_cache_size);
+        assert_eq!(ReadableSize::mb(128), config.prefilter_result_cache_size);
     }
 }
 
@@ -460,7 +498,7 @@ impl IndexConfig {
         self.content_cache_size = cmp::min(self.content_cache_size, cache_size);
 
         let metadata_cache_size = cmp::min(
-            sys_memory / SST_META_CACHE_SIZE_FACTOR,
+            sys_memory / INDEX_METADATA_CACHE_SIZE_FACTOR,
             ReadableSize::mb(64),
         );
         self.metadata_cache_size = cmp::min(self.metadata_cache_size, metadata_cache_size);
@@ -697,26 +735,4 @@ fn divide_num_cpus(divisor: usize) -> usize {
     debug_assert!(cores > 0);
 
     cores.div_ceil(divisor)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_deserialize_config() {
-        let s = r#"
-[memtable]
-type = "partition_tree"
-index_max_keys_per_shard = 8192
-data_freeze_threshold = 1024
-dedup = true
-fork_dictionary_bytes = "512MiB"
-"#;
-        let config: MitoConfig = toml::from_str(s).unwrap();
-        let MemtableConfig::PartitionTree(config) = &config.memtable else {
-            unreachable!()
-        };
-        assert_eq!(1024, config.data_freeze_threshold);
-    }
 }

@@ -12,20 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
-use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use client::{Output, OutputData, OutputMeta};
 use common_base::readable_size::ReadableSize;
-use common_datasource::file_format::csv::CsvFormat;
+use common_datasource::file_format::csv::{
+    CsvFormat, is_skippable_arrow_error, tolerant_csv_stream,
+};
 use common_datasource::file_format::json::JsonFormat;
 use common_datasource::file_format::orc::{ReaderAdapter, infer_orc_schema, new_orc_stream_reader};
 use common_datasource::file_format::{FileFormat, Format, file_to_stream};
 use common_datasource::lister::{Lister, Source};
-use common_datasource::object_store::{FS_SCHEMA, build_backend, parse_url};
-use common_datasource::util::find_dir_and_filename;
+use common_datasource::object_store::build_backend_with_path;
 use common_query::{OutputCost, OutputRows};
 use common_recordbatch::DfSendableRecordBatchStream;
 use common_recordbatch::adapter::RecordBatchStreamTypeAdapter;
@@ -33,10 +35,13 @@ use common_telemetry::{debug, tracing};
 use datafusion::datasource::physical_plan::{CsvSource, FileSource, JsonSource};
 use datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder;
 use datafusion::parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use datafusion_common::DataFusionError;
+use datafusion_common::arrow::error::ArrowError;
 use datafusion_common::config::CsvOptions;
 use datafusion_expr::Expr;
 use datatypes::arrow::compute::can_cast_types;
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Schema, SchemaRef};
+use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::vectors::Helper;
 use futures_util::StreamExt;
 use object_store::{Entry, EntryMode, ObjectStore};
@@ -47,7 +52,7 @@ use table::requests::{CopyTableRequest, InsertRequest};
 use table::table_reference::TableReference;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-use crate::error::{self, IntoVectorsSnafu, PathNotFoundSnafu, Result};
+use crate::error::{self, IntoVectorsSnafu, Result};
 use crate::statement::StatementExecutor;
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
@@ -92,16 +97,10 @@ impl StatementExecutor {
         &self,
         req: &CopyTableRequest,
     ) -> Result<(ObjectStore, Vec<Entry>)> {
-        let (schema, _host, path) = parse_url(&req.location).context(error::ParseUrlSnafu)?;
-
-        if schema.to_uppercase() == FS_SCHEMA {
-            ensure!(Path::new(&path).exists(), PathNotFoundSnafu { path });
-        }
-
-        let object_store =
-            build_backend(&req.location, &req.connection).context(error::BuildBackendSnafu)?;
-
-        let (dir, filename) = find_dir_and_filename(&path);
+        let backend =
+            build_backend_with_path(&req.location, &req.connection, &self.local_file_access)
+                .await
+                .context(error::BuildBackendSnafu)?;
         let regex = req
             .pattern
             .as_ref()
@@ -109,17 +108,25 @@ impl StatementExecutor {
             .transpose()
             .context(error::BuildRegexSnafu)?;
 
-        let source = if let Some(filename) = filename {
+        let source = if let Some(filename) = backend.object_path {
             Source::Filename(filename)
         } else {
             Source::Dir
         };
 
-        let lister = Lister::new(object_store.clone(), source.clone(), dir.clone(), regex);
+        let lister = Lister::new(
+            backend.object_store.clone(),
+            source.clone(),
+            req.location.clone(),
+            regex,
+        );
 
         let entries = lister.list().await.context(error::ListObjectsSnafu)?;
-        debug!("Copy from dir: {dir:?}, {source:?}, entries: {entries:?}");
-        Ok((object_store, entries))
+        debug!(
+            "Copy from location: {:?}, {source:?}, entries: {entries:?}",
+            req.location
+        );
+        Ok((backend.object_store, entries))
     }
 
     async fn collect_metadata(
@@ -221,23 +228,42 @@ impl StatementExecutor {
                 let csv_source = CsvSource::new(schema.clone())
                     .with_csv_options(options)
                     .with_batch_size(DEFAULT_BATCH_SIZE);
-                let stream = file_to_stream(
-                    object_store,
-                    path,
-                    csv_source,
-                    Some(projection),
-                    format.compression_type,
-                )
-                .await
-                .context(error::BuildFileStreamSnafu)?;
+                let stream = if format.skip_bad_records {
+                    let reader_schema =
+                        csv_reader_schema_for_skip_bad_records(schema, &compat_schema);
+                    tolerant_csv_stream(
+                        object_store,
+                        path,
+                        Arc::new(reader_schema),
+                        projection.clone(),
+                        format,
+                    )
+                    .await
+                    .context(error::BuildFileStreamSnafu)?
+                } else {
+                    file_to_stream(
+                        object_store,
+                        path,
+                        csv_source,
+                        Some(projection),
+                        format.compression_type,
+                    )
+                    .await
+                    .context(error::BuildFileStreamSnafu)?
+                };
 
-                Ok(Box::pin(
+                let stream = Box::pin(
                     // The projection is already applied in the CSV reader when we created the stream,
                     // so we pass None here to avoid double projection which would cause schema mismatch errors.
                     RecordBatchStreamTypeAdapter::new(output_schema, stream, None)
                         .with_filter(filters)
                         .context(error::PhysicalExprSnafu)?,
-                ))
+                );
+                if format.skip_bad_records {
+                    Ok(Box::pin(SkipBadRecordsStream::new(stream, path)))
+                } else {
+                    Ok(stream)
+                }
             }
             FileMetadata::Json {
                 path,
@@ -366,24 +392,24 @@ impl StatementExecutor {
                 .collect_metadata(&object_store, format.clone(), path.to_string())
                 .await?;
 
-            let file_schema = file_metadata.schema();
-            let (file_schema_projection, table_schema_projection, compat_schema) =
-                generated_schema_projection_and_compatible_file_schema(file_schema, &table_schema);
+            validate_csv_headers_if_required(&file_metadata, &table_schema)?;
+            let schema_mapping = copy_from_schema_mapping(&file_metadata, &table_schema);
             let projected_file_schema = Arc::new(
-                file_schema
-                    .project(&file_schema_projection)
+                file_metadata
+                    .schema()
+                    .project(&schema_mapping.file_projection)
                     .context(error::ProjectSchemaSnafu)?,
             );
             let projected_table_schema = Arc::new(
                 table_schema
-                    .project(&table_schema_projection)
+                    .project(&schema_mapping.table_projection)
                     .context(error::ProjectSchemaSnafu)?,
             );
             ensure_schema_compatible(&projected_file_schema, &projected_table_schema)?;
 
             files.push((
-                Arc::new(compat_schema),
-                file_schema_projection,
+                Arc::new(schema_mapping.compat_file_schema),
+                schema_mapping.file_projection,
                 projected_table_schema,
                 file_metadata,
             ))
@@ -391,7 +417,23 @@ impl StatementExecutor {
 
         let mut rows_inserted = 0;
         let mut insert_cost = 0;
-        let max_insert_rows = req.limit.map(|n| n as usize);
+        let max_insert_rows = req
+            .limit
+            .map(|n| {
+                usize::try_from(n).map_err(|_| {
+                    error::InvalidCopyParameterSnafu {
+                        key: "limit".to_string(),
+                        value: n.to_string(),
+                    }
+                    .build()
+                })
+            })
+            .transpose()?;
+        if max_insert_rows == Some(0) {
+            return Ok(gen_insert_output(rows_inserted, insert_cost));
+        }
+
+        let mut accepted_rows = 0;
         for (compat_schema, file_schema_projection, projected_table_schema, file_metadata) in files
         {
             let mut stream = self
@@ -417,6 +459,17 @@ impl StatementExecutor {
 
             while let Some(r) = stream.next().await {
                 let record_batch = r.context(error::ReadDfRecordBatchSnafu)?;
+                let record_batch = if let Some(max_insert_rows) = max_insert_rows {
+                    let remaining_rows = max_insert_rows - accepted_rows;
+                    if record_batch.num_rows() > remaining_rows {
+                        record_batch.slice(0, remaining_rows)
+                    } else {
+                        record_batch
+                    }
+                } else {
+                    record_batch
+                };
+                let record_batch_rows = record_batch.num_rows();
                 let vectors =
                     Helper::try_into_vectors(record_batch.columns()).context(IntoVectorsSnafu)?;
 
@@ -437,6 +490,7 @@ impl StatementExecutor {
                     },
                     query_ctx.clone(),
                 ));
+                accepted_rows += record_batch_rows;
 
                 if pending_mem_size as u64 >= pending_mem_threshold {
                     let (rows, cost) = batch_insert(&mut pending, &mut pending_mem_size).await?;
@@ -445,8 +499,14 @@ impl StatementExecutor {
                 }
 
                 if let Some(max_insert_rows) = max_insert_rows
-                    && rows_inserted >= max_insert_rows
+                    && accepted_rows == max_insert_rows
                 {
+                    if !pending.is_empty() {
+                        let (rows, cost) =
+                            batch_insert(&mut pending, &mut pending_mem_size).await?;
+                        rows_inserted += rows;
+                        insert_cost += cost;
+                    }
                     return Ok(gen_insert_output(rows_inserted, insert_cost));
                 }
             }
@@ -467,6 +527,58 @@ fn gen_insert_output(rows_inserted: usize, insert_cost: usize) -> Output {
         OutputData::AffectedRows(rows_inserted),
         OutputMeta::new_with_cost(insert_cost),
     )
+}
+
+struct SkipBadRecordsStream {
+    inner: DfSendableRecordBatchStream,
+    path: String,
+}
+
+impl SkipBadRecordsStream {
+    fn new(inner: DfSendableRecordBatchStream, path: impl Into<String>) -> Self {
+        Self {
+            inner,
+            path: path.into(),
+        }
+    }
+}
+
+impl datafusion::physical_plan::RecordBatchStream for SkipBadRecordsStream {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+}
+
+impl futures::Stream for SkipBadRecordsStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Err(error))) if is_skippable_record_error(&error) => {
+                    common_telemetry::warn!(
+                        "Skipping bad record while copying from {}: {}",
+                        this.path,
+                        error
+                    );
+                    continue;
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+fn is_skippable_record_error(error: &DataFusionError) -> bool {
+    match error {
+        DataFusionError::ArrowError(error, _) => is_skippable_arrow_error(error),
+        DataFusionError::External(error) => error
+            .downcast_ref::<ArrowError>()
+            .is_some_and(is_skippable_arrow_error),
+        DataFusionError::Context(_, error) => is_skippable_record_error(error),
+        _ => false,
+    }
 }
 
 /// Executes all pending inserts all at once, drain pending requests and reset pending bytes.
@@ -498,6 +610,52 @@ fn can_cast_types_for_greptime(from: &ArrowDataType, to: &ArrowDataType) -> bool
     can_cast_types(from, to)
 }
 
+fn csv_reader_schema_for_skip_bad_records(file: &SchemaRef, compat: &SchemaRef) -> Schema {
+    let fields = file
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, file_field)| match compat.fields().get(idx) {
+            Some(compat_field) if can_csv_reader_parse_type(compat_field.data_type()) => {
+                compat_field.clone()
+            }
+            _ => file_field.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    Schema::new_with_metadata(fields, file.metadata().clone())
+}
+
+fn can_csv_reader_parse_type(data_type: &ArrowDataType) -> bool {
+    match data_type {
+        ArrowDataType::Boolean
+        | ArrowDataType::Decimal32(_, _)
+        | ArrowDataType::Decimal64(_, _)
+        | ArrowDataType::Decimal128(_, _)
+        | ArrowDataType::Decimal256(_, _)
+        | ArrowDataType::Int8
+        | ArrowDataType::Int16
+        | ArrowDataType::Int32
+        | ArrowDataType::Int64
+        | ArrowDataType::UInt8
+        | ArrowDataType::UInt16
+        | ArrowDataType::UInt32
+        | ArrowDataType::UInt64
+        | ArrowDataType::Float32
+        | ArrowDataType::Float64
+        | ArrowDataType::Date32
+        | ArrowDataType::Date64
+        | ArrowDataType::Time32(_)
+        | ArrowDataType::Time64(_)
+        | ArrowDataType::Timestamp(_, _)
+        | ArrowDataType::Null
+        | ArrowDataType::Utf8
+        | ArrowDataType::Utf8View => true,
+        ArrowDataType::Dictionary(_, value_type) => value_type.as_ref() == &ArrowDataType::Utf8,
+        _ => false,
+    }
+}
+
 fn ensure_schema_compatible(from: &SchemaRef, to: &SchemaRef) -> Result<()> {
     let not_match = from
         .fields
@@ -517,6 +675,62 @@ fn ensure_schema_compatible(from: &SchemaRef, to: &SchemaRef) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn validate_csv_headers_if_required(file_metadata: &FileMetadata, table: &SchemaRef) -> Result<()> {
+    let FileMetadata::Csv {
+        schema,
+        format,
+        path,
+    } = file_metadata
+    else {
+        return Ok(());
+    };
+
+    if !format.strict_headers {
+        return Ok(());
+    }
+
+    let mut seen_file_columns = HashSet::with_capacity(schema.fields().len());
+    let duplicate_columns = schema
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            if seen_file_columns.insert(field.name().clone()) {
+                None
+            } else {
+                Some(field.name().clone())
+            }
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let file_columns = seen_file_columns.into_iter().collect::<BTreeSet<_>>();
+    let table_columns = table
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect::<BTreeSet<_>>();
+    let unknown_columns = file_columns
+        .difference(&table_columns)
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_columns = table_columns
+        .difference(&file_columns)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    ensure!(
+        unknown_columns.is_empty() && missing_columns.is_empty() && duplicate_columns.is_empty(),
+        error::CsvHeaderMismatchSnafu {
+            path,
+            unknown_columns,
+            missing_columns,
+            duplicate_columns,
+        }
+    );
+
+    Ok(())
 }
 
 /// Generates a maybe compatible schema of the file schema.
@@ -545,6 +759,62 @@ fn generated_schema_projection_and_compatible_file_schema(
         table_projection,
         Schema::new(compatible_fields),
     )
+}
+
+struct CopyFromSchemaMapping {
+    file_projection: Vec<usize>,
+    table_projection: Vec<usize>,
+    compat_file_schema: Schema,
+}
+
+fn copy_from_schema_mapping(
+    file_metadata: &FileMetadata,
+    table: &SchemaRef,
+) -> CopyFromSchemaMapping {
+    match file_metadata {
+        FileMetadata::Csv { schema, format, .. } if !format.has_header => {
+            generated_positional_schema_projection_and_compatible_file_schema(schema, table)
+        }
+        _ => {
+            let (file_projection, table_projection, compat_file_schema) =
+                generated_schema_projection_and_compatible_file_schema(
+                    file_metadata.schema(),
+                    table,
+                );
+            CopyFromSchemaMapping {
+                file_projection,
+                table_projection,
+                compat_file_schema,
+            }
+        }
+    }
+}
+
+fn generated_positional_schema_projection_and_compatible_file_schema(
+    file: &SchemaRef,
+    table: &SchemaRef,
+) -> CopyFromSchemaMapping {
+    let len = file.fields.len().min(table.fields.len());
+    let file_projection = (0..len).collect::<Vec<_>>();
+    let table_projection = (0..len).collect::<Vec<_>>();
+    let compatible_fields = file
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(idx, file_field)| {
+            if idx < len {
+                table.fields[idx].clone()
+            } else {
+                file_field.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    CopyFromSchemaMapping {
+        file_projection,
+        table_projection,
+        compat_file_schema: Schema::new(compatible_fields),
+    }
 }
 
 #[cfg(test)]
@@ -779,5 +1049,308 @@ mod tests {
                 generated_schema_projection_and_compatible_file_schema(test.0, test.1);
             assert_eq!(test.0.project(&fp).unwrap(), test.1.project(&tp).unwrap());
         }
+    }
+
+    #[test]
+    fn test_csv_reader_schema_for_skip_bad_records() {
+        let file_schema = make_test_schema(&[
+            Field::new("id", DataType::Utf8, true),
+            Field::new("jsons", DataType::Utf8, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]);
+        let compat_schema = make_test_schema(&[
+            Field::new("id", DataType::UInt32, true),
+            Field::new("jsons", DataType::Binary, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(datatypes::arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+        ]);
+
+        let reader_schema = csv_reader_schema_for_skip_bad_records(&file_schema, &compat_schema);
+
+        assert_eq!(reader_schema.field(0).data_type(), &DataType::UInt32);
+        assert_eq!(reader_schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(
+            reader_schema.field(2).data_type(),
+            compat_schema.field(2).data_type()
+        );
+    }
+
+    fn make_csv_metadata(schema: Arc<Schema>, has_header: bool) -> FileMetadata {
+        FileMetadata::Csv {
+            schema,
+            format: CsvFormat {
+                has_header,
+                ..CsvFormat::default()
+            },
+            path: "test.csv".to_string(),
+        }
+    }
+
+    fn make_strict_csv_metadata(schema: Arc<Schema>) -> FileMetadata {
+        FileMetadata::Csv {
+            schema,
+            format: CsvFormat {
+                strict_headers: true,
+                ..CsvFormat::default()
+            },
+            path: "test.csv".to_string(),
+        }
+    }
+
+    fn assert_field(schema: &Schema, idx: usize, name: &str, data_type: &DataType) {
+        let field = schema.field(idx);
+        assert_eq!(field.name(), name);
+        assert_eq!(field.data_type(), data_type);
+    }
+
+    #[test]
+    fn test_strict_csv_headers_allows_reordered_columns() {
+        let file_schema = make_test_schema(&[
+            Field::new("ts", DataType::Utf8, true),
+            Field::new("host_id", DataType::UInt8, true),
+            Field::new("reading_value", DataType::Float64, true),
+        ]);
+        let table_schema = make_test_schema(&[
+            Field::new("host_id", DataType::UInt32, true),
+            Field::new("reading_value", DataType::Float64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]);
+
+        validate_csv_headers_if_required(&make_strict_csv_metadata(file_schema), &table_schema)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_strict_csv_headers_rejects_unknown_columns() {
+        let file_schema = make_test_schema(&[
+            Field::new("host_id", DataType::UInt8, true),
+            Field::new("reading_value", DataType::Float64, true),
+            Field::new("ts", DataType::Utf8, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]);
+        let table_schema = make_test_schema(&[
+            Field::new("host_id", DataType::UInt32, true),
+            Field::new("reading_value", DataType::Float64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]);
+
+        let err =
+            validate_csv_headers_if_required(&make_strict_csv_metadata(file_schema), &table_schema)
+                .unwrap_err();
+
+        assert!(matches!(
+            err,
+            error::Error::CsvHeaderMismatch {
+                unknown_columns,
+                missing_columns,
+                duplicate_columns,
+                ..
+            } if unknown_columns == vec!["extra".to_string()]
+                && missing_columns.is_empty()
+                && duplicate_columns.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_strict_csv_headers_rejects_missing_columns() {
+        let file_schema = make_test_schema(&[
+            Field::new("host_id", DataType::UInt8, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]);
+        let table_schema = make_test_schema(&[
+            Field::new("host_id", DataType::UInt32, true),
+            Field::new("reading_value", DataType::Float64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]);
+
+        let err =
+            validate_csv_headers_if_required(&make_strict_csv_metadata(file_schema), &table_schema)
+                .unwrap_err();
+
+        assert!(matches!(
+            err,
+            error::Error::CsvHeaderMismatch {
+                unknown_columns,
+                missing_columns,
+                duplicate_columns,
+                ..
+            } if unknown_columns.is_empty()
+                && missing_columns == vec!["reading_value".to_string()]
+                && duplicate_columns.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_strict_csv_headers_rejects_duplicate_columns() {
+        let file_schema = make_test_schema(&[
+            Field::new("host_id", DataType::UInt8, true),
+            Field::new("reading_value", DataType::Float64, true),
+            Field::new("ts", DataType::Utf8, true),
+            Field::new("host_id", DataType::UInt16, true),
+        ]);
+        let table_schema = make_test_schema(&[
+            Field::new("host_id", DataType::UInt32, true),
+            Field::new("reading_value", DataType::Float64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]);
+
+        let err =
+            validate_csv_headers_if_required(&make_strict_csv_metadata(file_schema), &table_schema)
+                .unwrap_err();
+
+        assert!(matches!(
+            err,
+            error::Error::CsvHeaderMismatch {
+                unknown_columns,
+                missing_columns,
+                duplicate_columns,
+                ..
+            } if unknown_columns.is_empty()
+                && missing_columns.is_empty()
+                && duplicate_columns == vec!["host_id".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_headerless_csv_schema_projection_is_positional() {
+        let file_schema = make_test_schema(&[
+            Field::new("column_1", DataType::UInt8, true),
+            Field::new("column_2", DataType::Float64, true),
+            Field::new("column_3", DataType::Utf8, true),
+        ]);
+        let table_schema = make_test_schema(&[
+            Field::new("host_id", DataType::UInt32, true),
+            Field::new("reading_value", DataType::Float64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(datatypes::arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+        ]);
+
+        let mapping =
+            copy_from_schema_mapping(&make_csv_metadata(file_schema, false), &table_schema);
+
+        assert_eq!(mapping.file_projection, vec![0, 1, 2]);
+        assert_eq!(mapping.table_projection, vec![0, 1, 2]);
+        assert_field(&mapping.compat_file_schema, 0, "host_id", &DataType::UInt32);
+        assert_field(
+            &mapping.compat_file_schema,
+            1,
+            "reading_value",
+            &DataType::Float64,
+        );
+        assert_field(
+            &mapping.compat_file_schema,
+            2,
+            "ts",
+            table_schema.field(2).data_type(),
+        );
+        assert_eq!(
+            mapping
+                .compat_file_schema
+                .project(&mapping.file_projection)
+                .unwrap(),
+            table_schema.project(&mapping.table_projection).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_headerless_csv_schema_projection_ignores_extra_file_columns() {
+        let file_schema = make_test_schema(&[
+            Field::new("column_1", DataType::UInt8, true),
+            Field::new("column_2", DataType::Float64, true),
+            Field::new("column_3", DataType::Utf8, true),
+            Field::new("column_4", DataType::Utf8, true),
+        ]);
+        let table_schema = make_test_schema(&[
+            Field::new("host_id", DataType::UInt32, true),
+            Field::new("reading_value", DataType::Float64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]);
+
+        let mapping =
+            copy_from_schema_mapping(&make_csv_metadata(file_schema, false), &table_schema);
+
+        assert_eq!(mapping.file_projection, vec![0, 1, 2]);
+        assert_eq!(mapping.table_projection, vec![0, 1, 2]);
+        assert_eq!(mapping.compat_file_schema.fields().len(), 4);
+        assert_field(&mapping.compat_file_schema, 0, "host_id", &DataType::UInt32);
+        assert_field(
+            &mapping.compat_file_schema,
+            1,
+            "reading_value",
+            &DataType::Float64,
+        );
+        assert_field(&mapping.compat_file_schema, 2, "ts", &DataType::Utf8);
+        assert_field(&mapping.compat_file_schema, 3, "column_4", &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_headerless_csv_schema_projection_supports_prefix_import() {
+        let file_schema = make_test_schema(&[
+            Field::new("column_1", DataType::UInt8, true),
+            Field::new("column_2", DataType::Float64, true),
+        ]);
+        let table_schema = make_test_schema(&[
+            Field::new("host_id", DataType::UInt32, true),
+            Field::new("reading_value", DataType::Float64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]);
+
+        let mapping =
+            copy_from_schema_mapping(&make_csv_metadata(file_schema, false), &table_schema);
+
+        assert_eq!(mapping.file_projection, vec![0, 1]);
+        assert_eq!(mapping.table_projection, vec![0, 1]);
+        assert_field(&mapping.compat_file_schema, 0, "host_id", &DataType::UInt32);
+        assert_field(
+            &mapping.compat_file_schema,
+            1,
+            "reading_value",
+            &DataType::Float64,
+        );
+        assert_eq!(
+            mapping
+                .compat_file_schema
+                .project(&mapping.file_projection)
+                .unwrap(),
+            table_schema.project(&mapping.table_projection).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_csv_reader_schema_for_skip_bad_records_uses_positional_mapping() {
+        let file_schema = make_test_schema(&[
+            Field::new("column_1", DataType::Utf8, true),
+            Field::new("column_2", DataType::Utf8, true),
+            Field::new("column_3", DataType::Utf8, true),
+        ]);
+        let table_schema = make_test_schema(&[
+            Field::new("host_id", DataType::UInt32, true),
+            Field::new("jsons", DataType::Binary, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(datatypes::arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+        ]);
+        let mapping = copy_from_schema_mapping(
+            &make_csv_metadata(file_schema.clone(), false),
+            &table_schema,
+        );
+        let compat_schema = Arc::new(mapping.compat_file_schema);
+
+        let reader_schema = csv_reader_schema_for_skip_bad_records(&file_schema, &compat_schema);
+
+        assert_eq!(reader_schema.field(0).data_type(), &DataType::UInt32);
+        assert_eq!(reader_schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(
+            reader_schema.field(2).data_type(),
+            table_schema.field(2).data_type()
+        );
     }
 }

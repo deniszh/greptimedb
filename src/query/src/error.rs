@@ -15,7 +15,7 @@
 use std::any::Any;
 use std::time::{Duration, TryFromFloatSecsError};
 
-use common_error::ext::{BoxedError, ErrorExt};
+use common_error::ext::{BoxedError, ErrorExt, RetryHint};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use common_query::error::datafusion_status_code;
@@ -375,6 +375,20 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display(
+        "Conflicting snapshot sequence observed for region {} in a single query (existing={}, new={})",
+        region_id,
+        existing,
+        new
+    ))]
+    ConflictingSnapshotSequence {
+        region_id: RegionId,
+        existing: u64,
+        new: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(transparent)]
     Datatypes {
         source: datatypes::error::Error,
@@ -407,9 +421,11 @@ impl ErrorExt for Error {
             | CteColumnSchemaMismatch { .. }
             | ConvertValue { .. }
             | TryIntoDuration { .. }
-            | InvalidQueryContextExtension { .. } => StatusCode::InvalidArguments,
+            | InvalidQueryContextExtension { .. }
+            | ConflictingSnapshotSequence { .. } => StatusCode::InvalidArguments,
 
-            BuildBackend { .. } | ListObjects { .. } => StatusCode::StorageUnavailable,
+            BuildBackend { source, .. } => source.status_code(),
+            ListObjects { .. } => StatusCode::StorageUnavailable,
 
             TableNotFound { .. } => StatusCode::TableNotFound,
 
@@ -447,6 +463,29 @@ impl ErrorExt for Error {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn retry_hint(&self) -> RetryHint {
+        use Error::*;
+
+        match self {
+            BuildBackend { source, .. } | ListObjects { source, .. } => source.retry_hint(),
+            GetRegionMetadata { .. } => RetryHint::Retryable,
+            ParseFileFormat { source, .. } | InferSchema { source, .. } => source.retry_hint(),
+            Catalog { source, .. } => source.retry_hint(),
+            CreateRecordBatch { source, .. } => source.retry_hint(),
+            PartitionRuleManager { source, .. } => source.retry_hint(),
+            QueryExecution { source, .. } | QueryPlan { source, .. } => source.retry_hint(),
+            Sql { source, .. } => source.retry_hint(),
+            ConvertSqlType { source, .. } | ConvertSqlValue { source, .. } => source.retry_hint(),
+            RegionQuery { source, .. } => source.retry_hint(),
+            TableMutation { source, .. } => source.retry_hint(),
+            GetFulltextOptions { source, .. }
+            | GetSkippingIndexOptions { source, .. }
+            | GetVectorIndexOptions { source, .. }
+            | Datatypes { source, .. } => source.retry_hint(),
+            _ => RetryHint::NonRetryable,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -454,5 +493,25 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl From<Error> for DataFusionError {
     fn from(e: Error) -> DataFusionError {
         DataFusionError::External(Box::new(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_backend_delegates_error_metadata() {
+        let source = common_datasource::error::LocalFileAccessDisabledSnafu {
+            path: "file:///tmp/data.parquet",
+        }
+        .build();
+        let error = Error::BuildBackend {
+            source,
+            location: Location::default(),
+        };
+
+        assert_eq!(error.status_code(), StatusCode::InvalidArguments);
+        assert_eq!(error.retry_hint(), RetryHint::NonRetryable);
     }
 }

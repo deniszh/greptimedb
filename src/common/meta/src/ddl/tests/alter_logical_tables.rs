@@ -47,7 +47,7 @@ use crate::rpc::ddl::AlterTableTask;
 use crate::rpc::router::{Region, RegionRoute};
 use crate::test_util::{MockDatanodeManager, new_ddl_context};
 
-fn make_alter_logical_table_add_column_task(
+pub(crate) fn make_alter_logical_table_add_column_task(
     schema: Option<&str>,
     table: &str,
     add_columns: Vec<String>,
@@ -290,6 +290,7 @@ async fn test_on_update_metadata() {
     let ctx = common_procedure::Context {
         procedure_id: ProcedureId::random(),
         provider: Arc::new(MockContextProvider::default()),
+        event_context: None,
     };
     // on_submit_alter_region_requests
     status = procedure.execute(&ctx).await.unwrap();
@@ -374,6 +375,7 @@ async fn test_on_part_duplicate_alter_request() {
     let ctx = common_procedure::Context {
         procedure_id: ProcedureId::random(),
         provider: Arc::new(MockContextProvider::default()),
+        event_context: None,
     };
     // on_submit_alter_region_requests
     status = procedure.execute(&ctx).await.unwrap();
@@ -459,6 +461,7 @@ async fn test_on_part_duplicate_alter_request() {
     let ctx = common_procedure::Context {
         procedure_id: ProcedureId::random(),
         provider: Arc::new(MockContextProvider::default()),
+        event_context: None,
     };
     // on_submit_alter_region_requests
     status = procedure.execute(&ctx).await.unwrap();

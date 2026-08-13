@@ -68,6 +68,17 @@ pub const VECTOR: &str = "VECTOR";
 
 pub type RawIntervalExpr = String;
 
+// Preserve raw CREATE FLOW option entries until operator-side validation.
+// Do not use `OptionMap::new()` here: it can drop non-string values for
+// redacted keys before the flow option allowlist rejects them.
+fn flow_option_map(options: HashMap<String, OptionValue>) -> OptionMap {
+    let mut flow_options = OptionMap::default();
+    for (key, value) in options {
+        flow_options.insert_options(&key, value);
+    }
+    flow_options
+}
+
 /// Parses create [table] statement
 impl<'a> ParserContext<'a> {
     pub(crate) fn parse_create(&mut self) -> Result<Statement> {
@@ -339,6 +350,14 @@ impl<'a> ParserContext<'a> {
             None
         };
 
+        let flow_options = self
+            .parser
+            .parse_options(Keyword::WITH)
+            .context(SyntaxSnafu)?
+            .into_iter()
+            .map(parse_option_string)
+            .collect::<Result<HashMap<String, OptionValue>>>()?;
+
         self.parser
             .expect_keyword(Keyword::AS)
             .context(SyntaxSnafu)?;
@@ -353,6 +372,7 @@ impl<'a> ParserContext<'a> {
             expire_after,
             eval_interval,
             comment,
+            flow_options: flow_option_map(flow_options),
             query,
         }))
     }
@@ -390,7 +410,7 @@ impl<'a> ParserContext<'a> {
                 .fail();
             };
 
-            if !utils::is_simple_tql_cte_query(query) {
+            if utils::has_tql_cte(query) && !utils::is_simple_tql_cte_query(query) {
                 return InvalidFlowQuerySnafu {
                     reason: "WITH is only supported for the simplest TQL CTE in CREATE FLOW"
                         .to_string(),
@@ -482,6 +502,12 @@ impl<'a> ParserContext<'a> {
         if !self.parser.parse_keyword(Keyword::PARTITION) {
             return Ok(None);
         }
+
+        self.parse_partition_on_columns().map(Some)
+    }
+
+    /// Parses the "ON COLUMNS (...) (...)" part after "PARTITION".
+    pub(crate) fn parse_partition_on_columns(&mut self) -> Result<Partitions> {
         self.parser
             .expect_keywords(&[Keyword::ON, Keyword::COLUMNS])
             .context(error::UnexpectedSnafu {
@@ -500,7 +526,7 @@ impl<'a> ParserContext<'a> {
 
         let exprs = self.parse_comma_separated(Self::parse_partition_entry)?;
 
-        Ok(Some(Partitions { column_list, exprs }))
+        Ok(Partitions { column_list, exprs })
     }
 
     fn parse_partition_entry(&mut self) -> Result<Expr> {
@@ -684,12 +710,13 @@ impl<'a> ParserContext<'a> {
 
         let mut extensions = ColumnExtensions::default();
 
-        let data_type = parser.parse_data_type().context(SyntaxSnafu)?;
-        // Must immediately parse the JSON datatype format because it is closely after the "JSON"
-        // datatype, like this: "JSON(format = ...)".
-        if matches!(data_type, DataType::JSON) {
-            extensions.json_datatype_options = json::parse_json_datatype_options(parser)?;
-        }
+        let data_type =
+            if let Some((data_type, type_hints)) = json::parse_json2_type_and_hints(parser)? {
+                extensions.json_type_hints = type_hints;
+                data_type
+            } else {
+                parser.parse_data_type().context(SyntaxSnafu)?
+            };
 
         let mut options = vec![];
         loop {
@@ -884,7 +911,7 @@ impl<'a> ParserContext<'a> {
             );
 
             let column_type = get_unalias_type(column_type);
-            let data_type = sql_data_type_to_concrete_data_type(&column_type, column_extensions)?;
+            let data_type = sql_data_type_to_concrete_data_type(&column_type)?;
             ensure!(
                 data_type == ConcreteDataType::string_datatype(),
                 InvalidColumnOptionSnafu {
@@ -981,7 +1008,7 @@ impl<'a> ParserContext<'a> {
 
             // Check that column is a vector type
             let column_type = get_unalias_type(column_type);
-            let data_type = sql_data_type_to_concrete_data_type(&column_type, column_extensions)?;
+            let data_type = sql_data_type_to_concrete_data_type(&column_type)?;
             ensure!(
                 matches!(data_type, ConcreteDataType::Vector(_)),
                 InvalidColumnOptionSnafu {
@@ -1256,6 +1283,20 @@ mod tests {
     use crate::dialect::GreptimeDbDialect;
     use crate::parser::ParseOptions;
 
+    fn string_option_map(
+        entries: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> OptionMap {
+        OptionMap::new(entries.into_iter().map(|(key, value)| {
+            (
+                key.to_string(),
+                OptionValue::try_new(Expr::Value(
+                    Value::SingleQuotedString(value.to_string()).into(),
+                ))
+                .unwrap(),
+            )
+        }))
+    }
+
     #[test]
     fn test_parse_create_table_like() {
         let sql = "CREATE TABLE t1 LIKE t2";
@@ -1498,6 +1539,8 @@ mod tests {
             pub expire_after: Option<i64>,
             /// Comment string
             pub comment: Option<String>,
+            /// Flow creation options
+            pub flow_options: OptionMap,
         }
         let testcases = vec![
             (
@@ -1518,6 +1561,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;",
                     if_not_exists: true,
                     expire_after: Some(300),
                     comment: Some("test comment".to_string()),
+                    flow_options: OptionMap::default(),
                 },
             ),
             (
@@ -1538,6 +1582,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;",
                     if_not_exists: true,
                     expire_after: Some(300),
                     comment: Some("test comment".to_string()),
+                    flow_options: OptionMap::default(),
                 },
             ),
             (
@@ -1558,6 +1603,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;",
                     if_not_exists: true,
                     expire_after: Some(300),
                     comment: Some("test comment".to_string()),
+                    flow_options: OptionMap::default(),
                 },
             ),
             (
@@ -1578,6 +1624,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;",
                     if_not_exists: true,
                     expire_after: Some(300),
                     comment: Some("test comment".to_string()),
+                    flow_options: OptionMap::default(),
                 },
             ),
             (
@@ -1597,6 +1644,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;",
                     if_not_exists: false,
                     expire_after: Some(2 * 86400 + 3600 + 2 * 60),
                     comment: None,
+                    flow_options: OptionMap::default(),
                 },
             ),
             (
@@ -1616,6 +1664,7 @@ select max(c1), min(c2) from schema_2.table_2;",
                     if_not_exists: false,
                     expire_after: Some(600), // 10 minutes in seconds
                     comment: None,
+                    flow_options: OptionMap::default(),
                 },
             ),
             (
@@ -1636,6 +1685,27 @@ select max(c1), min(c2) from schema_2.table_2;",
                     if_not_exists: true,
                     expire_after: Some(7200), // 2 hours in seconds
                     comment: Some("lowercase test".to_string()),
+                    flow_options: OptionMap::default(),
+                },
+            ),
+            (
+                r"
+CREATE FLOW task_5
+SINK TO schema_1.table_1
+WITH (defer_on_missing_source = 'true')
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;",
+                CreateFlowWoutQuery {
+                    flow_name: ObjectName::from(vec![Ident::new("task_5")]),
+                    sink_table_name: ObjectName::from(vec![
+                        Ident::new("schema_1"),
+                        Ident::new("table_1"),
+                    ]),
+                    or_replace: false,
+                    if_not_exists: false,
+                    expire_after: None,
+                    comment: None,
+                    flow_options: string_option_map([("defer_on_missing_source", "true")]),
                 },
             ),
         ];
@@ -1651,6 +1721,7 @@ select max(c1), min(c2) from schema_2.table_2;",
                 expire_after: expected.expire_after,
                 eval_interval: None,
                 comment: expected.comment,
+                flow_options: expected.flow_options,
                 // ignore query parse result
                 query: create_task.query.clone(),
             };
@@ -1696,6 +1767,8 @@ select max(c1), min(c2) from schema_2.table_2;",
             pub eval_interval: Option<i64>,
             /// Comment string
             pub comment: Option<String>,
+            /// Flow creation options
+            pub flow_options: OptionMap,
         }
 
         // create flow without `OR REPLACE`, `IF NOT EXISTS`, `EXPIRE AFTER` and `COMMENT`
@@ -1719,6 +1792,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;",
                     expire_after: Some(300),
                     eval_interval: None,
                     comment: Some("test comment".to_string()),
+                    flow_options: OptionMap::default(),
                 },
             ),
             (
@@ -1740,6 +1814,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;",
                     expire_after: Some(300),
                     eval_interval: None,
                     comment: Some("test comment".to_string()),
+                    flow_options: OptionMap::default(),
                 },
             ),
             (
@@ -1762,6 +1837,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;",
                     expire_after: Some(300),
                     eval_interval: Some(10),
                     comment: Some("test comment".to_string()),
+                    flow_options: OptionMap::default(),
                 },
             ),
             (
@@ -1784,6 +1860,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;",
                     expire_after: Some(300),
                     eval_interval: Some(10),
                     comment: Some("test comment".to_string()),
+                    flow_options: OptionMap::default(),
                 },
             ),
             (
@@ -1806,6 +1883,32 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;",
                     expire_after: Some(2 * 86400 + 3600 + 2 * 60),
                     eval_interval: None,
                     comment: None,
+                    flow_options: OptionMap::default(),
+                },
+            ),
+            (
+                r"
+CREATE FLOW task_3
+SINK TO schema_1.table_1
+EVAL INTERVAL '10 seconds'
+WITH (defer_on_missing_source = 'true', foo = 'bar')
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;",
+                CreateFlowWoutQuery {
+                    flow_name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("task_3"))]),
+                    sink_table_name: ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("schema_1")),
+                        ObjectNamePart::Identifier(Ident::new("table_1")),
+                    ]),
+                    or_replace: false,
+                    if_not_exists: false,
+                    expire_after: None,
+                    eval_interval: Some(10),
+                    comment: None,
+                    flow_options: string_option_map([
+                        ("defer_on_missing_source", "true"),
+                        ("foo", "bar"),
+                    ]),
                 },
             ),
         ];
@@ -1821,6 +1924,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;",
                 expire_after: expected.expire_after,
                 eval_interval: expected.eval_interval,
                 comment: expected.comment,
+                flow_options: expected.flow_options,
                 // ignore query parse result
                 query: create_task.query.clone(),
             };
@@ -1859,7 +1963,7 @@ SELECT * FROM tql;
     }
 
     #[test]
-    fn test_parse_create_flow_with_sql_cte_is_unsupported() {
+    fn test_parse_create_flow_with_sql_cte_is_supported() {
         let sql = r#"
 CREATE FLOW f
 SINK TO s
@@ -1867,11 +1971,17 @@ AS
 WITH cte AS (SELECT 1) SELECT * FROM cte;
 "#;
 
-        let err =
+        let stmts =
             ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
-                .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.to_uppercase().contains("WITH"), "err: {msg}");
+                .unwrap();
+        assert_eq!(1, stmts.len());
+        let Statement::CreateFlow(create_flow) = &stmts[0] else {
+            panic!("unexpected stmt: {:?}", stmts[0]);
+        };
+        assert_eq!(
+            "WITH cte AS (SELECT 1) SELECT * FROM cte",
+            create_flow.query.to_string()
+        );
     }
 
     #[test]

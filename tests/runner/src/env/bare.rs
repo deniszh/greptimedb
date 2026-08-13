@@ -24,14 +24,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common_error::ext::ErrorExt;
 use sqlness::{Database, EnvController, QueryContext};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::client::MultiProtocolClient;
 use crate::cmd::bare::ServerAddr;
+use crate::cmd::compat_case::try_infer_version;
+use crate::cmd::datanode_overlay::PreparedDatanodeOverlay;
 use crate::formatter::{ErrorFormatter, MysqlFormatter, OutputFormatter, PostgresqlFormatter};
 use crate::protocol_interceptor::{MYSQL, PROTOCOL_KEY};
-use crate::server_mode::ServerMode;
+use crate::server_mode::{GrpcArgStyle, ServerMode};
 use crate::util;
 use crate::util::{PROGRAM, get_workspace_root, maybe_pull_binary};
 
@@ -42,6 +45,8 @@ const SERVER_MODE_METASRV_IDX: usize = 0;
 const SERVER_MODE_DATANODE_START_IDX: usize = 1;
 const SERVER_MODE_FRONTEND_IDX: usize = 4;
 const SERVER_MODE_FLOWNODE_IDX: usize = 5;
+// Number of datanodes in distributed mode
+const DISTRIBUTED_DATANODE_COUNT: usize = 3;
 
 #[derive(Clone)]
 pub enum WalConfig {
@@ -77,6 +82,7 @@ pub struct StoreConfig {
     pub(crate) setup_pg: Option<ServiceProvider>,
     pub(crate) setup_mysql: Option<ServiceProvider>,
     pub enable_flat_format: bool,
+    pub enable_gc: bool,
 }
 
 #[derive(Clone)]
@@ -97,6 +103,41 @@ pub struct Env {
     store_config: StoreConfig,
     /// Extra command line arguments when starting GreptimeDB binaries.
     extra_args: Vec<String>,
+    /// Cache for the inferred gRPC argument style per `bins_dir`.
+    grpc_arg_style_cache: Arc<Mutex<HashMap<PathBuf, GrpcArgStyle>>>,
+    compat_config_stage: Arc<Mutex<CompatConfigStage>>,
+}
+
+/// Kills a process unless ownership has been transferred to [`GreptimeDB`].
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn into_inner(mut self) -> Child {
+        self.0.take().unwrap()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            Env::stop_server(child);
+        }
+    }
+}
+
+/// Compatibility configuration selected for future server renders.
+#[derive(Clone, Debug)]
+pub(crate) enum CompatConfigStage {
+    /// Ordinary and baseline compatibility renders use the template unchanged.
+    Baseline,
+    /// Old compatibility renders apply this datanode overlay.
+    Old(Arc<PreparedDatanodeOverlay>),
+    /// Current compatibility renders use the template unchanged.
+    Current,
 }
 
 #[async_trait]
@@ -109,7 +150,10 @@ impl EnvController for Env {
         }
 
         unsafe {
-            std::env::set_var("SQLNESS_HOME", self.sqlness_home.display().to_string());
+            std::env::set_var(
+                "SQLNESS_HOME",
+                self.sqlness_home.join("copy").display().to_string(),
+            );
         }
         match mode {
             "standalone" => self.start_standalone(id).await,
@@ -146,7 +190,24 @@ impl Env {
             )]))),
             store_config,
             extra_args,
+            grpc_arg_style_cache: Arc::new(Mutex::new(HashMap::new())),
+            compat_config_stage: Arc::new(Mutex::new(CompatConfigStage::Baseline)),
         }
+    }
+
+    /// Selects the old-stage overlay for subsequent compatibility renders.
+    pub(crate) fn activate_compat_old(&self, overlay: Arc<PreparedDatanodeOverlay>) {
+        *self.compat_config_stage.lock().unwrap() = CompatConfigStage::Old(overlay);
+    }
+
+    /// Selects clean current-stage rendering for subsequent compatibility renders.
+    pub(crate) fn activate_compat_current(&self) {
+        *self.compat_config_stage.lock().unwrap() = CompatConfigStage::Current;
+    }
+
+    /// Takes a cheap compatibility-stage snapshot before rendering or spawning.
+    pub(crate) fn compat_config_stage(&self) -> CompatConfigStage {
+        self.compat_config_stage.lock().unwrap().clone()
     }
 
     async fn start_standalone(&self, id: usize) -> GreptimeDB {
@@ -165,7 +226,8 @@ impl Env {
             let server_process = self.start_server(server_mode, &db_ctx, id, true).await;
 
             let mut greptimedb = self.connect_db(&server_addr, id).await;
-            greptimedb.server_processes = Some(Arc::new(Mutex::new(vec![server_process])));
+            greptimedb.server_processes =
+                Some(Arc::new(Mutex::new(vec![server_process.into_inner()])));
             greptimedb.is_standalone = true;
             greptimedb.ctx = db_ctx;
 
@@ -174,6 +236,11 @@ impl Env {
     }
 
     async fn start_distributed(&self, id: usize) -> GreptimeDB {
+        self.start_distributed_inner(id).await
+    }
+
+    /// Internal: start a distributed cluster with flownode.
+    async fn start_distributed_inner(&self, id: usize) -> GreptimeDB {
         if self.server_addrs.server_addr.is_some() {
             self.connect_db(&self.server_addrs, id).await
         } else {
@@ -202,15 +269,13 @@ impl Env {
             db_ctx.set_server_mode(meta_server_mode.clone(), SERVER_MODE_METASRV_IDX);
             let meta_server = self.start_server(meta_server_mode, &db_ctx, id, true).await;
 
-            let datanode_1_mode = ServerMode::random_datanode(metasrv_port, 0);
-            db_ctx.set_server_mode(datanode_1_mode.clone(), SERVER_MODE_DATANODE_START_IDX);
-            let datanode_1 = self.start_server(datanode_1_mode, &db_ctx, id, true).await;
-            let datanode_2_mode = ServerMode::random_datanode(metasrv_port, 1);
-            db_ctx.set_server_mode(datanode_2_mode.clone(), SERVER_MODE_DATANODE_START_IDX + 1);
-            let datanode_2 = self.start_server(datanode_2_mode, &db_ctx, id, true).await;
-            let datanode_3_mode = ServerMode::random_datanode(metasrv_port, 2);
-            db_ctx.set_server_mode(datanode_3_mode.clone(), SERVER_MODE_DATANODE_START_IDX + 2);
-            let datanode_3 = self.start_server(datanode_3_mode, &db_ctx, id, true).await;
+            let mut datanodes = Vec::with_capacity(DISTRIBUTED_DATANODE_COUNT);
+            for i in 0..DISTRIBUTED_DATANODE_COUNT {
+                let datanode_mode = ServerMode::random_datanode(metasrv_port, i as u32);
+                db_ctx.set_server_mode(datanode_mode.clone(), SERVER_MODE_DATANODE_START_IDX + i);
+                let datanode = self.start_server(datanode_mode, &db_ctx, id, true).await;
+                datanodes.push(datanode);
+            }
 
             let frontend_mode = ServerMode::random_frontend(metasrv_port);
             let server_addr = frontend_mode.server_addr().unwrap();
@@ -223,12 +288,12 @@ impl Env {
 
             let mut greptimedb = self.connect_db(&server_addr, id).await;
 
-            greptimedb.metasrv_process = Some(meta_server).into();
-            greptimedb.server_processes = Some(Arc::new(Mutex::new(vec![
-                datanode_1, datanode_2, datanode_3,
-            ])));
-            greptimedb.frontend_process = Some(frontend).into();
-            greptimedb.flownode_process = Some(flownode).into();
+            greptimedb.metasrv_process = Some(meta_server.into_inner()).into();
+            greptimedb.server_processes = Some(Arc::new(Mutex::new(
+                datanodes.into_iter().map(ChildGuard::into_inner).collect(),
+            )));
+            greptimedb.frontend_process = Some(frontend.into_inner()).into();
+            greptimedb.flownode_process = Some(flownode.into_inner()).into();
             greptimedb.is_standalone = false;
             greptimedb.ctx = db_ctx;
 
@@ -249,6 +314,7 @@ impl Env {
             metasrv_process: None.into(),
             frontend_process: None.into(),
             flownode_process: None.into(),
+            active_bins_dir: Mutex::new(self.bins_dir.lock().unwrap().clone()),
             ctx: GreptimeDBContext {
                 time: 0,
                 datanode_id: Default::default(),
@@ -267,13 +333,54 @@ impl Env {
         let _ = process.wait();
     }
 
+    /// Infers which gRPC argument style to use for the binary at `bins_dir`.
+    fn infer_grpc_arg_style(&self, bins_dir: &Path) -> GrpcArgStyle {
+        let cache_key = bins_dir.to_path_buf();
+
+        // Fast path: already cached.
+        {
+            let cache = self.grpc_arg_style_cache.lock().unwrap();
+            if let Some(style) = cache.get(&cache_key) {
+                return *style;
+            }
+        }
+
+        let version = try_infer_version(bins_dir);
+        let style = GrpcArgStyle::for_version(version.as_ref());
+
+        // Insert into cache (may race with another thread, but both detect
+        // the same value, so it's harmless).
+        {
+            let mut cache = self.grpc_arg_style_cache.lock().unwrap();
+            cache.entry(cache_key).or_insert(style);
+        }
+
+        style
+    }
+
     async fn start_server(
         &self,
         mode: ServerMode,
         db_ctx: &GreptimeDBContext,
         id: usize,
         truncate_log: bool,
-    ) -> Child {
+    ) -> ChildGuard {
+        let bins_dir = self.bins_dir.lock().unwrap().clone().expect(
+            "GreptimeDB binary is not available. Please pass in the path to the directory that contains the pre-built GreptimeDB binary. Or you may call `self.build_db()` beforehand.",
+        );
+
+        self.start_server_with_bins_dir(mode, db_ctx, id, truncate_log, bins_dir)
+            .await
+    }
+
+    async fn start_server_with_bins_dir(
+        &self,
+        mode: ServerMode,
+        db_ctx: &GreptimeDBContext,
+        id: usize,
+        truncate_log: bool,
+        bins_dir: PathBuf,
+    ) -> ChildGuard {
         let log_file_name = match mode {
             ServerMode::Datanode { node_id, .. } => {
                 db_ctx.incr_datanode_id();
@@ -296,7 +403,16 @@ impl Env {
             .open(&stdout_file_name)
             .unwrap();
 
-        let args = mode.get_args(&self.sqlness_home, self, db_ctx, id);
+        let arg_style = self.infer_grpc_arg_style(&bins_dir);
+        let compat_stage = self.compat_config_stage();
+        let args = mode.get_args(
+            &self.sqlness_home,
+            self,
+            db_ctx,
+            id,
+            arg_style,
+            &compat_stage,
+        );
         let check_ip_addrs = mode.check_addrs();
 
         for check_ip_addr in &check_ip_addrs {
@@ -310,15 +426,11 @@ impl Env {
 
         let program = PROGRAM;
 
-        let bins_dir = self.bins_dir.lock().unwrap().clone().expect(
-            "GreptimeDB binary is not available. Please pass in the path to the directory that contains the pre-built GreptimeDB binary. Or you may call `self.build_db()` beforehand.",
-        );
-
         let abs_bins_dir = bins_dir
             .canonicalize()
             .expect("Failed to canonicalize bins_dir");
 
-        let mut process = Command::new(abs_bins_dir.join(program))
+        let process = Command::new(abs_bins_dir.join(program))
             .current_dir(bins_dir.clone())
             .env("TZ", "UTC")
             .args(args)
@@ -331,10 +443,10 @@ impl Env {
                     bins_dir.join(program)
                 );
             });
+        let process = ChildGuard::new(process);
 
         for check_ip_addr in &check_ip_addrs {
             if !util::check_port(check_ip_addr.parse().unwrap(), Duration::from_secs(30)).await {
-                Env::stop_server(&mut process);
                 panic!(
                     "{} doesn't up in 30 seconds, check {} for more details.",
                     mode.name(),
@@ -347,7 +459,11 @@ impl Env {
     }
 
     /// stop and restart the server process
-    async fn restart_server(&self, db: &GreptimeDB, is_full_restart: bool) {
+    pub(crate) async fn restart_server(&self, db: &GreptimeDB, is_full_restart: bool) {
+        let bins_dir = db.active_bins_dir.lock().unwrap().clone().expect(
+            "GreptimeDB binary is not available. Please pass in the path to the directory that contains the pre-built GreptimeDB binary. Or you may call `self.build_db()` beforehand.",
+        );
+
         {
             if let Some(server_process) = db.server_processes.clone() {
                 let mut server_processes = server_process.lock().unwrap();
@@ -369,6 +485,7 @@ impl Env {
                 }
             }
 
+            // Stop flownode if present.
             if let Some(mut flownode_process) =
                 db.flownode_process.lock().expect("poisoned lock").take()
             {
@@ -384,7 +501,9 @@ impl Env {
                 .cloned()
                 .unwrap();
             let server_addr = server_mode.server_addr().unwrap();
-            let new_server_process = self.start_server(server_mode, &db.ctx, db.id, false).await;
+            let new_server_process = self
+                .start_server_with_bins_dir(server_mode, &db.ctx, db.id, false, bins_dir.clone())
+                .await;
 
             let mut client = db.client.lock().await;
             client
@@ -396,17 +515,23 @@ impl Env {
             vec![new_server_process]
         } else {
             db.ctx.reset_datanode_id();
+            let mut new_metasrv = None;
             if is_full_restart {
                 let metasrv_mode = db
                     .ctx
                     .get_server_mode(SERVER_MODE_METASRV_IDX)
                     .cloned()
                     .unwrap();
-                let metasrv = self.start_server(metasrv_mode, &db.ctx, db.id, false).await;
-                db.metasrv_process
-                    .lock()
-                    .expect("lock poisoned")
-                    .replace(metasrv);
+                let metasrv = self
+                    .start_server_with_bins_dir(
+                        metasrv_mode,
+                        &db.ctx,
+                        db.id,
+                        false,
+                        bins_dir.clone(),
+                    )
+                    .await;
+                new_metasrv = Some(metasrv);
 
                 // wait for metasrv to start
                 // since it seems older version of db might take longer to complete election
@@ -414,52 +539,92 @@ impl Env {
             }
 
             let mut processes = vec![];
-            for i in 0..3 {
+            for i in 0..DISTRIBUTED_DATANODE_COUNT {
                 let datanode_mode = db
                     .ctx
                     .get_server_mode(SERVER_MODE_DATANODE_START_IDX + i)
                     .cloned()
                     .unwrap();
                 let new_server_process = self
-                    .start_server(datanode_mode, &db.ctx, db.id, false)
+                    .start_server_with_bins_dir(
+                        datanode_mode,
+                        &db.ctx,
+                        db.id,
+                        false,
+                        bins_dir.clone(),
+                    )
                     .await;
                 processes.push(new_server_process);
             }
 
+            let mut new_frontend = None;
             if is_full_restart {
                 let frontend_mode = db
                     .ctx
                     .get_server_mode(SERVER_MODE_FRONTEND_IDX)
                     .cloned()
                     .unwrap();
+                let server_addr = frontend_mode.server_addr().unwrap();
                 let frontend = self
-                    .start_server(frontend_mode, &db.ctx, db.id, false)
+                    .start_server_with_bins_dir(
+                        frontend_mode,
+                        &db.ctx,
+                        db.id,
+                        false,
+                        bins_dir.clone(),
+                    )
                     .await;
-                db.frontend_process
-                    .lock()
-                    .expect("lock poisoned")
-                    .replace(frontend);
+
+                // Reconnect protocol clients to the new frontend process
+                // so that MySQL/Postgres queries use the restarted frontend,
+                // not stale connections to the old (killed) process.
+                let mut client = db.client.lock().await;
+                client
+                    .reconnect_mysql_client(server_addr.mysql_server_addr.as_ref().unwrap())
+                    .await;
+                client
+                    .reconnect_pg_client(server_addr.pg_server_addr.as_ref().unwrap())
+                    .await;
+                new_frontend = Some(frontend);
             }
 
-            let flownode_mode = db
-                .ctx
-                .get_server_mode(SERVER_MODE_FLOWNODE_IDX)
-                .cloned()
-                .unwrap();
-            let flownode = self
-                .start_server(flownode_mode, &db.ctx, db.id, false)
-                .await;
-            db.flownode_process
-                .lock()
-                .expect("lock poisoned")
-                .replace(flownode);
+            // Restart flownode.
+            let mut new_flownode = None;
+            if let Some(flownode_mode) = db.ctx.get_server_mode(SERVER_MODE_FLOWNODE_IDX).cloned() {
+                let flownode = self
+                    .start_server_with_bins_dir(
+                        flownode_mode,
+                        &db.ctx,
+                        db.id,
+                        false,
+                        bins_dir.clone(),
+                    )
+                    .await;
+                new_flownode = Some(flownode);
+            }
+
+            if let Some(metasrv) = new_metasrv {
+                let mut metasrv_process = db.metasrv_process.lock().expect("lock poisoned");
+                metasrv_process.replace(metasrv.into_inner());
+            }
+            if let Some(frontend) = new_frontend {
+                let mut frontend_process = db.frontend_process.lock().expect("lock poisoned");
+                frontend_process.replace(frontend.into_inner());
+            }
+            if let Some(flownode) = new_flownode {
+                let mut flownode_process = db.flownode_process.lock().expect("lock poisoned");
+                flownode_process.replace(flownode.into_inner());
+            }
 
             processes
         };
 
         if let Some(server_processes) = db.server_processes.clone() {
             let mut server_processes = server_processes.lock().unwrap();
-            *server_processes = new_server_processes;
+            *server_processes = new_server_processes
+                .into_iter()
+                .map(ChildGuard::into_inner)
+                .collect();
         }
     }
 
@@ -516,7 +681,8 @@ impl Env {
 
     /// Build the DB with `cargo build --bin greptime`
     fn build_db(&self) {
-        if self.bins_dir.lock().unwrap().is_some() {
+        let mut bins_dir = self.bins_dir.lock().unwrap();
+        if bins_dir.is_some() {
             return;
         }
 
@@ -541,15 +707,54 @@ impl Env {
             panic!();
         }
 
-        let _ = self
-            .bins_dir
-            .lock()
-            .unwrap()
-            .insert(util::get_binary_dir("debug"));
+        bins_dir.replace(util::get_binary_dir("debug"));
     }
 
     pub(crate) fn extra_args(&self) -> &Vec<String> {
         &self.extra_args
+    }
+
+    /// Start a distributed GreptimeDB cluster. Exposed for compat runner.
+    pub(crate) async fn compat_start_distributed(&self, id: usize) -> GreptimeDB {
+        self.start_distributed(id).await
+    }
+
+    /// Start a standalone GreptimeDB instance. Exposed for compat runner.
+    pub(crate) async fn compat_start_standalone(&self, id: usize) -> GreptimeDB {
+        self.start_standalone(id).await
+    }
+
+    /// Restart a compatibility instance with a new binary directory.
+    pub(crate) async fn compat_restart(&self, db: &GreptimeDB, bins_dir: PathBuf) {
+        *db.active_bins_dir.lock().unwrap() = Some(bins_dir);
+        self.restart_server(db, true).await;
+        self.wait_query_ready(db).await;
+    }
+
+    /// Wait for the query endpoint to become ready after restart.
+    async fn wait_query_ready(&self, db: &GreptimeDB) {
+        let server_mode_idx = if db.is_standalone {
+            SERVER_MODE_STANDALONE_IDX
+        } else {
+            SERVER_MODE_FRONTEND_IDX
+        };
+        let server_mode = db.ctx.get_server_mode(server_mode_idx).cloned().unwrap();
+        if let Some(addr) = server_mode.check_addrs().first() {
+            println!("Waiting for query endpoint readiness at {addr}...");
+            crate::util::retry_with_backoff(
+                || async {
+                    let mut client = db.client.lock().await;
+                    match client.grpc_query("SELECT 1").await {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(format!("Query endpoint not ready: {e}")),
+                    }
+                },
+                10,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("Query endpoint failed to become ready: {e}"));
+        }
     }
 }
 
@@ -559,6 +764,7 @@ pub struct GreptimeDB {
     frontend_process: Mutex<Option<Child>>,
     flownode_process: Mutex<Option<Child>>,
     client: TokioMutex<MultiProtocolClient>,
+    active_bins_dir: Mutex<Option<PathBuf>>,
     ctx: GreptimeDBContext,
     is_standalone: bool,
     env: Env,
@@ -592,6 +798,81 @@ impl GreptimeDB {
             Err(e) => Box::new(ErrorFormatter::from(e)),
         }
     }
+
+    /// Handle `QueryContext` directives for compat statement execution.
+    ///
+    /// Inspects `QueryContext` keys set by sqlness interceptors:
+    /// - `restart`: restarts the server (datanode-only) if not using external address.
+    /// - `version`: switches to the specified binary version and performs a full restart.
+    ///
+    /// This does **not** execute queries itself; it only prepares the server state.
+    /// Used by the compat runner.
+    pub(crate) async fn compat_prepare_query_context(&self, ctx: &QueryContext) {
+        if ctx.context.contains_key("restart") && self.env.server_addrs.server_addr.is_none() {
+            self.env.restart_server(self, false).await;
+        } else if let Some(version) = ctx.context.get("version") {
+            let version_bin_dir = self
+                .env
+                .versioned_bins_dirs
+                .lock()
+                .expect("lock poison")
+                .get(version.as_str())
+                .cloned();
+
+            match version_bin_dir {
+                Some(path) if path.join(PROGRAM).is_file() => {
+                    *self.active_bins_dir.lock().unwrap() = Some(path);
+                }
+                _ => {
+                    maybe_pull_binary(version, self.env.pull_version_on_need).await;
+                    let root = get_workspace_root();
+                    let new_path = PathBuf::from_iter([&root, version]);
+                    *self.active_bins_dir.lock().unwrap() = Some(new_path);
+                }
+            }
+
+            self.env.restart_server(self, true).await;
+            // sleep for a while to wait for the server to fully boot up
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
+    pub(crate) async fn compat_query(
+        &self,
+        query: &str,
+        ctx: &QueryContext,
+    ) -> Result<String, String> {
+        let mut client = self.client.lock().await;
+
+        // Handle protocol switching
+        if let Some(protocol) = ctx.context.get(PROTOCOL_KEY) {
+            if protocol == MYSQL {
+                return match client.mysql_query(query).await {
+                    Ok(res) => Ok(crate::formatter::MysqlFormatter::from(res).to_string()),
+                    Err(e) => Err(e),
+                };
+            } else {
+                // postgres
+                return match client.postgres_query(query).await {
+                    Ok(rows) => Ok(crate::formatter::PostgresqlFormatter::from(rows).to_string()),
+                    Err(e) => Err(e),
+                };
+            }
+        }
+
+        // Default: gRPC
+        match client.grpc_query(query).await {
+            Ok(output) => Ok(OutputFormatter::from(output).to_string()),
+            Err(e) => {
+                let status_code = e.status_code();
+                let root_cause = e.output_msg();
+                Err(format!(
+                    "Error: {}({status_code}), {root_cause}",
+                    status_code as u32
+                ))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -609,16 +890,16 @@ impl Database for GreptimeDB {
                 .cloned();
 
             match version_bin_dir {
-                Some(path) if path.clone().join(PROGRAM).is_file() => {
+                Some(path) if path.join(PROGRAM).is_file() => {
                     // use version in versioned_bins_dirs
-                    *self.env.bins_dir.lock().unwrap() = Some(path.clone());
+                    *self.active_bins_dir.lock().unwrap() = Some(path);
                 }
                 _ => {
                     // use version in dir files
                     maybe_pull_binary(version, self.env.pull_version_on_need).await;
                     let root = get_workspace_root();
                     let new_path = PathBuf::from_iter([&root, version]);
-                    *self.env.bins_dir.lock().unwrap() = Some(new_path);
+                    *self.active_bins_dir.lock().unwrap() = Some(new_path);
                 }
             }
 
@@ -683,6 +964,11 @@ impl GreptimeDB {
         {
             util::teardown_wal();
         }
+    }
+
+    /// Stop all processes managed by this GreptimeDB. Exposed for compat runner.
+    pub(crate) fn compat_stop(&mut self) {
+        self.stop();
     }
 }
 
@@ -752,5 +1038,102 @@ impl GreptimeDBContext {
 
     fn get_server_mode(&self, idx: usize) -> Option<&ServerMode> {
         self.server_modes.get(idx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::bare::ServerAddr;
+    use crate::cmd::datanode_overlay::{DatanodeOverlay, DatanodeProtectionPolicy};
+
+    fn test_env(temp_dir: &Path) -> Env {
+        Env::new(
+            temp_dir.to_path_buf(),
+            ServerAddr::default(),
+            WalConfig::RaftEngine,
+            false,
+            None,
+            StoreConfig {
+                store_addrs: vec![],
+                setup_etcd: false,
+                setup_pg: None,
+                setup_mysql: None,
+                enable_flat_format: false,
+                enable_gc: false,
+            },
+            vec![],
+        )
+    }
+
+    #[test]
+    fn compat_config_stage_is_shared_by_env_clones_and_transitions_cleanly() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("overlay.toml"), "value = 1").unwrap();
+        let overlay = DatanodeOverlay::load(temp_dir.path(), Path::new("overlay.toml"))
+            .unwrap()
+            .prepare(&DatanodeProtectionPolicy::for_wal(&WalConfig::RaftEngine))
+            .unwrap();
+        let env = test_env(temp_dir.path());
+        let clone = env.clone();
+
+        assert!(matches!(
+            clone.compat_config_stage(),
+            CompatConfigStage::Baseline
+        ));
+        env.activate_compat_old(Arc::new(overlay));
+        assert!(matches!(
+            clone.compat_config_stage(),
+            CompatConfigStage::Old(_)
+        ));
+        clone.activate_compat_current();
+        assert!(matches!(
+            env.compat_config_stage(),
+            CompatConfigStage::Current
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_guard_kills_untransferred_processes() {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id().to_string();
+
+        drop(ChildGuard::new(child));
+
+        assert!(
+            !std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_guard_kills_process_on_forced_unwind() {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id().to_string();
+
+        let unwind = std::panic::catch_unwind(|| {
+            let _guard = ChildGuard::new(child);
+            panic!("forced startup unwind");
+        });
+
+        assert!(unwind.is_err());
+        assert!(
+            !std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 }

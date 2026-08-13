@@ -21,8 +21,6 @@ pub mod flat_dedup;
 pub mod flat_merge;
 pub mod flat_projection;
 pub mod last_row;
-pub mod merge;
-pub mod plain_batch;
 pub mod projection;
 pub(crate) mod prune;
 pub(crate) mod pruner;
@@ -31,18 +29,22 @@ pub mod range;
 pub mod range_cache;
 #[cfg(not(feature = "test"))]
 pub(crate) mod range_cache;
+pub mod read_columns;
 pub mod scan_region;
 pub mod scan_util;
 pub(crate) mod seq_scan;
+pub(crate) mod series_candidate;
+pub(crate) mod series_reader;
 pub mod series_scan;
 pub mod stream;
 pub(crate) mod unordered_scan;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use api::v1::OpType;
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use common_time::Timestamp;
 use datafusion_common::arrow::array::UInt8Array;
@@ -65,7 +67,6 @@ use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec};
 use snafu::{OptionExt, ResultExt, ensure};
-use store_api::metadata::RegionMetadata;
 use store_api::storage::{ColumnId, SequenceNumber, SequenceRange};
 
 use crate::error::{
@@ -73,7 +74,40 @@ use crate::error::{
     Result,
 };
 use crate::memtable::{BoxedBatchIterator, BoxedRecordBatchIterator};
-use crate::read::prune::PruneReader;
+
+pub(crate) fn timestamp_array_to_i64_slice(arr: &ArrayRef) -> &[i64] {
+    use datatypes::arrow::array::{
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
+    use datatypes::arrow::datatypes::{DataType, TimeUnit};
+
+    match arr.data_type() {
+        DataType::Timestamp(t, _) => match t {
+            TimeUnit::Second => arr
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .values(),
+            TimeUnit::Millisecond => arr
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap()
+                .values(),
+            TimeUnit::Microsecond => arr
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .values(),
+            TimeUnit::Nanosecond => arr
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .values(),
+        },
+        _ => unreachable!(),
+    }
+}
 
 /// Storage internal representation of a batch of rows for a primary key (time series).
 ///
@@ -573,24 +607,6 @@ impl Batch {
             size += batch_column.data.memory_size();
         }
         size
-    }
-
-    /// Returns ids and datatypes of fields in the [Batch] after applying the `projection`.
-    pub(crate) fn projected_fields(
-        metadata: &RegionMetadata,
-        projection: &[ColumnId],
-    ) -> Vec<(ColumnId, ConcreteDataType)> {
-        let projected_ids: HashSet<_> = projection.iter().copied().collect();
-        metadata
-            .field_columns()
-            .filter_map(|column| {
-                if projected_ids.contains(&column.column_id) {
-                    Some((column.column_id, column.column_schema.data_type.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect()
     }
 
     /// Returns timestamps in a native slice or `None` if the batch is empty.
@@ -1113,8 +1129,6 @@ pub enum Source {
     Iter(BoxedBatchIterator),
     /// Source from a [BoxedBatchStream].
     Stream(BoxedBatchStream),
-    /// Source from a [PruneReader].
-    PruneReader(PruneReader),
 }
 
 impl Source {
@@ -1124,25 +1138,63 @@ impl Source {
             Source::Reader(reader) => reader.next_batch().await,
             Source::Iter(iter) => iter.next().transpose(),
             Source::Stream(stream) => stream.try_next().await,
-            Source::PruneReader(reader) => reader.next_batch().await,
         }
     }
 }
 
 /// Async [RecordBatch] reader and iterator wrapper for flat format.
-pub enum FlatSource {
+pub struct FlatSource {
+    schema: SchemaRef,
+    inner: FlatSourceInner,
+}
+
+impl FlatSource {
+    /// Create a [FlatSource] from a [BoxedRecordBatchIterator] and its schema.
+    pub fn new_iter(schema: SchemaRef, iter: BoxedRecordBatchIterator) -> Self {
+        Self {
+            schema,
+            inner: FlatSourceInner::Iter(iter),
+        }
+    }
+
+    /// Create a [FlatSource] from a [BoxedRecordBatchStream] and its schema.
+    pub fn new_stream(schema: SchemaRef, stream: BoxedRecordBatchStream) -> Self {
+        Self {
+            schema,
+            inner: FlatSourceInner::Stream(stream),
+        }
+    }
+
+    pub(crate) fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        self.inner.next_batch().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_iter(self) -> BoxedRecordBatchIterator {
+        match self.inner {
+            FlatSourceInner::Iter(iter) => iter,
+            FlatSourceInner::Stream(_) => unreachable!(),
+        }
+    }
+}
+
+enum FlatSourceInner {
     /// Source from a [BoxedRecordBatchIterator].
     Iter(BoxedRecordBatchIterator),
     /// Source from a [BoxedRecordBatchStream].
     Stream(BoxedRecordBatchStream),
 }
 
-impl FlatSource {
+impl FlatSourceInner {
     /// Returns next [RecordBatch] from this data source.
     pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         match self {
-            FlatSource::Iter(iter) => iter.next().transpose(),
-            FlatSource::Stream(stream) => stream.try_next().await,
+            Self::Iter(iter) => iter.next().transpose(),
+            Self::Stream(stream) => stream.try_next().await,
         }
     }
 }

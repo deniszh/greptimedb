@@ -90,9 +90,9 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Fulltext or Skipping index only supports string type, column: {column_name}, unexpected type: {column_type:?}"
+        "Fulltext index only supports string type, column: {column_name}, unexpected type: {column_type:?}"
     ))]
-    InvalidStringIndexColumnType {
+    InvalidFulltextIndexColumnType {
         column_name: String,
         column_type: ColumnDataType,
         #[snafu(implicit)]
@@ -109,6 +109,13 @@ pub enum Error {
     InvalidUnsetTableOptionRequest {
         #[snafu(source)]
         error: MetadataError,
+    },
+
+    #[snafu(display("Invalid table option request: {err_msg}"))]
+    InvalidTableOptionRequest {
+        err_msg: String,
+        #[snafu(implicit)]
+        location: Location,
     },
 
     #[snafu(display("Invalid set fulltext option request"))]
@@ -183,11 +190,12 @@ impl ErrorExt for Error {
             Error::InvalidColumnDef { source, .. } => source.status_code(),
             Error::UnknownLocationType { .. } => StatusCode::InvalidArguments,
 
-            Error::UnknownColumnDataType { .. } | Error::InvalidStringIndexColumnType { .. } => {
+            Error::UnknownColumnDataType { .. } | Error::InvalidFulltextIndexColumnType { .. } => {
                 StatusCode::InvalidArguments
             }
             Error::InvalidSetTableOptionRequest { .. }
             | Error::InvalidUnsetTableOptionRequest { .. }
+            | Error::InvalidTableOptionRequest { .. }
             | Error::InvalidSetFulltextOptionRequest { .. }
             | Error::InvalidSetSkippingIndexOptionRequest { .. }
             | Error::MissingAlterIndexOption { .. }

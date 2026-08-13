@@ -27,7 +27,6 @@ use snafu::{OptionExt, ResultExt, ensure};
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Streaming;
-use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
 
 use crate::client::{Id, LeaderProviderRef};
@@ -39,6 +38,7 @@ use crate::error::{InvalidResponseHeaderSnafu, Result};
 pub struct HeartbeatConfig {
     pub interval: Duration,
     pub retry_interval: Duration,
+    pub gc_enabled: bool,
 }
 
 impl Default for HeartbeatConfig {
@@ -46,6 +46,7 @@ impl Default for HeartbeatConfig {
         Self {
             interval: BASE_HEARTBEAT_INTERVAL,
             retry_interval: BASE_HEARTBEAT_INTERVAL,
+            gc_enabled: false,
         }
     }
 }
@@ -54,8 +55,8 @@ impl fmt::Display for HeartbeatConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "interval={:?}, retry={:?}",
-            self.interval, self.retry_interval
+            "interval={:?}, retry={:?}, gc_enabled={}",
+            self.interval, self.retry_interval, self.gc_enabled
         )
     }
 }
@@ -68,6 +69,7 @@ impl HeartbeatConfig {
             Self {
                 interval: Duration::from_millis(cfg.heartbeat_interval_ms),
                 retry_interval: Duration::from_millis(cfg.retry_interval_ms),
+                gc_enabled: cfg.gc_enabled,
             }
         } else {
             let fallback = Self::default();
@@ -259,7 +261,6 @@ impl Inner {
             .map_err(error::Error::from)?
             .context(error::CreateHeartbeatStreamSnafu)?;
 
-        // Extract heartbeat configuration from handshake response
         let config = HeartbeatConfig::from_response(&res);
 
         info!(
@@ -280,10 +281,10 @@ impl Inner {
             .get(addr)
             .context(error::CreateChannelSnafu)?;
 
-        Ok(HeartbeatClient::new(channel)
-            .accept_compressed(CompressionEncoding::Zstd)
-            .accept_compressed(CompressionEncoding::Gzip)
-            .send_compressed(CompressionEncoding::Zstd))
+        Ok(common_grpc::configure_tonic_client!(
+            HeartbeatClient::new(channel),
+            self.channel_manager,
+        ))
     }
 
     #[inline]

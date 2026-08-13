@@ -24,7 +24,6 @@ use common_base::Plugins;
 use common_config::Configurable;
 #[cfg(any(feature = "pg_kvbackend", feature = "mysql_kvbackend"))]
 use common_meta::distributed_time_constants::META_LEASE_SECS;
-use common_meta::election::CANDIDATE_LEASE_SECS;
 use common_meta::election::etcd::EtcdElection;
 use common_meta::kv_backend::chroot::ChrootKvBackend;
 use common_meta::kv_backend::etcd::EtcdStore;
@@ -33,7 +32,7 @@ use common_meta::kv_backend::{KvBackendRef, ResettableKvBackendRef};
 use common_telemetry::info;
 use either::Either;
 use servers::configurator::GrpcRouterConfiguratorRef;
-use servers::http::{HttpServer, HttpServerBuilder};
+use servers::http::{ExtraHttpRouterProviders, HttpServer, HttpServerBuilder};
 use servers::metrics_handler::MetricsHandler;
 use servers::server::Server;
 use snafu::ResultExt;
@@ -47,7 +46,8 @@ use crate::cluster::{MetaPeerClientBuilder, MetaPeerClientRef};
 use crate::error::OtherSnafu;
 use crate::metasrv::builder::MetasrvBuilder;
 use crate::metasrv::{
-    BackendImpl, ElectionRef, Metasrv, MetasrvOptions, SelectTarget, SelectorRef,
+    BackendImpl, ElectionRef, Metasrv, MetasrvOptions, SelectTarget, SelectorFactoryContext,
+    SelectorFactoryRef, SelectorRef,
 };
 use crate::selector::lease_based::LeaseBasedSelector;
 use crate::selector::load_based::LoadBasedSelector;
@@ -105,9 +105,16 @@ impl MetasrvInstance {
     }
 
     pub async fn start(&mut self) -> Result<()> {
+        self.metasrv.ensure_repartition_gc_enabled().await?;
+
         if let Some(builder) = self.http_server.as_mut().left()
-            && let Some(builder) = builder.take()
+            && let Some(mut builder) = builder.take()
         {
+            if let Some(providers) = self.plugins.get::<ExtraHttpRouterProviders>() {
+                for provider in providers.iter() {
+                    builder = builder.with_extra_router(provider.router());
+                }
+            }
             let mut server = builder.build();
 
             let addr = self.opts.http.addr.parse().context(error::ParseAddrSnafu {
@@ -124,7 +131,7 @@ impl MetasrvInstance {
             return Ok(());
         };
 
-        self.metasrv.try_start().await?;
+        self.metasrv.try_start_after_gc_check().await?;
 
         let (tx, rx) = mpsc::channel::<()>(1);
 
@@ -233,13 +240,15 @@ pub async fn bootstrap_metasrv_with_router(
 
 #[macro_export]
 macro_rules! add_compressed_service {
-    ($builder:expr, $server:expr) => {
+    ($builder:expr, $server:expr, $grpc_config:expr) => {
         $builder.add_service(
             $server
                 .accept_compressed(CompressionEncoding::Gzip)
                 .accept_compressed(CompressionEncoding::Zstd)
                 .send_compressed(CompressionEncoding::Gzip)
-                .send_compressed(CompressionEncoding::Zstd),
+                .send_compressed(CompressionEncoding::Zstd)
+                .max_decoding_message_size($grpc_config.max_recv_message_size)
+                .max_encoding_message_size($grpc_config.max_send_message_size),
         )
     };
 }
@@ -251,17 +260,32 @@ pub fn router(metasrv: Arc<Metasrv>) -> Router {
         // For quick network failures detection.
         .http2_keepalive_interval(Some(metasrv.options().grpc.http2_keep_alive_interval))
         .http2_keepalive_timeout(Some(metasrv.options().grpc.http2_keep_alive_timeout));
-    let router = add_compressed_service!(router, HeartbeatServer::from_arc(metasrv.clone()));
-    let router = add_compressed_service!(router, StoreServer::from_arc(metasrv.clone()));
-    let router = add_compressed_service!(router, ClusterServer::from_arc(metasrv.clone()));
-    let router = add_compressed_service!(router, ProcedureServiceServer::from_arc(metasrv.clone()));
-    let router = add_compressed_service!(router, ConfigServer::from_arc(metasrv.clone()));
+    let grpc_config = metasrv.options().grpc.as_config();
+    let router = add_compressed_service!(
+        router,
+        HeartbeatServer::from_arc(metasrv.clone()),
+        grpc_config
+    );
+    let router =
+        add_compressed_service!(router, StoreServer::from_arc(metasrv.clone()), grpc_config);
+    let router = add_compressed_service!(
+        router,
+        ClusterServer::from_arc(metasrv.clone()),
+        grpc_config
+    );
+    let router = add_compressed_service!(
+        router,
+        ProcedureServiceServer::from_arc(metasrv.clone()),
+        grpc_config
+    );
+    let router =
+        add_compressed_service!(router, ConfigServer::from_arc(metasrv.clone()), grpc_config);
     router.add_service(admin::make_admin_service(metasrv))
 }
 
 pub async fn metasrv_builder(
     opts: &MetasrvOptions,
-    plugins: Plugins,
+    plugins: &Plugins,
     kv_backend: Option<KvBackendRef>,
 ) -> Result<MetasrvBuilder> {
     let (mut kv_backend, election) = match (kv_backend, &opts.backend) {
@@ -290,16 +314,12 @@ pub async fn metasrv_builder(
             use std::time::Duration;
 
             use common_meta::distributed_time_constants::POSTGRES_KEEP_ALIVE_SECS;
-            use common_meta::election::rds::postgres::{ElectionPgClient, PgElection};
-            use common_meta::kv_backend::rds::PgStore;
+            use common_meta::election::CANDIDATE_LEASE_SECS;
             use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod};
 
-            use crate::utils::postgres::create_postgres_pool;
+            use crate::utils::postgres::{build_postgres_election, build_postgres_kv_backend};
 
             let candidate_lease_ttl = Duration::from_secs(CANDIDATE_LEASE_SECS);
-            let execution_timeout = Duration::from_secs(META_LEASE_SECS);
-            let statement_timeout = Duration::from_secs(META_LEASE_SECS);
-            let idle_session_timeout = Duration::from_secs(META_LEASE_SECS);
             let meta_lease_ttl = Duration::from_secs(META_LEASE_SECS);
 
             let mut cfg = Config::new();
@@ -308,24 +328,12 @@ pub async fn metasrv_builder(
             cfg.manager = Some(ManagerConfig {
                 recycling_method: RecyclingMethod::Verified,
             });
-            // Use a dedicated pool for the election client to allow customized session settings.
-            let pool = create_postgres_pool(
+
+            let election = build_postgres_election(
                 &opts.store_addrs,
                 Some(cfg.clone()),
                 opts.backend_tls.clone(),
-            )
-            .await?;
-
-            let election_client = ElectionPgClient::new(
-                pool,
-                execution_timeout,
-                idle_session_timeout,
-                statement_timeout,
-            )
-            .context(error::KvBackendSnafu)?;
-            let election = PgElection::with_pg_client(
                 opts.grpc.server_addr.clone(),
-                election_client,
                 opts.store_key_prefix.clone(),
                 candidate_lease_ttl,
                 meta_lease_ttl,
@@ -333,20 +341,18 @@ pub async fn metasrv_builder(
                 &opts.meta_table_name,
                 opts.meta_election_lock_id,
             )
-            .await
-            .context(error::KvBackendSnafu)?;
+            .await?;
 
-            let pool = create_postgres_pool(&opts.store_addrs, Some(cfg), opts.backend_tls.clone())
-                .await?;
-            let kv_backend = PgStore::with_pg_pool(
-                pool,
+            let kv_backend = build_postgres_kv_backend(
+                &opts.store_addrs,
+                Some(cfg),
+                opts.backend_tls.clone(),
                 opts.meta_schema_name.as_deref(),
                 &opts.meta_table_name,
                 opts.max_txn_ops,
                 opts.auto_create_schema,
             )
-            .await
-            .context(error::KvBackendSnafu)?;
+            .await?;
 
             (kv_backend, Some(election))
         }
@@ -354,45 +360,34 @@ pub async fn metasrv_builder(
         (None, BackendImpl::MysqlStore) => {
             use std::time::Duration;
 
-            use common_meta::election::rds::mysql::{ElectionMysqlClient, MySqlElection};
-            use common_meta::kv_backend::rds::MySqlStore;
+            use common_meta::election::CANDIDATE_LEASE_SECS;
 
-            use crate::utils::mysql::create_mysql_pool;
+            use crate::utils::mysql::{build_mysql_election, build_mysql_kv_backend};
 
-            let pool = create_mysql_pool(&opts.store_addrs, opts.backend_tls.as_ref()).await?;
-            let kv_backend =
-                MySqlStore::with_mysql_pool(pool, &opts.meta_table_name, opts.max_txn_ops)
-                    .await
-                    .context(error::KvBackendSnafu)?;
+            let kv_backend = build_mysql_kv_backend(
+                &opts.store_addrs,
+                opts.backend_tls.as_ref(),
+                &opts.meta_table_name,
+                opts.max_txn_ops,
+            )
+            .await?;
             // Since election will acquire a lock of the table, we need a separate table for election.
             let election_table_name = opts.meta_table_name.clone() + "_election";
-            // We use a separate pool for election since we need a different session keep-alive idle time.
-            let pool = create_mysql_pool(&opts.store_addrs, opts.backend_tls.as_ref()).await?;
-            let execution_timeout = Duration::from_secs(META_LEASE_SECS);
-            let statement_timeout = Duration::from_secs(META_LEASE_SECS);
-            let idle_session_timeout = Duration::from_secs(META_LEASE_SECS);
             let innode_lock_wait_timeout = Duration::from_secs(META_LEASE_SECS / 2);
             let meta_lease_ttl = Duration::from_secs(META_LEASE_SECS);
             let candidate_lease_ttl = Duration::from_secs(CANDIDATE_LEASE_SECS);
 
-            let election_client = ElectionMysqlClient::new(
-                pool,
-                execution_timeout,
-                statement_timeout,
-                innode_lock_wait_timeout,
-                idle_session_timeout,
-                &election_table_name,
-            );
-            let election = MySqlElection::with_mysql_client(
+            let election = build_mysql_election(
+                &opts.store_addrs,
+                opts.backend_tls.as_ref(),
                 opts.grpc.server_addr.clone(),
-                election_client,
                 opts.store_key_prefix.clone(),
                 candidate_lease_ttl,
                 meta_lease_ttl,
                 &election_table_name,
+                innode_lock_wait_timeout,
             )
-            .await
-            .context(error::KvBackendSnafu)?;
+            .await?;
             (kv_backend, Some(election))
         }
     };
@@ -411,30 +406,37 @@ pub async fn metasrv_builder(
     let in_memory = Arc::new(MemoryKvBackend::new()) as ResettableKvBackendRef;
     let meta_peer_client = build_default_meta_peer_client(&election, &in_memory);
 
-    let selector = if let Some(selector) = plugins.get::<SelectorRef>() {
-        info!("Using selector from plugins");
-        selector
+    let base_selector: Arc<
+        dyn Selector<
+                Context = crate::metasrv::SelectorContext,
+                Output = Vec<common_meta::peer::Peer>,
+            >,
+    > = match opts.selector {
+        SelectorType::LoadBased => Arc::new(LoadBasedSelector::new(
+            RegionNumsBasedWeightCompute,
+            meta_peer_client.clone(),
+        )) as SelectorRef,
+        SelectorType::LeaseBased => Arc::new(LeaseBasedSelector) as SelectorRef,
+        SelectorType::RoundRobin => {
+            Arc::new(RoundRobinSelector::new(SelectTarget::Datanode)) as SelectorRef
+        }
+    };
+    info!(
+        "Using selector from options, selector type: {}",
+        opts.selector.as_ref()
+    );
+
+    let selector = if let Some(factory) = plugins.get::<SelectorFactoryRef>() {
+        info!("Building selector from plugin factory");
+        factory.build(SelectorFactoryContext {
+            metasrv_options: opts.clone(),
+            meta_peer_client: meta_peer_client.clone(),
+            in_memory: in_memory.clone(),
+            election: election.clone(),
+            base_selector,
+        })
     } else {
-        let selector: Arc<
-            dyn Selector<
-                    Context = crate::metasrv::SelectorContext,
-                    Output = Vec<common_meta::peer::Peer>,
-                >,
-        > = match opts.selector {
-            SelectorType::LoadBased => Arc::new(LoadBasedSelector::new(
-                RegionNumsBasedWeightCompute,
-                meta_peer_client.clone(),
-            )) as SelectorRef,
-            SelectorType::LeaseBased => Arc::new(LeaseBasedSelector) as SelectorRef,
-            SelectorType::RoundRobin => {
-                Arc::new(RoundRobinSelector::new(SelectTarget::Datanode)) as SelectorRef
-            }
-        };
-        info!(
-            "Using selector from options, selector type: {}",
-            opts.selector.as_ref()
-        );
-        selector
+        base_selector
     };
 
     Ok(MetasrvBuilder::new()
@@ -443,8 +445,7 @@ pub async fn metasrv_builder(
         .in_memory(in_memory)
         .selector(selector)
         .election(election)
-        .meta_peer_client(meta_peer_client)
-        .plugins(plugins))
+        .meta_peer_client(meta_peer_client))
 }
 
 pub(crate) fn build_default_meta_peer_client(
@@ -458,4 +459,128 @@ pub(crate) fn build_default_meta_peer_client(
         .map(Arc::new)
         // Safety: all required fields set at initialization
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use common_meta::kv_backend::memory::MemoryKvBackend;
+    use servers::http::{ExtraHttpRouterProvider, ExtraHttpRouterProviderRef};
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::metasrv::{SelectorFactory, SelectorFactoryContext};
+    use crate::procedure::repartition::gc_requirement::RepartitionGcRequirementManager;
+
+    struct RecordingSelectorFactory {
+        called: Arc<AtomicBool>,
+    }
+
+    impl SelectorFactory for RecordingSelectorFactory {
+        fn build(&self, ctx: SelectorFactoryContext) -> SelectorRef {
+            self.called.store(true, Ordering::Relaxed);
+            ctx.base_selector
+        }
+    }
+
+    #[tokio::test]
+    async fn metasrv_builder_builds_load_based_selector_from_plugin_factory() {
+        let called = Arc::new(AtomicBool::new(false));
+        let plugins = Plugins::new();
+        plugins.insert(Arc::new(RecordingSelectorFactory {
+            called: called.clone(),
+        }) as SelectorFactoryRef);
+        let opts = MetasrvOptions {
+            selector: SelectorType::LoadBased,
+            ..Default::default()
+        };
+
+        metasrv_builder(
+            &opts,
+            &plugins,
+            Some(Arc::new(MemoryKvBackend::new()) as KvBackendRef),
+        )
+        .await
+        .unwrap();
+
+        assert!(called.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn gc_requirement_is_checked_before_http_server_start() {
+        let kv_backend: KvBackendRef = Arc::new(MemoryKvBackend::new());
+        RepartitionGcRequirementManager::new(kv_backend.clone())
+            .require_gc()
+            .await
+            .unwrap();
+
+        let opts = MetasrvOptions {
+            enable_telemetry: false,
+            ..Default::default()
+        };
+        let metasrv = MetasrvBuilder::new()
+            .options(opts)
+            .kv_backend(kv_backend)
+            .build()
+            .await
+            .unwrap();
+        let mut instance = MetasrvInstance::new(metasrv).await.unwrap();
+
+        let err = instance.start().await.unwrap_err();
+        assert!(matches!(err, error::Error::RepartitionGcRequired { .. }));
+        assert!(instance.http_server().is_none());
+        assert!(matches!(instance.mut_http_server(), Either::Left(Some(_))));
+    }
+
+    struct TestExtraHttpRouterProvider;
+
+    impl ExtraHttpRouterProvider for TestExtraHttpRouterProvider {
+        fn router(&self) -> axum::Router {
+            axum::Router::new().route(
+                "/test-extra-http-router",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metasrv_add_extra_http_router() -> Result<()> {
+        let mut opts = MetasrvOptions::default();
+        opts.grpc.bind_addr = "127.0.0.1:0".to_string();
+        opts.http.addr = "127.0.0.1:0".to_string();
+        opts.enable_telemetry = false;
+
+        let plugins = Plugins::new();
+        let mut providers = ExtraHttpRouterProviders::new();
+        providers.add(Arc::new(TestExtraHttpRouterProvider) as ExtraHttpRouterProviderRef);
+        plugins.insert(providers);
+
+        let metasrv = MetasrvBuilder::new()
+            .options(opts)
+            .plugins(plugins)
+            .build()
+            .await?;
+        let mut instance = MetasrvInstance::new(metasrv).await?;
+        instance.start().await?;
+
+        let response = instance
+            .http_server()
+            .unwrap()
+            .make_app()
+            .oneshot(
+                Request::get("/test-extra-http-router")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::NO_CONTENT, response.status());
+        instance.shutdown().await?;
+        Ok(())
+    }
 }

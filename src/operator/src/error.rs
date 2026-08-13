@@ -16,13 +16,14 @@ use std::any::Any;
 
 use common_datasource::file_format::Format;
 use common_error::define_into_tonic_status;
-use common_error::ext::{BoxedError, ErrorExt};
+use common_error::ext::{BoxedError, ErrorExt, RetryHint};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use common_query::error::Error as QueryResult;
 use datafusion::parquet;
 use datafusion_common::DataFusionError;
 use datatypes::arrow::error::ArrowError;
+use object_store::error::retry_hint_from_opendal_error;
 use snafu::{Location, Snafu};
 use table::metadata::TableType;
 
@@ -55,7 +56,7 @@ pub enum Error {
     #[snafu(display("Failed to build admin function args: {msg}"))]
     BuildAdminFunctionArgs { msg: String },
 
-    #[snafu(display("Failed to execute admin function: {msg}, error: {error}"))]
+    #[snafu(display("Failed to execute admin function {msg}"))]
     ExecuteAdminFunction {
         msg: String,
         #[snafu(source)]
@@ -63,6 +64,9 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Admin function execution was cancelled"))]
+    AdminFunctionCancelled,
 
     #[snafu(display("Expected {expected} args, but actual {actual}"))]
     FunctionArityMismatch { expected: usize, actual: usize },
@@ -341,6 +345,22 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Table `{name}` is read-only"))]
+    TableReadOnly {
+        name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "The definition of table `{name}` is managed by GreptimeDB; it cannot be created or altered (DROP recreates it on the next write)"
+    ))]
+    TableDdlReserved {
+        name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Table occurs error"))]
     Table {
         #[snafu(implicit)]
@@ -468,13 +488,6 @@ pub enum Error {
         source: table::error::Error,
     },
 
-    #[snafu(display("Failed to parse data source url"))]
-    ParseUrl {
-        #[snafu(implicit)]
-        location: Location,
-        source: common_datasource::error::Error,
-    },
-
     #[snafu(display("Unsupported format: {:?}", format))]
     UnsupportedFormat {
         #[snafu(implicit)]
@@ -584,6 +597,22 @@ pub enum Error {
         index: usize,
         table_schema: String,
         file_schema: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "CSV header mismatch in path: {}, unknown columns: {:?}, missing columns: {:?}, duplicate columns: {:?}",
+        path,
+        unknown_columns,
+        missing_columns,
+        duplicate_columns
+    ))]
+    CsvHeaderMismatch {
+        path: String,
+        unknown_columns: Vec<String>,
+        missing_columns: Vec<String>,
+        duplicate_columns: Vec<String>,
         #[snafu(implicit)]
         location: Location,
     },
@@ -835,13 +864,6 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Path not found: {path}"))]
-    PathNotFound {
-        path: String,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
     #[snafu(display("Invalid time index type: {}", ty))]
     InvalidTimeIndexType {
         ty: arrow::datatypes::DataType,
@@ -935,6 +957,7 @@ impl ErrorExt for Error {
             | Error::ColumnNotFound { .. }
             | Error::BuildRegex { .. }
             | Error::InvalidSchema { .. }
+            | Error::CsvHeaderMismatch { .. }
             | Error::ProjectSchema { .. }
             | Error::UnsupportedFormat { .. }
             | Error::ColumnNoneDefaultValue { .. }
@@ -966,7 +989,9 @@ impl ErrorExt for Error {
             }
             Error::NotSupported { .. }
             | Error::ShowCreateTableBaseOnly { .. }
-            | Error::SchemaReadOnly { .. } => StatusCode::Unsupported,
+            | Error::SchemaReadOnly { .. }
+            | Error::TableReadOnly { .. }
+            | Error::TableDdlReserved { .. } => StatusCode::Unsupported,
             Error::TableMetadataManager { source, .. } => source.status_code(),
             Error::ParseSql { source, .. } => source.status_code(),
             Error::InvalidateTableCache { source, .. } => source.status_code(),
@@ -993,6 +1018,7 @@ impl ErrorExt for Error {
             | Error::EncodeJson { .. }
             | Error::DeserializePartitionExpr { .. }
             | Error::SerializePartitionExpr { .. } => StatusCode::Unexpected,
+            Error::AdminFunctionCancelled => StatusCode::Cancelled,
             Error::ViewNotFound { .. }
             | Error::ViewInfoNotFound { .. }
             | Error::TableNotFound { .. } => StatusCode::TableNotFound,
@@ -1022,9 +1048,9 @@ impl ErrorExt for Error {
             Error::ReadObject { .. }
             | Error::ReadParquetMetadata { .. }
             | Error::ReadOrc { .. } => StatusCode::StorageUnavailable,
-            Error::ListObjects { source, .. }
-            | Error::ParseUrl { source, .. }
-            | Error::BuildBackend { source, .. } => source.status_code(),
+            Error::ListObjects { source, .. } | Error::BuildBackend { source, .. } => {
+                source.status_code()
+            }
             Error::ExecuteDdl { source, .. } => source.status_code(),
             Error::InvalidCopyParameter { .. } | Error::InvalidCopyDatabasePath { .. } => {
                 StatusCode::InvalidArguments
@@ -1045,7 +1071,6 @@ impl ErrorExt for Error {
             }
             Error::InvalidProcessId { .. } => StatusCode::InvalidArguments,
             Error::ProcessManagerMissing { .. } => StatusCode::Unexpected,
-            Error::PathNotFound { .. } => StatusCode::InvalidArguments,
             Error::TimestampFormatNotSupported { .. } => StatusCode::InvalidArguments,
             Error::SqlCommon { source, .. } => source.status_code(),
             #[cfg(feature = "enterprise")]
@@ -1061,6 +1086,71 @@ impl ErrorExt for Error {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn retry_hint(&self) -> RetryHint {
+        match self {
+            Error::ReadObject { error, .. } => retry_hint_from_opendal_error(error),
+            Error::ReadParquetMetadata { .. } => RetryHint::Retryable,
+            Error::InvalidateTableCache { source, .. }
+            | Error::ExecuteDdl { source, .. }
+            | Error::RequestInserts { source, .. }
+            | Error::RequestDeletes { source, .. }
+            | Error::RequestRegion { source, .. }
+            | Error::FindViewInfo { source, .. }
+            | Error::TableMetadataManager { source, .. } => source.retry_hint(),
+
+            Error::ParseFileFormat { source, .. }
+            | Error::InferSchema { source, .. }
+            | Error::ListObjects { source, .. }
+            | Error::BuildBackend { source, .. }
+            | Error::ReadOrc { source, .. } => source.retry_hint(),
+
+            Error::ExtractTableNames { source, .. }
+            | Error::ExecuteStatement { source, .. }
+            | Error::PlanStatement { source, .. }
+            | Error::ParseQuery { source, .. }
+            | Error::ExecLogicalPlan { source, .. }
+            | Error::DescribeStatement { source, .. } => source.retry_hint(),
+
+            Error::FindTablePartitionRule { source, .. }
+            | Error::SplitInsert { source, .. }
+            | Error::SplitDelete { source, .. }
+            | Error::FindRegionLeader { source, .. } => source.retry_hint(),
+
+            Error::BuildCreateExprOnInsertion { source, .. }
+            | Error::FindNewColumnsOnInsertion { source, .. }
+            | Error::AlterExprToRequest { source, .. } => source.retry_hint(),
+
+            Error::ConvertColumnDefaultConstraint { source, .. }
+            | Error::IntoVectors { source, .. }
+            | Error::ColumnDefaultValue { source, .. } => source.retry_hint(),
+
+            Error::ColumnDataType { source, .. }
+            | Error::InvalidColumnDef { source, .. }
+            | Error::ColumnOptions { source, .. } => source.retry_hint(),
+
+            Error::Table { source, .. }
+            | Error::Insert { source, .. }
+            | Error::MissingTimeIndexColumn { source, .. } => source.retry_hint(),
+
+            Error::Cast { source, .. } => source.retry_hint(),
+            Error::ParseSql { source, .. } => source.retry_hint(),
+            Error::Catalog { source, .. } => source.retry_hint(),
+            Error::SubstraitCodec { source, .. } => source.retry_hint(),
+            Error::External { source, .. } => source.retry_hint(),
+            Error::BuildRecordBatch { source, .. } => source.retry_hint(),
+            Error::DecodeFlightData { source, .. } => source.retry_hint(),
+            Error::SqlCommon { source, .. } => source.retry_hint(),
+            Error::ConvertSchema { source, .. } => source.retry_hint(),
+            Error::WriteStreamToFile { source, .. } => source.retry_hint(),
+            Error::PrepareFileTable { source, .. } | Error::InferFileTableSchema { source, .. } => {
+                source.retry_hint()
+            }
+            #[cfg(feature = "enterprise")]
+            Error::TriggerQuerier { source, .. } => source.retry_hint(),
+            _ => RetryHint::NonRetryable,
+        }
     }
 }
 

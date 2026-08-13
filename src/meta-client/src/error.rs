@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use common_error::define_from_tonic_status;
-use common_error::ext::ErrorExt;
+use common_error::ext::{ErrorExt, RetryHint};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use snafu::{Location, Snafu};
@@ -29,11 +29,12 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("{}", msg))]
+    #[snafu(display("{}, code: {}, tonic code: {}", msg, code, tonic_code))]
     MetaServer {
         code: StatusCode,
         msg: String,
         tonic_code: tonic::Code,
+        retry_hint: RetryHint,
         #[snafu(implicit)]
         location: Location,
     },
@@ -62,6 +63,12 @@ pub enum Error {
     #[snafu(display("{} not started", name))]
     NotStarted {
         name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Procedure submission requires query context"))]
+    MissingQueryContext {
         #[snafu(implicit)]
         location: Location,
     },
@@ -140,12 +147,14 @@ impl ErrorExt for Error {
             | Error::NoLeader { .. }
             | Error::AskLeaderTimeout { .. }
             | Error::NotStarted { .. }
+            | Error::MissingQueryContext { .. }
             | Error::SendHeartbeat { .. }
             | Error::CreateHeartbeatStream { .. }
             | Error::CreateChannel { .. }
             | Error::RetryTimesExceeded { .. }
-            | Error::ReadOnlyKvBackend { .. }
             | Error::ConvertMetaConfig { .. } => StatusCode::Internal,
+
+            Error::ReadOnlyKvBackend { .. } => StatusCode::Unsupported,
 
             Error::MetaServer { code, .. } => *code,
 
@@ -155,6 +164,18 @@ impl ErrorExt for Error {
             | Error::GetFlowStat { source, .. } => source.status_code(),
         }
     }
+
+    fn retry_hint(&self) -> RetryHint {
+        match self {
+            Error::MetaServer { retry_hint, .. } => *retry_hint,
+            Error::InvalidResponseHeader { source, .. }
+            | Error::ConvertMetaRequest { source, .. }
+            | Error::ConvertMetaResponse { source, .. }
+            | Error::GetFlowStat { source, .. } => source.retry_hint(),
+            Error::CreateChannel { source, .. } => source.retry_hint(),
+            _ => RetryHint::NonRetryable,
+        }
+    }
 }
 
 impl Error {
@@ -162,7 +183,7 @@ impl Error {
         matches!(
             self,
             Error::MetaServer {
-                tonic_code: tonic::Code::OutOfRange,
+                tonic_code: tonic::Code::OutOfRange | tonic::Code::ResourceExhausted,
                 ..
             }
         )
@@ -170,3 +191,86 @@ impl Error {
 }
 
 define_from_tonic_status!(Error, MetaServer);
+
+#[cfg(test)]
+mod tests {
+    use common_error::ext::{ErrorExt, RetryHint};
+    use common_error::{GREPTIME_DB_HEADER_ERROR_CODE, GREPTIME_DB_HEADER_ERROR_RETRY_HINT};
+    use tonic::codegen::http::{HeaderMap, HeaderValue};
+    use tonic::metadata::MetadataMap;
+
+    use super::*;
+
+    #[test]
+    fn test_from_tonic_status_fallbacks_to_status_code() {
+        let status = tonic::Status::new(tonic::Code::Internal, "blabla");
+
+        let err: Error = status.into();
+
+        assert_eq!(err.retry_hint(), RetryHint::NonRetryable);
+    }
+
+    #[test]
+    fn test_from_tonic_status_fallback_can_be_non_retryable() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            GREPTIME_DB_HEADER_ERROR_CODE,
+            HeaderValue::from(StatusCode::InvalidArguments as u32),
+        );
+        let status = tonic::Status::with_metadata(
+            tonic::Code::Internal,
+            "blabla",
+            MetadataMap::from_headers(headers),
+        );
+
+        let err: Error = status.into();
+
+        assert_eq!(err.retry_hint(), RetryHint::NonRetryable);
+    }
+
+    #[test]
+    fn test_from_tonic_status_with_retry_hint() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            GREPTIME_DB_HEADER_ERROR_CODE,
+            HeaderValue::from(StatusCode::Internal as u32),
+        );
+        headers.insert(
+            GREPTIME_DB_HEADER_ERROR_RETRY_HINT,
+            HeaderValue::from_static(RetryHint::Retryable.as_str()),
+        );
+        let status = tonic::Status::with_metadata(
+            tonic::Code::Internal,
+            "blabla",
+            MetadataMap::from_headers(headers),
+        );
+
+        let err: Error = status.into();
+
+        assert_eq!(err.retry_hint(), RetryHint::Retryable);
+    }
+
+    #[test]
+    fn test_is_exceeded_size_limit_for_out_of_range() {
+        let err = Error::from(tonic::Status::new(tonic::Code::OutOfRange, "any message"));
+
+        assert!(err.is_exceeded_size_limit());
+    }
+
+    #[test]
+    fn test_is_exceeded_size_limit_for_resource_exhausted() {
+        let err = Error::from(tonic::Status::new(
+            tonic::Code::ResourceExhausted,
+            "arbitrary message",
+        ));
+
+        assert!(err.is_exceeded_size_limit());
+    }
+
+    #[test]
+    fn test_is_exceeded_size_limit_for_non_size_code() {
+        let err = Error::from(tonic::Status::new(tonic::Code::Internal, "message"));
+
+        assert!(!err.is_exceeded_size_limit());
+    }
+}

@@ -75,7 +75,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             return;
         }
 
-        let staging_partition_info = region.staging_partition_info.lock().unwrap().clone();
+        let staging_partition_info = region.manifest_ctx.staging_partition_info();
 
         let staging_partition_expr = staging_partition_info
             .as_ref()
@@ -136,11 +136,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             );
             let _ = worker_sender
                 .send(WorkerRequestWithTime::new(WorkerRequest::EditRegion(
-                    RegionEditRequest {
-                        region_id: region.region_id,
-                        edit,
-                        tx,
-                    },
+                    RegionEditRequest::new(
+                        region_id, edit,
+                        // we don't need to preload sst cache during repartition, as it may cause extra network overhead.
+                        false, tx,
+                    ),
                 )))
                 .await;
 
@@ -152,12 +152,18 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                     return;
                 };
                 let mut manager = region.manifest_ctx.manifest_manager.write().await;
-                match region.exit_staging_on_success(&mut manager).await {
-                    Ok(()) => {
-                        sender.send(Ok(0));
+                let hook_payload = match region.exit_staging_on_success(&mut manager).await {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        sender.send(Err(e));
+                        return;
                     }
-                    Err(e) => sender.send(Err(e)),
+                };
+                drop(manager);
+                if let Some(pending) = hook_payload {
+                    pending.fire().await;
                 }
+                sender.send(Ok(0));
             } else {
                 sender.send(
                     UnexpectedSnafu {

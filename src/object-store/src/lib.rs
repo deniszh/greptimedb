@@ -15,7 +15,7 @@
 pub use opendal::raw::{Access, HttpClient};
 pub use opendal::{
     Buffer, Builder as ObjectStoreBuilder, Entry, EntryMode, Error, ErrorKind, FuturesAsyncReader,
-    FuturesAsyncWriter, Lister, Operator as ObjectStore, Reader, Result, Scheme, Writer, services,
+    FuturesAsyncWriter, Lister, Operator as ObjectStore, Reader, Result, Writer, services,
 };
 
 pub mod config;
@@ -24,6 +24,7 @@ pub mod factory;
 pub mod layers;
 pub mod manager;
 mod metrics;
+pub mod secure_fs;
 pub mod test_util;
 pub mod util;
 

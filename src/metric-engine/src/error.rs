@@ -15,7 +15,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use common_error::ext::{BoxedError, ErrorExt};
+use common_error::ext::{BoxedError, ErrorExt, RetryHint};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use datatypes::prelude::ConcreteDataType;
@@ -37,6 +37,14 @@ pub enum Error {
 
     #[snafu(display("Failed to open mito region, region type: {}", region_type))]
     OpenMitoRegion {
+        region_type: String,
+        source: BoxedError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to clean up mito region, region type: {}", region_type))]
+    CleanUpMitoRegion {
         region_type: String,
         source: BoxedError,
         #[snafu(implicit)]
@@ -170,6 +178,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Mito truncate operation fails"))]
+    MitoTruncateOperation {
+        source: BoxedError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Mito sync operation fails"))]
     MitoSyncOperation {
         source: BoxedError,
@@ -250,6 +265,12 @@ pub enum Error {
 
     #[snafu(display("Alter request to physical region is forbidden"))]
     ForbiddenPhysicalAlter {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Write request to physical region is forbidden"))]
+    ForbiddenPhysicalWrite {
         #[snafu(implicit)]
         location: Location,
     },
@@ -343,6 +364,19 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display(
+        "Failed to create default value for column {} of region {}",
+        column,
+        region_id
+    ))]
+    CreateDefault {
+        region_id: RegionId,
+        column: String,
+        source: datatypes::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Unexpected request: {}", reason))]
     UnexpectedRequest {
         reason: String,
@@ -394,9 +428,11 @@ impl ErrorExt for Error {
             | UnsupportedAlterKind { .. }
             | UnsupportedRemapManifestsRequest { .. }
             | UnsupportedSyncRegionFromRequest { .. }
-            | InvalidRequest { .. } => StatusCode::InvalidArguments,
+            | InvalidRequest { .. }
+            | CreateDefault { .. } => StatusCode::InvalidArguments,
 
             ForbiddenPhysicalAlter { .. }
+            | ForbiddenPhysicalWrite { .. }
             | UnsupportedRegionRequest { .. }
             | MissingFiles { .. } => StatusCode::Unsupported,
 
@@ -417,10 +453,12 @@ impl ErrorExt for Error {
 
             CreateMitoRegion { source, .. }
             | OpenMitoRegion { source, .. }
+            | CleanUpMitoRegion { source, .. }
             | CloseMitoRegion { source, .. }
             | MitoReadOperation { source, .. }
             | MitoWriteOperation { source, .. }
             | MitoFlushOperation { source, .. }
+            | MitoTruncateOperation { source, .. }
             | MitoSyncOperation { source, .. }
             | MitoEnterStagingOperation { source, .. }
             | BatchOpenMitoRegion { source, .. }
@@ -442,5 +480,33 @@ impl ErrorExt for Error {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn retry_hint(&self) -> RetryHint {
+        use Error::*;
+
+        match self {
+            CreateMitoRegion { source, .. }
+            | OpenMitoRegion { source, .. }
+            | CleanUpMitoRegion { source, .. }
+            | BatchOpenMitoRegion { source, .. }
+            | BatchCatchupMitoRegion { source, .. }
+            | CloseMitoRegion { source, .. }
+            | MitoReadOperation { source, .. }
+            | MitoWriteOperation { source, .. }
+            | MitoFlushOperation { source, .. }
+            | MitoTruncateOperation { source, .. }
+            | MitoSyncOperation { source, .. }
+            | MitoEnterStagingOperation { source, .. }
+            | MitoCopyRegionFromOperation { source, .. }
+            | MitoEditRegion { source, .. } => source.retry_hint(),
+
+            EncodePrimaryKey { source, .. } => source.retry_hint(),
+            CollectRecordBatchStream { source, .. } => source.retry_hint(),
+            StartRepeatedTask { source, .. } => source.retry_hint(),
+            CacheGet { source, .. } => source.retry_hint(),
+
+            _ => RetryHint::NonRetryable,
+        }
     }
 }

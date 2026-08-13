@@ -18,14 +18,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::v1::{AffectedRows, FlightMetadata, Metrics};
+use arrow_flight::FlightData;
 use arrow_flight::utils::flight_data_to_arrow_batch;
-use arrow_flight::{FlightData, SchemaAsIpc};
 use common_base::bytes::Bytes;
 use common_recordbatch::DfRecordBatch;
 use datatypes::arrow;
 use datatypes::arrow::array::ArrayRef;
 use datatypes::arrow::buffer::Buffer;
-use datatypes::arrow::datatypes::{DataType, Schema as ArrowSchema, SchemaRef};
+use datatypes::arrow::datatypes::{Schema as ArrowSchema, SchemaRef};
 use datatypes::arrow::error::ArrowError;
 use datatypes::arrow::ipc::{MessageHeader, convert, reader, root_as_message, writer};
 use flatbuffers::FlatBufferBuilder;
@@ -37,11 +37,19 @@ use vec1::{Vec1, vec1};
 use crate::error;
 use crate::error::{DecodeFlightDataSnafu, InvalidFlightDataSnafu, Result};
 
+/// Flight metadata key used to carry flow query extensions as JSON pairs.
+pub const FLOW_EXTENSIONS_METADATA_KEY: &str = "x-greptime-flow-extensions";
+/// Flight metadata key used to carry query snapshot read upper bounds as JSON.
+pub const SNAPSHOT_SEQS_METADATA_KEY: &str = "x-greptime-snapshot-seqs";
+
 #[derive(Debug, Clone)]
 pub enum FlightMessage {
     Schema(SchemaRef),
     RecordBatch(DfRecordBatch),
-    AffectedRows(usize),
+    AffectedRows {
+        rows: usize,
+        metrics: Option<String>,
+    },
     Metrics(String),
 }
 
@@ -80,8 +88,14 @@ impl FlightEncoder {
     }
 
     /// Encode the Arrow schema to [FlightData].
-    pub fn encode_schema(&self, schema: &ArrowSchema) -> FlightData {
-        SchemaAsIpc::new(schema, &self.write_options).into()
+    pub fn encode_schema(&mut self, schema: &ArrowSchema) -> FlightData {
+        self.data_gen
+            .schema_to_bytes_with_dictionary_tracker(
+                schema,
+                &mut self.dictionary_tracker,
+                &self.write_options,
+            )
+            .into()
     }
 
     /// Encode the [FlightMessage] to a list (at least one element) of [FlightData]s.
@@ -91,15 +105,7 @@ impl FlightEncoder {
     /// be encoded to exactly one [FlightData].
     pub fn encode(&mut self, flight_message: FlightMessage) -> Vec1<FlightData> {
         match flight_message {
-            FlightMessage::Schema(schema) => {
-                schema.fields().iter().for_each(|x| {
-                    if matches!(x.data_type(), DataType::Dictionary(_, _)) {
-                        self.dictionary_tracker.next_dict_id();
-                    }
-                });
-
-                vec1![self.encode_schema(schema.as_ref())]
-            }
+            FlightMessage::Schema(schema) => vec1![self.encode_schema(schema.as_ref())],
             FlightMessage::RecordBatch(record_batch) => {
                 let (encoded_dictionaries, encoded_batch) = self
                     .data_gen
@@ -116,10 +122,12 @@ impl FlightEncoder {
                     encoded_batch.into(),
                 )
             }
-            FlightMessage::AffectedRows(rows) => {
+            FlightMessage::AffectedRows { rows, metrics } => {
                 let metadata = FlightMetadata {
                     affected_rows: Some(AffectedRows { value: rows as _ }),
-                    metrics: None,
+                    metrics: metrics.map(|s| Metrics {
+                        metrics: s.into_bytes(),
+                    }),
                 }
                 .encode_to_vec();
                 vec1![FlightData {
@@ -223,7 +231,12 @@ impl FlightDecoder {
                 let metadata = FlightMetadata::decode(flight_data.app_metadata.clone())
                     .context(DecodeFlightDataSnafu)?;
                 if let Some(AffectedRows { value }) = metadata.affected_rows {
-                    return Ok(Some(FlightMessage::AffectedRows(value as _)));
+                    return Ok(Some(FlightMessage::AffectedRows {
+                        rows: value as _,
+                        metrics: metadata
+                            .metrics
+                            .map(|m| String::from_utf8_lossy(&m.metrics).to_string()),
+                    }));
                 }
                 if let Some(Metrics { metrics }) = metadata.metrics {
                     return Ok(Some(FlightMessage::Metrics(
@@ -356,8 +369,9 @@ fn build_none_flight_msg() -> Bytes {
 mod test {
     use arrow_flight::utils::batches_to_flight_data;
     use datatypes::arrow::array::{
-        DictionaryArray, Int32Array, StringArray, UInt8Array, UInt32Array,
+        DictionaryArray, Int32Array, ListArray, StringArray, UInt8Array, UInt32Array,
     };
+    use datatypes::arrow::buffer::OffsetBuffer;
     use datatypes::arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
@@ -423,6 +437,47 @@ mod test {
             unreachable!()
         };
         assert_eq!(actual_batch, batch2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_affected_rows_metrics_encode_decode() -> Result<()> {
+        let metrics = r#"{"region_watermarks":[{"region_id":42,"watermark":7}]}"#;
+        let mut encoder = FlightEncoder::default();
+        let encoded = encoder.encode(FlightMessage::AffectedRows {
+            rows: 3,
+            metrics: Some(metrics.to_string()),
+        });
+
+        assert_eq!(encoded.len(), 1);
+
+        let mut decoder = FlightDecoder::default();
+        let decoded = decoder.try_decode(encoded.first())?.unwrap();
+        let FlightMessage::AffectedRows {
+            rows,
+            metrics: decoded_metrics,
+        } = decoded
+        else {
+            unreachable!()
+        };
+        assert_eq!(rows, 3);
+        assert_eq!(decoded_metrics.as_deref(), Some(metrics));
+
+        let encoded = encoder.encode(FlightMessage::AffectedRows {
+            rows: 5,
+            metrics: None,
+        });
+        let decoded = decoder.try_decode(encoded.first())?.unwrap();
+        let FlightMessage::AffectedRows {
+            rows,
+            metrics: decoded_metrics,
+        } = decoded
+        else {
+            unreachable!()
+        };
+        assert_eq!(rows, 5);
+        assert!(decoded_metrics.is_none());
+
         Ok(())
     }
 
@@ -547,5 +602,121 @@ mod test {
 +---+---+";
         assert_eq!(actual, expected.trim());
         Ok(())
+    }
+
+    #[test]
+    fn test_encode_schema_with_nested_dictionary_array() -> Result<()> {
+        let item = Arc::new(Field::new_dictionary(
+            "item",
+            DataType::UInt32,
+            DataType::Utf8,
+            true,
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(item.clone()),
+            true,
+        )]));
+        let values = DictionaryArray::new(
+            UInt32Array::from_iter_values([0, 1, 0]),
+            Arc::new(StringArray::from_iter_values(["host-a", "host-b"])),
+        );
+        let list = ListArray::new(
+            item,
+            OffsetBuffer::from_lengths([2, 1]),
+            Arc::new(values),
+            None,
+        );
+        let batch = DfRecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+
+        let mut encoder = FlightEncoder::default();
+        let encoded_schema = encoder.encode_schema(schema.as_ref());
+        let encoded_batch = encoder.encode(FlightMessage::RecordBatch(batch.clone()));
+
+        let mut decoder = FlightDecoder::default();
+        assert!(matches!(
+            decoder.try_decode(&encoded_schema)?,
+            Some(FlightMessage::Schema(actual)) if actual == schema
+        ));
+        for data in encoded_batch.iter().take(encoded_batch.len() - 1) {
+            assert!(decoder.try_decode(data)?.is_none());
+        }
+        assert!(matches!(
+            decoder.try_decode(encoded_batch.last())?,
+            Some(FlightMessage::RecordBatch(actual)) if actual == batch
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_affected_rows_roundtrip_through_flight_codec() {
+        // Verify the full FlightEncoder → FlightDecoder pipeline handles
+        // the new FlightMessage::AffectedRows variant with optional inline
+        // metrics without breaking the wire protocol.
+        let mut encoder = FlightEncoder::default();
+        let mut decoder = FlightDecoder::default();
+
+        // Without metrics — same wire format as old `AffectedRows(7)`.
+        let encoded = encoder.encode(FlightMessage::AffectedRows {
+            rows: 7,
+            metrics: None,
+        });
+        let decoded = decoder.try_decode(encoded.first()).unwrap().unwrap();
+        assert!(matches!(
+            decoded,
+            FlightMessage::AffectedRows {
+                rows: 7,
+                metrics: None,
+            }
+        ));
+
+        // With metrics — new capability, row count preserved.
+        let json = r#"{"region_watermarks":[{"region_id":1,"watermark":99}]}"#;
+        let encoded = encoder.encode(FlightMessage::AffectedRows {
+            rows: 42,
+            metrics: Some(json.to_string()),
+        });
+        let decoded = decoder.try_decode(encoded.first()).unwrap().unwrap();
+        assert!(matches!(
+            decoded,
+            FlightMessage::AffectedRows {
+                rows: 42,
+                metrics: Some(_),
+            }
+        ));
+    }
+
+    /// Simulates the wire output of the **old** `FlightMessage::AffectedRows(usize)`
+    /// variant and verifies that the **new** `FlightDecoder` handles it.
+    #[test]
+    fn test_old_affected_rows_format_decoded_by_new_code() {
+        use arrow_flight::FlightData;
+        use prost::bytes::Bytes as ProstBytes;
+
+        // The old encoder produced FlightData whose app_metadata is
+        // FlightMetadata { affected_rows, metrics: None }. The new
+        // `AffectedRows { rows, metrics: Option<String> }` variant with
+        // `metrics: None` produces the exact same wire bytes.
+        let old_wire_bytes = FlightData {
+            flight_descriptor: None,
+            data_header: build_none_flight_msg().into(),
+            app_metadata: FlightMetadata {
+                affected_rows: Some(AffectedRows { value: 99 }),
+                metrics: None, // old format: no metrics field
+            }
+            .encode_to_vec()
+            .into(),
+            data_body: ProstBytes::default(),
+        };
+
+        let mut decoder = FlightDecoder::default();
+        let decoded = decoder.try_decode(&old_wire_bytes).unwrap().unwrap();
+        assert!(matches!(
+            decoded,
+            FlightMessage::AffectedRows {
+                rows: 99,
+                metrics: None,
+            }
+        ));
     }
 }

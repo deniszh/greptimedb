@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::v1::SemanticType;
-use common_recordbatch::recordbatch::align_json_array;
 use datatypes::arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, DictionaryArray, UInt32Array,
 };
@@ -26,9 +25,11 @@ use datatypes::arrow::compute::{TakeOptions, take};
 use datatypes::arrow::datatypes::{FieldRef, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::ConcreteDataType;
+use datatypes::extension::json::is_json2_extension_type;
 use datatypes::prelude::DataType;
 use datatypes::value::Value;
-use datatypes::vectors::{Helper, VectorRef};
+use datatypes::vectors::VectorRef;
+use datatypes::vectors::json::array::JsonArray;
 use mito_codec::row_converter::{
     CompositeValues, PrimaryKeyCodec, SortField, build_primary_key_codec,
     build_primary_key_codec_with_fields,
@@ -39,132 +40,23 @@ use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::ColumnId;
 
 use crate::error::{
-    CastVectorSnafu, CompatReaderSnafu, ComputeArrowSnafu, ConvertVectorSnafu, CreateDefaultSnafu,
-    DecodeSnafu, EncodeSnafu, NewRecordBatchSnafu, RecordBatchSnafu, Result, UnexpectedSnafu,
-    UnsupportedOperationSnafu,
+    CompatReaderSnafu, ComputeArrowSnafu, ConvertValueSnafu, CreateDefaultSnafu, DecodeSnafu,
+    EncodeSnafu, NewRecordBatchSnafu, Result, UnexpectedSnafu, UnsupportedOperationSnafu,
 };
 use crate::read::flat_projection::{FlatProjectionMapper, flat_projected_columns};
-use crate::read::projection::{PrimaryKeyProjectionMapper, ProjectionMapper};
-use crate::read::{Batch, BatchColumn, BatchReader};
-use crate::sst::parquet::flat_format::primary_key_column_index;
-use crate::sst::parquet::format::{FormatProjection, INTERNAL_COLUMN_NUM, PrimaryKeyArray};
-use crate::sst::{internal_fields, tag_maybe_to_dictionary_field};
+use crate::sst::parquet::flat_format::{FlatReadFormat, primary_key_column_index};
+use crate::sst::parquet::format::{INTERNAL_COLUMN_NUM, PrimaryKeyArray};
+use crate::sst::{internal_fields, tag_maybe_to_dictionary_field, with_field_id};
 
-/// Reader to adapt schema of underlying reader to expected schema.
-pub struct CompatReader<R> {
-    /// Underlying reader.
-    reader: R,
-    /// Helper to compat batches.
-    compat: PrimaryKeyCompatBatch,
-}
-
-impl<R> CompatReader<R> {
-    /// Creates a new compat reader.
-    /// - `mapper` is built from the metadata users expect to see.
-    /// - `reader_meta` is the metadata of the input reader.
-    /// - `reader` is the input reader.
-    pub fn new(
-        mapper: &ProjectionMapper,
-        reader_meta: RegionMetadataRef,
-        reader: R,
-    ) -> Result<CompatReader<R>> {
-        Ok(CompatReader {
-            reader,
-            compat: PrimaryKeyCompatBatch::new(mapper, reader_meta)?,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl<R: BatchReader> BatchReader for CompatReader<R> {
-    async fn next_batch(&mut self) -> Result<Option<Batch>> {
-        let Some(mut batch) = self.reader.next_batch().await? else {
-            return Ok(None);
-        };
-
-        batch = self.compat.compat_batch(batch)?;
-
-        Ok(Some(batch))
-    }
-}
-
-/// Helper to adapt schema of the batch to an expected schema.
-pub(crate) enum CompatBatch {
-    /// Adapter for primary key format.
-    PrimaryKey(PrimaryKeyCompatBatch),
-    /// Adapter for flat format.
-    Flat(FlatCompatBatch),
-}
-
-impl CompatBatch {
-    /// Returns the inner primary key batch adapter if this is a PrimaryKey format.
-    #[allow(dead_code)]
-    pub(crate) fn as_primary_key(&self) -> Option<&PrimaryKeyCompatBatch> {
-        match self {
-            CompatBatch::PrimaryKey(batch) => Some(batch),
-            _ => None,
-        }
-    }
-
-    /// Returns the inner flat batch adapter if this is a Flat format.
-    pub(crate) fn as_flat(&self) -> Option<&FlatCompatBatch> {
-        match self {
-            CompatBatch::Flat(batch) => Some(batch),
-            _ => None,
-        }
-    }
-}
-
-/// A helper struct to adapt schema of the batch to an expected schema.
-pub(crate) struct PrimaryKeyCompatBatch {
-    /// Optional primary key adapter.
-    rewrite_pk: Option<RewritePrimaryKey>,
-    /// Optional primary key adapter.
-    compat_pk: Option<CompatPrimaryKey>,
-    /// Optional fields adapter.
-    compat_fields: Option<CompatFields>,
-}
-
-impl PrimaryKeyCompatBatch {
-    /// Creates a new [CompatBatch].
-    /// - `mapper` is built from the metadata users expect to see.
-    /// - `reader_meta` is the metadata of the input reader.
-    pub(crate) fn new(mapper: &ProjectionMapper, reader_meta: RegionMetadataRef) -> Result<Self> {
-        let rewrite_pk = may_rewrite_primary_key(mapper.metadata(), &reader_meta);
-        let compat_pk = may_compat_primary_key(mapper.metadata(), &reader_meta)?;
-        let mapper = mapper.as_primary_key().context(UnexpectedSnafu {
-            reason: "Unexpected format",
-        })?;
-        let compat_fields = may_compat_fields(mapper, &reader_meta)?;
-
-        Ok(Self {
-            rewrite_pk,
-            compat_pk,
-            compat_fields,
-        })
-    }
-
-    /// Adapts the `batch` to the expected schema.
-    pub(crate) fn compat_batch(&self, mut batch: Batch) -> Result<Batch> {
-        if let Some(rewrite_pk) = &self.rewrite_pk {
-            batch = rewrite_pk.compat(batch)?;
-        }
-        if let Some(compat_pk) = &self.compat_pk {
-            batch = compat_pk.compat(batch)?;
-        }
-        if let Some(compat_fields) = &self.compat_fields {
-            batch = compat_fields.compat(batch)?;
-        }
-
-        Ok(batch)
-    }
-}
-
-/// Returns true if `left` and `right` have same columns and primary key encoding.
+/// Returns true if the columns in the `projection_mapper` and `read_format` have same data types
+/// and primary key encodings.
 pub(crate) fn has_same_columns_and_pk_encoding(
-    left: &RegionMetadata,
-    right: &RegionMetadata,
+    projection_mapper: &FlatProjectionMapper,
+    read_format: &FlatReadFormat,
+    compaction: bool,
 ) -> bool {
+    let left = projection_mapper.metadata();
+    let right = read_format.metadata();
     if left.primary_key_encoding != right.primary_key_encoding {
         return false;
     }
@@ -174,17 +66,13 @@ pub(crate) fn has_same_columns_and_pk_encoding(
     }
 
     for (left_col, right_col) in left.column_metadatas.iter().zip(&right.column_metadatas) {
-        if left_col.column_id != right_col.column_id || !left_col.is_same_datatype(right_col) {
+        if left_col.column_id != right_col.column_id {
             return false;
         }
-        debug_assert_eq!(
-            left_col.column_schema.data_type,
-            right_col.column_schema.data_type
-        );
         debug_assert_eq!(left_col.semantic_type, right_col.semantic_type);
     }
 
-    true
+    &projection_mapper.input_arrow_schema(compaction) == read_format.arrow_schema()
 }
 
 /// A helper struct to adapt schema of the batch to an expected schema.
@@ -201,18 +89,38 @@ impl FlatCompatBatch {
     /// Creates a [FlatCompatBatch].
     ///
     /// - `mapper` is built from the metadata users expect to see.
-    /// - `actual` is the [RegionMetadata] of the input parquet.
-    /// - `format_projection` is the projection of the read format for the input parquet.
+    /// - `read_format` is the [FlatReadFormat] of the input parquet.
     /// - `compaction` indicates whether the reader is for compaction.
     pub(crate) fn try_new(
         mapper: &FlatProjectionMapper,
-        actual: &RegionMetadataRef,
-        format_projection: &FormatProjection,
+        read_format: &FlatReadFormat,
         compaction: bool,
     ) -> Result<Option<Self>> {
-        let actual_schema = flat_projected_columns(actual, format_projection);
+        let actual = read_format.metadata();
+        let format_projection = read_format.format_projection();
+        let mut actual_schema = flat_projected_columns(actual, format_projection);
+        if read_format
+            .arrow_schema()
+            .fields()
+            .iter()
+            .any(is_json2_extension_type)
+        {
+            for field in read_format.arrow_schema().fields() {
+                if is_json2_extension_type(field)
+                    && let Some(column_id) =
+                        actual.column_by_name(field.name()).map(|x| x.column_id)
+                    && let Some(i) = actual_schema.iter().position(|x| x.0 == column_id)
+                {
+                    actual_schema[i].1 = ConcreteDataType::from_arrow_type(field.data_type());
+                }
+            }
+        }
+
         let expect_schema = mapper.batch_schema();
-        if expect_schema == actual_schema {
+        if expect_schema == actual_schema
+            && actual.primary_key == mapper.metadata().primary_key
+            && actual.primary_key_encoding == mapper.metadata().primary_key_encoding
+        {
             // Although the SST has a different schema, but the schema after projection is the same
             // as expected schema.
             return Ok(None);
@@ -256,12 +164,21 @@ impl FlatCompatBatch {
             let column_field = &expect_metadata.schema.arrow_schema().fields()[column_index];
             // For tag columns, we need to create a dictionary field.
             if expect_column.semantic_type == SemanticType::Tag {
-                fields.push(tag_maybe_to_dictionary_field(
+                let field = tag_maybe_to_dictionary_field(
                     &expect_column.column_schema.data_type,
                     column_field,
-                ));
+                );
+                fields.push(Arc::new(with_field_id(
+                    (*field).clone(),
+                    expect_column.column_id,
+                )));
             } else {
-                fields.push(column_field.clone());
+                let field = with_field_id(
+                    Arc::unwrap_or_clone(column_field.clone()),
+                    expect_column.column_id,
+                )
+                .with_data_type(expect_data_type.as_arrow_type());
+                fields.push(Arc::new(field))
             };
 
             if let Some((index, actual_data_type)) = actual_schema_index.get(column_id) {
@@ -293,7 +210,6 @@ impl FlatCompatBatch {
                         ),
                     })?;
                 index_or_defaults.push(IndexOrDefault::DefaultValue {
-                    column_id: expect_column.column_id,
                     default_vector,
                     semantic_type: expect_column.semantic_type,
                 });
@@ -354,9 +270,12 @@ impl FlatCompatBatch {
                     let old_column = batch.column(*pos);
 
                     if let Some(ty) = cast_type {
-                        let casted = if let Some(json_type) = ty.as_json() {
-                            align_json_array(old_column, &json_type.as_arrow_type())
-                                .context(RecordBatchSnafu)?
+                        let casted = if let Some(json_type) = ty.as_json()
+                            && json_type.is_json2()
+                        {
+                            JsonArray::from(old_column)
+                                .project_to(&json_type.as_arrow_type())
+                                .context(ConvertValueSnafu)?
                         } else {
                             datatypes::arrow::compute::cast(old_column, &ty.as_arrow_type())
                                 .context(ComputeArrowSnafu)?
@@ -367,7 +286,6 @@ impl FlatCompatBatch {
                     }
                 }
                 IndexOrDefault::DefaultValue {
-                    column_id: _,
                     default_vector,
                     semantic_type,
                 } => repeat_vector(default_vector, len, *semantic_type == SemanticType::Tag),
@@ -380,11 +298,16 @@ impl FlatCompatBatch {
             )
             .collect::<Result<Vec<_>>>()?;
 
-        let compat_batch = RecordBatch::try_new(self.arrow_schema.clone(), columns)
-            .context(NewRecordBatchSnafu)?;
+        let mut columns = columns;
+        let primary_key_index = primary_key_column_index(columns.len());
+        columns[primary_key_index] = self.compat_primary_key(&columns[primary_key_index])?;
 
-        // Handles primary keys.
-        self.compat_pk.compat(compat_batch)
+        RecordBatch::try_new(self.arrow_schema.clone(), columns).context(NewRecordBatchSnafu)
+    }
+
+    /// Makes an encoded primary-key array compatible with the expected metadata.
+    pub(crate) fn compat_primary_key(&self, primary_key: &ArrayRef) -> Result<ArrayRef> {
+        self.compat_pk.compat(primary_key)
     }
 }
 
@@ -415,121 +338,6 @@ fn repeat_vector(vector: &VectorRef, to_len: usize, is_tag: bool) -> Result<Arra
     }
 }
 
-/// Helper to make primary key compatible.
-#[derive(Debug)]
-struct CompatPrimaryKey {
-    /// Row converter to append values to primary keys.
-    converter: Arc<dyn PrimaryKeyCodec>,
-    /// Default values to append.
-    values: Vec<(ColumnId, Value)>,
-}
-
-impl CompatPrimaryKey {
-    /// Make primary key of the `batch` compatible.
-    fn compat(&self, mut batch: Batch) -> Result<Batch> {
-        let mut buffer = Vec::with_capacity(
-            batch.primary_key().len() + self.converter.estimated_size().unwrap_or_default(),
-        );
-        buffer.extend_from_slice(batch.primary_key());
-        self.converter
-            .encode_values(&self.values, &mut buffer)
-            .context(EncodeSnafu)?;
-
-        batch.set_primary_key(buffer);
-
-        // update cache
-        if let Some(pk_values) = &mut batch.pk_values {
-            pk_values.extend(&self.values);
-        }
-
-        Ok(batch)
-    }
-}
-
-/// Helper to make fields compatible.
-#[derive(Debug)]
-struct CompatFields {
-    /// Column Ids and DataTypes the reader actually returns.
-    actual_fields: Vec<(ColumnId, ConcreteDataType)>,
-    /// Indices to convert actual fields to expect fields.
-    index_or_defaults: Vec<IndexOrDefault>,
-}
-
-impl CompatFields {
-    /// Make fields of the `batch` compatible.
-    fn compat(&self, batch: Batch) -> Result<Batch> {
-        debug_assert_eq!(self.actual_fields.len(), batch.fields().len());
-        debug_assert!(
-            self.actual_fields
-                .iter()
-                .zip(batch.fields())
-                .all(|((id, _), batch_column)| *id == batch_column.column_id)
-        );
-
-        let len = batch.num_rows();
-        self.index_or_defaults
-            .iter()
-            .map(|index_or_default| match index_or_default {
-                IndexOrDefault::Index { pos, cast_type } => {
-                    let old_column = &batch.fields()[*pos];
-
-                    let data = if let Some(ty) = cast_type {
-                        if let Some(json_type) = ty.as_json() {
-                            let json_array = old_column.data.to_arrow_array();
-                            let json_array =
-                                align_json_array(&json_array, &json_type.as_arrow_type())
-                                    .context(RecordBatchSnafu)?;
-                            Helper::try_into_vector(&json_array).context(ConvertVectorSnafu)?
-                        } else {
-                            old_column.data.cast(ty).with_context(|_| CastVectorSnafu {
-                                from: old_column.data.data_type(),
-                                to: ty.clone(),
-                            })?
-                        }
-                    } else {
-                        old_column.data.clone()
-                    };
-                    Ok(BatchColumn {
-                        column_id: old_column.column_id,
-                        data,
-                    })
-                }
-                IndexOrDefault::DefaultValue {
-                    column_id,
-                    default_vector,
-                    semantic_type: _,
-                } => {
-                    let data = default_vector.replicate(&[len]);
-                    Ok(BatchColumn {
-                        column_id: *column_id,
-                        data,
-                    })
-                }
-            })
-            .collect::<Result<Vec<_>>>()
-            .and_then(|fields| batch.with_fields(fields))
-    }
-}
-
-fn may_rewrite_primary_key(
-    expect: &RegionMetadata,
-    actual: &RegionMetadata,
-) -> Option<RewritePrimaryKey> {
-    if expect.primary_key_encoding == actual.primary_key_encoding {
-        return None;
-    }
-
-    let fields = expect.primary_key.clone();
-    let original = build_primary_key_codec(actual);
-    let new = build_primary_key_codec(expect);
-
-    Some(RewritePrimaryKey {
-        original,
-        new,
-        fields,
-    })
-}
-
 /// Returns true if the actual primary keys is the same as expected.
 fn is_primary_key_same(expect: &RegionMetadata, actual: &RegionMetadata) -> Result<bool> {
     ensure!(
@@ -557,113 +365,6 @@ fn is_primary_key_same(expect: &RegionMetadata, actual: &RegionMetadata) -> Resu
     Ok(actual.primary_key.len() == expect.primary_key.len())
 }
 
-/// Creates a [CompatPrimaryKey] if needed.
-fn may_compat_primary_key(
-    expect: &RegionMetadata,
-    actual: &RegionMetadata,
-) -> Result<Option<CompatPrimaryKey>> {
-    if is_primary_key_same(expect, actual)? {
-        return Ok(None);
-    }
-
-    // We need to append default values to the primary key.
-    let to_add = &expect.primary_key[actual.primary_key.len()..];
-    let mut fields = Vec::with_capacity(to_add.len());
-    let mut values = Vec::with_capacity(to_add.len());
-    for column_id in to_add {
-        // Safety: The id comes from expect region metadata.
-        let column = expect.column_by_id(*column_id).unwrap();
-        fields.push((
-            *column_id,
-            SortField::new(column.column_schema.data_type.clone()),
-        ));
-        let default_value = column
-            .column_schema
-            .create_default()
-            .context(CreateDefaultSnafu {
-                region_id: expect.region_id,
-                column: &column.column_schema.name,
-            })?
-            .with_context(|| CompatReaderSnafu {
-                region_id: expect.region_id,
-                reason: format!(
-                    "key column {} does not have a default value to read",
-                    column.column_schema.name
-                ),
-            })?;
-        values.push((*column_id, default_value));
-    }
-    // Using expect primary key encoding to build the converter
-    let converter =
-        build_primary_key_codec_with_fields(expect.primary_key_encoding, fields.into_iter());
-
-    Ok(Some(CompatPrimaryKey { converter, values }))
-}
-
-/// Creates a [CompatFields] if needed.
-fn may_compat_fields(
-    mapper: &PrimaryKeyProjectionMapper,
-    actual: &RegionMetadata,
-) -> Result<Option<CompatFields>> {
-    let expect_fields = mapper.batch_fields();
-    let actual_fields = Batch::projected_fields(actual, mapper.column_ids());
-    if expect_fields == actual_fields {
-        return Ok(None);
-    }
-
-    let source_field_index: HashMap<_, _> = actual_fields
-        .iter()
-        .enumerate()
-        .map(|(idx, (column_id, data_type))| (*column_id, (idx, data_type)))
-        .collect();
-
-    let index_or_defaults = expect_fields
-        .iter()
-        .map(|(column_id, expect_data_type)| {
-            if let Some((index, actual_data_type)) = source_field_index.get(column_id) {
-                let mut cast_type = None;
-
-                if expect_data_type != *actual_data_type {
-                    cast_type = Some(expect_data_type.clone())
-                }
-                // Source has this field.
-                Ok(IndexOrDefault::Index {
-                    pos: *index,
-                    cast_type,
-                })
-            } else {
-                // Safety: mapper must have this column.
-                let column = mapper.metadata().column_by_id(*column_id).unwrap();
-                // Create a default vector with 1 element for that column.
-                let default_vector = column
-                    .column_schema
-                    .create_default_vector(1)
-                    .context(CreateDefaultSnafu {
-                        region_id: mapper.metadata().region_id,
-                        column: &column.column_schema.name,
-                    })?
-                    .with_context(|| CompatReaderSnafu {
-                        region_id: mapper.metadata().region_id,
-                        reason: format!(
-                            "column {} does not have a default value to read",
-                            column.column_schema.name
-                        ),
-                    })?;
-                Ok(IndexOrDefault::DefaultValue {
-                    column_id: column.column_id,
-                    default_vector,
-                    semantic_type: SemanticType::Field,
-                })
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(Some(CompatFields {
-        actual_fields,
-        index_or_defaults,
-    }))
-}
-
 /// Index in source batch or a default value to fill a column.
 #[derive(Debug)]
 enum IndexOrDefault {
@@ -674,65 +375,11 @@ enum IndexOrDefault {
     },
     /// Default value for the column.
     DefaultValue {
-        /// Id of the column.
-        column_id: ColumnId,
         /// Default value. The vector has only 1 element.
         default_vector: VectorRef,
         /// Semantic type of the column.
         semantic_type: SemanticType,
     },
-}
-
-/// Adapter to rewrite primary key.
-struct RewritePrimaryKey {
-    /// Original primary key codec.
-    original: Arc<dyn PrimaryKeyCodec>,
-    /// New primary key codec.
-    new: Arc<dyn PrimaryKeyCodec>,
-    /// Order of the fields in the new primary key.
-    fields: Vec<ColumnId>,
-}
-
-impl RewritePrimaryKey {
-    /// Make primary key of the `batch` compatible.
-    fn compat(&self, mut batch: Batch) -> Result<Batch> {
-        if batch.pk_values().is_none() {
-            let new_pk_values = self
-                .original
-                .decode(batch.primary_key())
-                .context(DecodeSnafu)?;
-            batch.set_pk_values(new_pk_values);
-        }
-        // Safety: We ensure pk_values is not None.
-        let values = batch.pk_values().unwrap();
-
-        let mut buffer = Vec::with_capacity(
-            batch.primary_key().len() + self.new.estimated_size().unwrap_or_default(),
-        );
-        match values {
-            CompositeValues::Dense(values) => {
-                self.new
-                    .encode_values(values.as_slice(), &mut buffer)
-                    .context(EncodeSnafu)?;
-            }
-            CompositeValues::Sparse(values) => {
-                let values = self
-                    .fields
-                    .iter()
-                    .map(|id| {
-                        let value = values.get_or_null(*id);
-                        (*id, value.as_value_ref())
-                    })
-                    .collect::<Vec<_>>();
-                self.new
-                    .encode_value_refs(&values, &mut buffer)
-                    .context(EncodeSnafu)?;
-            }
-        }
-        batch.set_primary_key(buffer);
-
-        Ok(batch)
-    }
 }
 
 /// Helper to rewrite primary key to another encoding for flat format.
@@ -769,18 +416,44 @@ impl FlatRewritePrimaryKey {
     fn rewrite_key(
         &self,
         append_values: &[(ColumnId, Value)],
-        batch: RecordBatch,
-    ) -> Result<RecordBatch> {
-        let old_pk_dict_array = batch
-            .column(primary_key_column_index(batch.num_columns()))
-            .as_any()
-            .downcast_ref::<PrimaryKeyArray>()
-            .unwrap();
-        let old_pk_values_array = old_pk_dict_array
-            .values()
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
+        primary_key: &ArrayRef,
+    ) -> Result<ArrayRef> {
+        if let Some(old_pk_dict_array) = primary_key.as_any().downcast_ref::<PrimaryKeyArray>() {
+            let old_pk_values_array = old_pk_dict_array
+                .values()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .context(UnexpectedSnafu {
+                    reason: "Primary-key dictionary values are not binary",
+                })?;
+            let new_pk_values_array =
+                Arc::new(self.rewrite_values(append_values, old_pk_values_array)?);
+            return Ok(Arc::new(PrimaryKeyArray::new(
+                old_pk_dict_array.keys().clone(),
+                new_pk_values_array,
+            )));
+        }
+
+        let old_pk_values_array =
+            primary_key
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .context(UnexpectedSnafu {
+                    reason: format!(
+                        "Primary-key column is neither binary nor dictionary, got {:?}",
+                        primary_key.data_type()
+                    ),
+                })?;
+        Ok(Arc::new(
+            self.rewrite_values(append_values, old_pk_values_array)?,
+        ))
+    }
+
+    fn rewrite_values(
+        &self,
+        append_values: &[(ColumnId, Value)],
+        old_pk_values_array: &BinaryArray,
+    ) -> Result<BinaryArray> {
         let mut builder = BinaryBuilder::with_capacity(
             old_pk_values_array.len(),
             old_pk_values_array.value_data().len(),
@@ -822,14 +495,7 @@ impl FlatRewritePrimaryKey {
             }
             builder.append_value(&buffer);
         }
-        let new_pk_values_array = Arc::new(builder.finish());
-        let new_pk_dict_array =
-            PrimaryKeyArray::new(old_pk_dict_array.keys().clone(), new_pk_values_array);
-
-        let mut columns = batch.columns().to_vec();
-        columns[primary_key_column_index(batch.num_columns())] = Arc::new(new_pk_dict_array);
-
-        RecordBatch::try_new(batch.schema(), columns).context(NewRecordBatchSnafu)
+        Ok(builder.finish())
     }
 }
 
@@ -899,34 +565,58 @@ impl FlatCompatPrimaryKey {
         })
     }
 
-    /// Makes primary key of the `batch` compatible.
-    ///
-    /// Callers must ensure other columns except the `__primary_key` column is compatible.
-    fn compat(&self, batch: RecordBatch) -> Result<RecordBatch> {
+    /// Makes an encoded primary-key array compatible.
+    fn compat(&self, primary_key: &ArrayRef) -> Result<ArrayRef> {
         if let Some(rewriter) = &self.rewriter {
             // If we have different encoding, rewrite the whole primary key.
-            return rewriter.rewrite_key(&self.values, batch);
+            return rewriter.rewrite_key(&self.values, primary_key);
         }
 
-        self.append_key(batch)
+        self.append_key(primary_key)
     }
 
-    /// Appends values to the primary key of the `batch`.
-    fn append_key(&self, batch: RecordBatch) -> Result<RecordBatch> {
+    /// Appends values to the primary key array.
+    fn append_key(&self, primary_key: &ArrayRef) -> Result<ArrayRef> {
         let Some(converter) = &self.converter else {
-            return Ok(batch);
+            return Ok(primary_key.clone());
         };
 
-        let old_pk_dict_array = batch
-            .column(primary_key_column_index(batch.num_columns()))
-            .as_any()
-            .downcast_ref::<PrimaryKeyArray>()
-            .unwrap();
-        let old_pk_values_array = old_pk_dict_array
-            .values()
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
+        if let Some(old_pk_dict_array) = primary_key.as_any().downcast_ref::<PrimaryKeyArray>() {
+            let old_pk_values_array = old_pk_dict_array
+                .values()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .context(UnexpectedSnafu {
+                    reason: "Primary-key dictionary values are not binary",
+                })?;
+            let new_pk_values_array =
+                Arc::new(self.append_values(old_pk_values_array, converter.as_ref())?);
+            return Ok(Arc::new(PrimaryKeyArray::new(
+                old_pk_dict_array.keys().clone(),
+                new_pk_values_array,
+            )));
+        }
+
+        let old_pk_values_array =
+            primary_key
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .context(UnexpectedSnafu {
+                    reason: format!(
+                        "Primary-key column is neither binary nor dictionary, got {:?}",
+                        primary_key.data_type()
+                    ),
+                })?;
+        Ok(Arc::new(
+            self.append_values(old_pk_values_array, converter.as_ref())?,
+        ))
+    }
+
+    fn append_values(
+        &self,
+        old_pk_values_array: &BinaryArray,
+        converter: &dyn PrimaryKeyCodec,
+    ) -> Result<BinaryArray> {
         let mut builder = BinaryBuilder::with_capacity(
             old_pk_values_array.len(),
             old_pk_values_array.value_data().len()
@@ -955,15 +645,7 @@ impl FlatCompatPrimaryKey {
             builder.append_value(&buffer);
         }
 
-        let new_pk_values_array = Arc::new(builder.finish());
-        let new_pk_dict_array =
-            PrimaryKeyArray::new(old_pk_dict_array.keys().clone(), new_pk_values_array);
-
-        // Overrides the primary key column.
-        let mut columns = batch.columns().to_vec();
-        columns[primary_key_column_index(batch.num_columns())] = Arc::new(new_pk_dict_array);
-
-        RecordBatch::try_new(batch.schema(), columns).context(NewRecordBatchSnafu)
+        Ok(builder.finish())
     }
 }
 
@@ -973,7 +655,7 @@ mod tests {
 
     use api::v1::{OpType, SemanticType};
     use datatypes::arrow::array::{
-        ArrayRef, BinaryDictionaryBuilder, Int64Array, StringDictionaryBuilder,
+        ArrayRef, BinaryArray, BinaryDictionaryBuilder, Int64Array, StringDictionaryBuilder,
         TimestampMillisecondArray, UInt8Array, UInt64Array,
     };
     use datatypes::arrow::datatypes::UInt32Type;
@@ -990,6 +672,7 @@ mod tests {
 
     use super::*;
     use crate::read::flat_projection::FlatProjectionMapper;
+    use crate::read::read_columns::ReadColumns;
     use crate::sst::parquet::flat_format::FlatReadFormat;
     use crate::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 
@@ -1052,128 +735,6 @@ mod tests {
         buffer
     }
 
-    #[test]
-    fn test_invalid_pk_len() {
-        let reader_meta = new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (3, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1, 2],
-        );
-        let expect_meta = new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        );
-        may_compat_primary_key(&expect_meta, &reader_meta).unwrap_err();
-    }
-
-    #[test]
-    fn test_different_pk() {
-        let reader_meta = new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (3, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[2, 1],
-        );
-        let expect_meta = new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (3, SemanticType::Field, ConcreteDataType::int64_datatype()),
-                (4, SemanticType::Tag, ConcreteDataType::string_datatype()),
-            ],
-            &[1, 2, 4],
-        );
-        may_compat_primary_key(&expect_meta, &reader_meta).unwrap_err();
-    }
-
-    #[test]
-    fn test_same_pk() {
-        let reader_meta = new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        );
-        assert!(
-            may_compat_primary_key(&reader_meta, &reader_meta)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_same_pk_encoding() {
-        let reader_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-            ],
-            &[1],
-        ));
-
-        assert!(
-            may_compat_primary_key(&reader_meta, &reader_meta)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_same_fields() {
-        let reader_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        ));
-        let mapper = PrimaryKeyProjectionMapper::all(&reader_meta).unwrap();
-        assert!(may_compat_fields(&mapper, &reader_meta).unwrap().is_none())
-    }
-
     /// Creates a primary key array for flat format testing.
     fn build_flat_test_pk_array(primary_keys: &[&[u8]]) -> ArrayRef {
         let mut builder = BinaryDictionaryBuilder::<UInt32Type>::new();
@@ -1216,18 +777,16 @@ mod tests {
         let mapper = FlatProjectionMapper::all(&expected_metadata).unwrap();
         let read_format = FlatReadFormat::new(
             actual_metadata.clone(),
-            [0, 1, 2, 3].into_iter(),
+            ReadColumns::from_deduped_column_ids([0, 1, 2, 3]),
             None,
             "test",
             false,
         )
         .unwrap();
-        let format_projection = read_format.format_projection();
 
-        let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, false)
-                .unwrap()
-                .unwrap();
+        let compat_batch = FlatCompatBatch::try_new(&mapper, &read_format, false)
+            .unwrap()
+            .unwrap();
 
         let mut tag_builder = StringDictionaryBuilder::<UInt32Type>::new();
         tag_builder.append_value("tag1");
@@ -1302,27 +861,25 @@ mod tests {
             &[1],
         ));
 
-        // Output projection: tag_1, field_2. Read also includes field_3.
         let mapper = FlatProjectionMapper::new_with_read_columns(
             &expected_metadata,
             vec![1, 2],
-            vec![1, 2, 3],
+            ReadColumns::from_deduped_column_ids([1, 2, 3]),
+            None,
         )
         .unwrap();
         let read_format = FlatReadFormat::new(
             actual_metadata.clone(),
-            [1, 2, 3].into_iter(),
+            ReadColumns::from_deduped_column_ids([1, 2, 3]),
             None,
             "test",
             false,
         )
         .unwrap();
-        let format_projection = read_format.format_projection();
 
-        let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, false)
-                .unwrap()
-                .unwrap();
+        let compat_batch = FlatCompatBatch::try_new(&mapper, &read_format, false)
+            .unwrap()
+            .unwrap();
 
         let mut tag_builder = StringDictionaryBuilder::<UInt32Type>::new();
         tag_builder.append_value("tag1");
@@ -1402,18 +959,16 @@ mod tests {
         let mapper = FlatProjectionMapper::all(&expected_metadata).unwrap();
         let read_format = FlatReadFormat::new(
             actual_metadata.clone(),
-            [0, 1, 2, 3].into_iter(),
+            ReadColumns::from_deduped_column_ids([0, 1, 2, 3]),
             None,
             "test",
             false,
         )
         .unwrap();
-        let format_projection = read_format.format_projection();
 
-        let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, false)
-                .unwrap()
-                .unwrap();
+        let compat_batch = FlatCompatBatch::try_new(&mapper, &read_format, false)
+            .unwrap()
+            .unwrap();
 
         // Tag array.
         let mut tag1_builder = StringDictionaryBuilder::<UInt32Type>::new();
@@ -1463,6 +1018,64 @@ mod tests {
     }
 
     #[test]
+    fn test_compat_primary_key_with_different_encoding_only() {
+        let mut actual_metadata = new_metadata(
+            &[
+                (
+                    0,
+                    SemanticType::Timestamp,
+                    ConcreteDataType::timestamp_millisecond_datatype(),
+                ),
+                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
+                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
+            ],
+            &[1],
+        );
+        actual_metadata.primary_key_encoding = PrimaryKeyEncoding::Dense;
+        let actual_metadata = Arc::new(actual_metadata);
+
+        let mut expected_metadata = (*actual_metadata).clone();
+        expected_metadata.primary_key_encoding = PrimaryKeyEncoding::Sparse;
+        let expected_metadata = Arc::new(expected_metadata);
+
+        let mapper = FlatProjectionMapper::all(&expected_metadata).unwrap();
+        let read_format = FlatReadFormat::new(
+            actual_metadata,
+            ReadColumns::from_deduped_column_ids([0, 1, 2]),
+            None,
+            "test",
+            false,
+        )
+        .unwrap();
+        let compat = FlatCompatBatch::try_new(&mapper, &read_format, false)
+            .unwrap()
+            .unwrap();
+
+        let dense_key = encode_key(&[Some("tag1")]);
+        let sparse_key = encode_sparse_key(&[(1, Some("tag1"))]);
+
+        let dictionary_key = build_flat_test_pk_array(&[&dense_key, &dense_key]);
+        let result = compat.compat_primary_key(&dictionary_key).unwrap();
+        let result = result.as_any().downcast_ref::<PrimaryKeyArray>().unwrap();
+        let values = result
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(result.keys().value(0) as usize), sparse_key);
+        assert_eq!(values.value(result.keys().value(1) as usize), sparse_key);
+
+        let binary_key: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(dense_key.as_slice()),
+            Some(dense_key.as_slice()),
+        ]));
+        let result = compat.compat_primary_key(&binary_key).unwrap();
+        let result = result.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(result.value(0), sparse_key);
+        assert_eq!(result.value(1), sparse_key);
+    }
+
+    #[test]
     fn test_flat_compat_batch_compact_sparse() {
         let mut actual_metadata = new_metadata(
             &[
@@ -1496,18 +1109,16 @@ mod tests {
         let mapper = FlatProjectionMapper::all(&expected_metadata).unwrap();
         let read_format = FlatReadFormat::new(
             actual_metadata.clone(),
-            [0, 2, 3].into_iter(),
+            ReadColumns::from_deduped_column_ids([0, 2, 3]),
             None,
             "test",
             true,
         )
         .unwrap();
-        let format_projection = read_format.format_projection();
 
-        let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, true)
-                .unwrap()
-                .unwrap();
+        let compat_batch = FlatCompatBatch::try_new(&mapper, &read_format, true)
+            .unwrap()
+            .unwrap();
 
         let sparse_k1 = encode_sparse_key(&[]);
         let input_columns: Vec<ArrayRef> = vec![

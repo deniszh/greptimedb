@@ -23,22 +23,30 @@ use std::time::Instant;
 use api::v1::SemanticType;
 use common_error::ext::BoxedError;
 use common_recordbatch::SendableRecordBatchStream;
+use common_recordbatch::adapter::RegionQueryStatCounters;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_telemetry::tracing::Instrument;
 use common_telemetry::{debug, error, tracing, warn};
 use common_time::range::TimestampRange;
 use datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr;
-use datafusion_common::Column;
+use datafusion_common::pruning::PruningStatistics;
+use datafusion_common::{Column, ScalarValue};
 use datafusion_expr::Expr;
 use datafusion_expr::utils::expr_to_columns;
+use datatypes::arrow::array::{ArrayRef, BooleanArray, UInt64Array};
+use datatypes::extension::json::is_json2_extension_type;
+use datatypes::types::json_type::JsonNativeType;
+use datatypes::value::timestamp_to_scalar_value;
 use futures::StreamExt;
+use itertools::Itertools;
 use partition::expr::PartitionExpr;
 use smallvec::SmallVec;
-use snafu::{OptionExt as _, ResultExt};
+use snafu::{OptionExt, ResultExt};
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::region_engine::{PartitionRange, RegionScannerRef};
 use store_api::storage::{
-    ColumnId, RegionId, ScanRequest, SequenceRange, TimeSeriesDistribution, TimeSeriesRowSelector,
+    ColumnId, NestedPath, RegionId, ScanRequest, SequenceNumber, SequenceRange,
+    TimeSeriesDistribution, TimeSeriesRowSelector,
 };
 use table::predicate::{Predicate, build_time_range_predicate, extract_time_range_from_expr};
 use tokio::sync::{Semaphore, mpsc};
@@ -52,15 +60,16 @@ use crate::error::{InvalidPartitionExprSnafu, InvalidRequestSnafu, Result};
 use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
 use crate::memtable::{MemtableRange, RangesOptions};
 use crate::metrics::READ_SST_COUNT;
-use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBatch};
-use crate::read::projection::ProjectionMapper;
+use crate::read::compat::{self, FlatCompatBatch};
+use crate::read::flat_projection::FlatProjectionMapper;
 use crate::read::range::{FileRangeBuilder, MemRangeBuilder, RangeMeta, RowGroupIndex};
-use crate::read::range_cache::ScanRequestFingerprint;
+use crate::read::range_cache::{ScanRequestFingerprint, implied_time_range_from_exprs};
+use crate::read::read_columns::{ReadColumn, ReadColumns};
 use crate::read::seq_scan::SeqScan;
 use crate::read::series_scan::SeriesScan;
 use crate::read::stream::ScanBatchStream;
 use crate::read::unordered_scan::UnorderedScan;
-use crate::read::{Batch, BoxedRecordBatchStream, RecordBatch, Source};
+use crate::read::{BoxedRecordBatchStream, RecordBatch};
 use crate::region::options::MergeMode;
 use crate::region::version::VersionRef;
 use crate::sst::file::FileHandle;
@@ -144,6 +153,14 @@ impl Scanner {
             Scanner::Seq(seq_scan) => seq_scan.input().index_ids(),
             Scanner::Unordered(unordered_scan) => unordered_scan.input().index_ids(),
             Scanner::Series(series_scan) => series_scan.input().index_ids(),
+        }
+    }
+
+    pub(crate) fn snapshot_sequence(&self) -> Option<SequenceNumber> {
+        match self {
+            Scanner::Seq(seq_scan) => seq_scan.input().snapshot_sequence,
+            Scanner::Unordered(unordered_scan) => unordered_scan.input().snapshot_sequence,
+            Scanner::Series(series_scan) => series_scan.input().snapshot_sequence,
         }
     }
 
@@ -232,6 +249,8 @@ pub(crate) struct ScanRegion {
     /// Whether to filter out the deleted rows.
     /// Usually true for normal read, and false for scan for compaction.
     filter_deleted: bool,
+    /// Counters that should receive query-load metrics.
+    query_stat_counters: Option<RegionQueryStatCounters>,
     #[cfg(feature = "enterprise")]
     extension_range_provider: Option<BoxedExtensionRangeProvider>,
 }
@@ -255,9 +274,17 @@ impl ScanRegion {
             ignore_bloom_filter: false,
             start_time: None,
             filter_deleted: true,
+            query_stat_counters: None,
             #[cfg(feature = "enterprise")]
             extension_range_provider: None,
         }
+    }
+
+    /// Sets counters that should receive query-load metrics.
+    #[must_use]
+    pub(crate) fn with_query_stat_counters(mut self, counters: RegionQueryStatCounters) -> Self {
+        self.query_stat_counters = Some(counters);
+        self
     }
 
     /// Sets maximum number of SST files to scan concurrently.
@@ -386,53 +413,84 @@ impl ScanRegion {
     /// Creates a scan input.
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id()))]
     async fn scan_input(self) -> Result<ScanInput> {
+        let metadata = &self.version.metadata;
         let sst_min_sequence = self.request.sst_min_sequence.and_then(NonZeroU64::new);
         let time_range = self.build_time_range_predicate();
-        let predicate = PredicateGroup::new(&self.version.metadata, &self.request.filters)?;
+        let predicate = PredicateGroup::new(metadata, &self.request.filters)?;
 
-        let read_column_ids = match &self.request.projection {
-            Some(p) => self.build_read_column_ids(p, &predicate)?,
-            None => self
-                .version
-                .metadata
-                .column_metadatas
-                .iter()
-                .map(|col| col.column_id)
-                .collect(),
+        let read_col_ids =
+            self.build_read_col_ids(self.request.projection.as_deref(), &predicate)?;
+
+        // Narrow JSON2 columns to avoid reading unnecessary nested fields.
+        //
+        // `read_col_ids` selects the root columns required by the projection and predicates,
+        // while nested projection is currently only applied to JSON2 columns, whose type hints
+        // further narrow them to the requested nested fields.
+        let has_structured_json = metadata
+            .schema
+            .arrow_schema()
+            .fields()
+            .iter()
+            .any(is_json2_extension_type);
+        let read_cols = if has_structured_json {
+            self.read_columns_with_json_type_hint(&read_col_ids)
+        } else {
+            ReadColumns::from_deduped_column_ids(read_col_ids.iter().copied())
         };
 
         // The mapper always computes projected column ids as the schema of SSTs may change.
-        let mapper = match &self.request.projection {
-            Some(p) => ProjectionMapper::new_with_read_columns(
-                &self.version.metadata,
-                p.iter().copied(),
-                read_column_ids.clone(),
-            )?,
-            None => ProjectionMapper::all(&self.version.metadata)?,
+        let projection = self
+            .request
+            .projection
+            .clone()
+            .unwrap_or_else(|| (0..metadata.column_metadatas.len()).collect());
+        let json_type_hint = has_structured_json
+            .then_some(&self.request.json_type_hint)
+            .inspect(|json_type_hint| {
+                debug!(
+                    "Concretized JSON type: {{{}}}",
+                    json_type_hint
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", k, v))
+                        .join(", ")
+                );
+            });
+        let mapper = FlatProjectionMapper::new_with_read_columns(
+            metadata,
+            projection,
+            read_cols,
+            json_type_hint,
+        )?;
+        let mapper = if self.request.preserve_pk_dictionary_encoding {
+            mapper.with_pk_dictionary_encoding()
+        } else {
+            mapper
         };
 
         let ssts = &self.version.ssts;
         let mut files = Vec::new();
-        for level in ssts.levels() {
-            for file in level.files.values() {
-                let exceed_min_sequence = match (sst_min_sequence, file.meta_ref().sequence) {
-                    (Some(min_sequence), Some(file_sequence)) => file_sequence > min_sequence,
-                    // If the file's sequence is None (or actually is zero), it could mean the file
-                    // is generated and added to the region "directly". In this case, its data should
-                    // be considered as fresh as the memtable. So its sequence is treated greater than
-                    // the min_sequence, whatever the value of min_sequence is. Hence the default
-                    // "true" in this arm.
-                    (Some(_), None) => true,
-                    (None, _) => true,
-                };
+        if !self.request.skip_sst_files {
+            for level in ssts.levels() {
+                for file in level.files.values() {
+                    let exceed_min_sequence = match (sst_min_sequence, file.meta_ref().sequence) {
+                        (Some(min_sequence), Some(file_sequence)) => file_sequence > min_sequence,
+                        // If the file's sequence is None (or actually is zero), it could mean the file
+                        // is generated and added to the region "directly". In this case, its data should
+                        // be considered as fresh as the memtable. So its sequence is treated greater than
+                        // the min_sequence, whatever the value of min_sequence is. Hence the default
+                        // "true" in this arm.
+                        (Some(_), None) => true,
+                        (None, _) => true,
+                    };
 
-                // Finds SST files in range.
-                if exceed_min_sequence && file_in_range(file, &time_range) {
-                    files.push(file.clone());
+                    // Finds SST files in range.
+                    if exceed_min_sequence && file_in_range(file, &time_range) {
+                        files.push(file.clone());
+                    }
+                    // There is no need to check and prune for file's sequence here as the sequence number is usually very new,
+                    // unless the timing is too good, or the sequence number wouldn't be in file.
+                    // and the batch will be filtered out by tree reader anyway.
                 }
-                // There is no need to check and prune for file's sequence here as the sequence number is usually very new,
-                // unless the timing is too good, or the sequence number wouldn't be in file.
-                // and the batch will be filtered out by tree reader anyway.
             }
         }
 
@@ -455,7 +513,7 @@ impl ScanRegion {
                 continue;
             }
             let ranges_in_memtable = m.ranges(
-                Some(read_column_ids.as_slice()),
+                Some(&read_col_ids),
                 RangesOptions::default()
                     .with_predicate(predicate.clone())
                     .with_sequence(SequenceRange::new(
@@ -523,14 +581,23 @@ impl ScanRegion {
             .with_distribution(self.request.distribution)
             .with_explain_flat_format(
                 self.version.options.sst_format == Some(crate::sst::FormatType::Flat),
-            );
+            )
+            .with_snapshot_sequence(
+                self.request
+                    .snapshot_on_scan
+                    .then_some(self.request.memtable_max_sequence)
+                    .flatten(),
+            )
+            .with_query_stat_counters(self.query_stat_counters);
         #[cfg(feature = "vector_index")]
         let input = input
             .with_vector_index_applier(vector_index_applier)
             .with_vector_index_k(vector_index_k);
 
         #[cfg(feature = "enterprise")]
-        let input = if let Some(provider) = self.extension_range_provider {
+        let input = if !self.request.skip_sst_files
+            && let Some(provider) = self.extension_range_provider
+        {
             let ranges = provider
                 .find_extension_ranges(self.version.flushed_sequence, time_range, &self.request)
                 .await?;
@@ -540,6 +607,108 @@ impl ScanRegion {
             input
         };
         Ok(input)
+    }
+
+    /// Builds the ordered root column ids required by the pushed-down projection and predicate.
+    fn build_read_col_ids(
+        &self,
+        projection: Option<&[usize]>,
+        predicate: &PredicateGroup,
+    ) -> Result<Vec<ColumnId>> {
+        let metadata = &self.version.metadata;
+        let Some(projection) = projection else {
+            return Ok(metadata
+                .column_metadatas
+                .iter()
+                .map(|col| col.column_id)
+                .collect());
+        };
+
+        let mut read_col_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for idx in projection {
+            let col_id = metadata
+                .column_metadatas
+                .get(*idx)
+                .with_context(|| InvalidRequestSnafu {
+                    region_id: metadata.region_id,
+                    reason: format!("projection index {} is out of bounds", idx),
+                })?
+                .column_id;
+            let inserted = seen.insert(col_id);
+            // DataFusion's logical `OptimizeProjections` rule deduplicates pushed-down
+            // projection indices via `RequiredIndices::compact()`.
+            debug_assert!(
+                inserted,
+                "projection contains duplicate column id: {}",
+                col_id
+            );
+            // Keep the projection order.
+            read_col_ids.push(col_id);
+        }
+
+        if projection.is_empty() {
+            let time_index = metadata.time_index_column().column_id;
+            if seen.insert(time_index) {
+                read_col_ids.push(time_index);
+            }
+        }
+
+        let mut extra_col_names = HashSet::new();
+        let mut cols = HashSet::new();
+
+        if let Some(p) = predicate.predicate_without_region() {
+            for expr in p.exprs() {
+                cols.clear();
+                if expr_to_columns(expr, &mut cols).is_err() {
+                    continue;
+                }
+                extra_col_names.extend(cols.iter().map(|col| col.name.clone()));
+            }
+        }
+
+        if let Some(expr) = predicate.region_partition_expr() {
+            expr.collect_column_names(&mut extra_col_names);
+        }
+
+        if !extra_col_names.is_empty() {
+            for col in &metadata.column_metadatas {
+                if extra_col_names.remove(&col.column_schema.name) && !seen.contains(&col.column_id)
+                {
+                    read_col_ids.push(col.column_id);
+                }
+            }
+            if !extra_col_names.is_empty() {
+                warn!(
+                    "Some columns in filters are not found in region {}: {:?}",
+                    metadata.region_id, extra_col_names
+                );
+            }
+        }
+        Ok(read_col_ids)
+    }
+
+    /// Builds read columns with nested paths derived from JSON type hints.
+    fn read_columns_with_json_type_hint(&self, col_ids: &[ColumnId]) -> ReadColumns {
+        let cols = col_ids
+            .iter()
+            .map(|&col_id| {
+                let nested_paths = self
+                    .version
+                    .metadata
+                    .column_by_id(col_id)
+                    .and_then(|column| {
+                        let col_name = &column.column_schema.name;
+                        self.request
+                            .json_type_hint
+                            .get(col_name)
+                            .map(|json_type| json_nested_paths(col_name, json_type))
+                    })
+                    .unwrap_or_default();
+                ReadColumn::new(col_id, nested_paths)
+            })
+            .collect();
+        ReadColumns { cols }
     }
 
     fn region_id(&self) -> RegionId {
@@ -556,72 +725,6 @@ impl ScanRegion {
             .expect("Time index must have timestamp-compatible type")
             .unit();
         build_time_range_predicate(&time_index.column_schema.name, unit, &self.request.filters)
-    }
-
-    /// Return all columns id to read according to the projection and filters.
-    fn build_read_column_ids(
-        &self,
-        projection: &[usize],
-        predicate: &PredicateGroup,
-    ) -> Result<Vec<ColumnId>> {
-        let metadata = &self.version.metadata;
-        // use Vec for read_column_ids to keep the order of columns.
-        let mut read_column_ids = Vec::new();
-        let mut seen = HashSet::new();
-
-        for idx in projection {
-            let column =
-                metadata
-                    .column_metadatas
-                    .get(*idx)
-                    .with_context(|| InvalidRequestSnafu {
-                        region_id: metadata.region_id,
-                        reason: format!("projection index {} is out of bound", idx),
-                    })?;
-            seen.insert(column.column_id);
-            // keep the projection order
-            read_column_ids.push(column.column_id);
-        }
-
-        if projection.is_empty() {
-            let time_index = metadata.time_index_column().column_id;
-            if seen.insert(time_index) {
-                read_column_ids.push(time_index);
-            }
-        }
-
-        let mut extra_names = HashSet::new();
-        let mut columns = HashSet::new();
-
-        for expr in &self.request.filters {
-            columns.clear();
-            if expr_to_columns(expr, &mut columns).is_err() {
-                continue;
-            }
-            extra_names.extend(columns.iter().map(|column| column.name.clone()));
-        }
-
-        if let Some(expr) = predicate.region_partition_expr() {
-            expr.collect_column_names(&mut extra_names);
-        }
-
-        if !extra_names.is_empty() {
-            for column in &metadata.column_metadatas {
-                if extra_names.contains(column.column_schema.name.as_str())
-                    && !seen.contains(&column.column_id)
-                {
-                    read_column_ids.push(column.column_id);
-                }
-                extra_names.remove(column.column_schema.name.as_str());
-            }
-            if !extra_names.is_empty() {
-                warn!(
-                    "Some columns in filters are not found in region {}: {:?}",
-                    metadata.region_id, extra_names
-                );
-            }
-        }
-        Ok(read_column_ids)
     }
 
     /// Partitions filters into two groups: non-field filters and field filters.
@@ -781,11 +884,11 @@ pub struct ScanInput {
     /// Region SST access layer.
     access_layer: AccessLayerRef,
     /// Maps projected Batches to RecordBatches.
-    pub(crate) mapper: Arc<ProjectionMapper>,
-    /// Column ids to read from memtables and SSTs.
+    pub(crate) mapper: Arc<FlatProjectionMapper>,
+    /// The columns to read from memtables and SSTs.
     /// Notice this is different from the columns in `mapper` which are projected columns.
     /// But this read columns might also include non-projected columns needed for filtering.
-    pub(crate) read_column_ids: Vec<ColumnId>,
+    pub(crate) read_cols: ReadColumns,
     /// Time range filter for time index.
     pub(crate) time_range: Option<TimestampRange>,
     /// Predicate to push down.
@@ -796,6 +899,8 @@ pub struct ScanInput {
     pub(crate) memtables: Vec<MemRangeBuilder>,
     /// Handles to SST files to scan.
     pub(crate) files: Vec<FileHandle>,
+    /// Scan-wide hint for rows in an execution batch.
+    batch_size: usize,
     /// Cache.
     pub(crate) cache_strategy: CacheStrategy,
     /// Ignores file not found error.
@@ -826,8 +931,12 @@ pub struct ScanInput {
     pub(crate) distribution: Option<TimeSeriesDistribution>,
     /// Whether the region's configured SST format is flat.
     explain_flat_format: bool,
+    /// Snapshot upper bound bound at scan open and propagated back to the caller.
+    pub(crate) snapshot_sequence: Option<SequenceNumber>,
     /// Whether this scan is for compaction.
     pub(crate) compaction: bool,
+    /// Counters that should receive query-load metrics.
+    pub(crate) query_stat_counters: Option<RegionQueryStatCounters>,
     #[cfg(feature = "enterprise")]
     extension_ranges: Vec<BoxedExtensionRange>,
 }
@@ -835,16 +944,17 @@ pub struct ScanInput {
 impl ScanInput {
     /// Creates a new [ScanInput].
     #[must_use]
-    pub(crate) fn new(access_layer: AccessLayerRef, mapper: ProjectionMapper) -> ScanInput {
+    pub(crate) fn new(access_layer: AccessLayerRef, mapper: FlatProjectionMapper) -> ScanInput {
         ScanInput {
             access_layer,
-            read_column_ids: mapper.column_ids().to_vec(),
+            read_cols: mapper.read_columns().clone(),
             mapper: Arc::new(mapper),
             time_range: None,
             predicate: PredicateGroup::default(),
             region_partition_expr: None,
             memtables: Vec::new(),
             files: Vec::new(),
+            batch_size: crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
             cache_strategy: CacheStrategy::Disabled,
             ignore_file_not_found: false,
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
@@ -862,7 +972,9 @@ impl ScanInput {
             series_row_selector: None,
             distribution: None,
             explain_flat_format: false,
+            snapshot_sequence: None,
             compaction: false,
+            query_stat_counters: None,
             #[cfg(feature = "enterprise")]
             extension_ranges: Vec::new(),
         }
@@ -894,6 +1006,18 @@ impl ScanInput {
     #[must_use]
     pub(crate) fn with_files(mut self, files: Vec<FileHandle>) -> Self {
         self.files = files;
+        self
+    }
+
+    /// Returns the scan-wide hint for rows in an execution batch.
+    pub(crate) fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Sets the scan-wide hint for rows in an execution batch.
+    #[must_use]
+    pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
         self
     }
 
@@ -983,6 +1107,14 @@ impl ScanInput {
         self
     }
 
+    pub(crate) fn with_query_stat_counters(
+        mut self,
+        counters: Option<RegionQueryStatCounters>,
+    ) -> Self {
+        self.query_stat_counters = counters;
+        self
+    }
+
     /// Sets whether to remove deletion markers during scan.
     #[must_use]
     pub(crate) fn with_filter_deleted(mut self, filter_deleted: bool) -> Self {
@@ -1024,44 +1156,20 @@ impl ScanInput {
         self
     }
 
+    #[must_use]
+    pub(crate) fn with_snapshot_sequence(
+        mut self,
+        snapshot_sequence: Option<SequenceNumber>,
+    ) -> Self {
+        self.snapshot_sequence = snapshot_sequence;
+        self
+    }
+
     /// Sets whether this scan is for compaction.
     #[must_use]
     pub(crate) fn with_compaction(mut self, compaction: bool) -> Self {
         self.compaction = compaction;
         self
-    }
-
-    /// Scans sources in parallel.
-    ///
-    /// # Panics if the input doesn't allow parallel scan.
-    #[tracing::instrument(
-        skip(self, sources, semaphore),
-        fields(
-            region_id = %self.region_metadata().region_id,
-            source_count = sources.len()
-        )
-    )]
-    pub(crate) fn create_parallel_sources(
-        &self,
-        sources: Vec<Source>,
-        semaphore: Arc<Semaphore>,
-        channel_size: usize,
-    ) -> Result<Vec<Source>> {
-        if sources.len() <= 1 {
-            return Ok(sources);
-        }
-
-        // Spawn a task for each source.
-        let sources = sources
-            .into_iter()
-            .map(|source| {
-                let (sender, receiver) = mpsc::channel(channel_size);
-                self.spawn_scan_task(source, semaphore.clone(), sender);
-                let stream = Box::pin(ReceiverStream::new(receiver));
-                Source::Stream(stream)
-            })
-            .collect();
-        Ok(sources)
     }
 
     /// Builds memtable ranges to scan by `index`.
@@ -1072,7 +1180,7 @@ impl ScanInput {
         ranges
     }
 
-    fn predicate_for_file(&self, file: &FileHandle) -> Option<Predicate> {
+    pub(crate) fn predicate_for_file(&self, file: &FileHandle) -> Option<Predicate> {
         if self.should_skip_region_partition(file) {
             self.predicate.predicate_without_region().cloned()
         } else {
@@ -1090,7 +1198,56 @@ impl ScanInput {
         }
     }
 
+    /// Tries to build file-level pruning statistics using only the [FileHandle]'s manifest-level
+    /// time range, without reading any parquet metadata.
+    ///
+    /// Returns `None` if timestamp unit conversion overflows (conservative: keep the file).
+    fn try_file_level_pruning_stats(&self, file: &FileHandle) -> Option<FileLevelPruningStats> {
+        let (ts_min, ts_max) = file.time_range();
+        let time_index = self.mapper.metadata().time_index_column();
+        let time_index_unit = time_index.column_schema.data_type.as_timestamp()?.unit();
+
+        // Convert file timestamps to the time index column's unit. Use `convert_to_ceil` for
+        // the upper bound to avoid accidentally shrinking the manifest range.
+        let min_ts = ts_min.convert_to(time_index_unit)?;
+        let max_ts = ts_max.convert_to_ceil(time_index_unit)?;
+
+        Some(FileLevelPruningStats {
+            min_scalar: timestamp_to_scalar_value(time_index_unit, Some(min_ts.value())),
+            max_scalar: timestamp_to_scalar_value(time_index_unit, Some(max_ts.value())),
+            time_index_col_name: time_index.column_schema.name.clone(),
+        })
+    }
+
+    /// Checks whether a file can be definitively pruned using only its manifest-level
+    /// time range and the current predicate, without reading any parquet metadata.
+    ///
+    /// Returns `true` if [PruningStatistics] proves the file cannot contain matching rows.
+    #[inline]
+    pub(crate) fn can_manifest_prune_file(&self, file: &FileHandle) -> bool {
+        let predicate = self.predicate_for_file(file);
+        self.manifest_prunes_file(file, predicate.as_ref())
+    }
+
+    fn manifest_prunes_file(&self, file: &FileHandle, predicate: Option<&Predicate>) -> bool {
+        if let Some(pred) = predicate
+            && !pred.is_empty()
+            && let Some(file_level_stats) = self.try_file_level_pruning_stats(file)
+        {
+            let pruning_results = pred.prune_with_stats(
+                &file_level_stats,
+                self.mapper.metadata().schema.arrow_schema(),
+            );
+            pruning_results.first() == Some(&false)
+        } else {
+            false
+        }
+    }
+
     /// Prunes a file to scan and returns the builder to build readers.
+    ///
+    /// This is the public entry point used by direct tests and non-pruner callers.
+    /// It performs its own manifest-level pruning check internally.
     #[tracing::instrument(
         skip_all,
         fields(
@@ -1101,20 +1258,58 @@ impl ScanInput {
     pub async fn prune_file(
         &self,
         file: &FileHandle,
+        pre_filter_mode: PreFilterMode,
         reader_metrics: &mut ReaderMetrics,
     ) -> Result<FileRangeBuilder> {
         let predicate = self.predicate_for_file(file);
-        let filter_mode = pre_filter_mode(self.append_mode, self.merge_mode);
-        let decode_pk_values = !self.compaction && self.mapper.has_tags();
+
+        // Early file-level pruning using manifest time range before any parquet metadata access.
+        if self.manifest_prunes_file(file, predicate.as_ref()) {
+            reader_metrics.filter_metrics.files_time_range_pruned += 1;
+            return Ok(FileRangeBuilder::default());
+        }
+
+        self.prune_file_after_manifest_check(file, pre_filter_mode, true, predicate, reader_metrics)
+            .await
+    }
+
+    /// Second half of `prune_file` — performs the actual parquet metadata /
+    /// reader setup. Callers that already performed manifest-level pruning
+    /// (e.g. the `Pruner` via its shared `manifest_pruned_files` cache) should
+    /// call this directly to avoid a redundant manifest check.
+    ///
+    /// `predicate` is the result of `self.predicate_for_file(file)` computed
+    /// externally so the caller can reuse it if needed.
+    pub(crate) async fn prune_file_after_manifest_check(
+        &self,
+        file: &FileHandle,
+        pre_filter_mode: PreFilterMode,
+        enable_predicate_prefilter: bool,
+        predicate: Option<Predicate>,
+        reader_metrics: &mut ReaderMetrics,
+    ) -> Result<FileRangeBuilder> {
+        let may_build_selective_row_selection = predicate.is_some();
+        let decode_pk_values = !self.compaction
+            && self
+                .mapper
+                .read_columns()
+                .column_ids_iter()
+                .any(|column_id| self.mapper.metadata().primary_key.contains(&column_id));
         let reader = self
             .access_layer
             .read_sst(file.clone())
             .predicate(predicate)
-            .projection(Some(self.read_column_ids.clone()))
+            .projection(Some(self.read_cols.clone()))
             .cache(self.cache_strategy.clone())
             .inverted_index_appliers(self.inverted_index_appliers.clone())
             .bloom_filter_index_appliers(self.bloom_filter_index_appliers.clone())
             .fulltext_index_appliers(self.fulltext_index_appliers.clone());
+        let reader = reader.batch_size(self.batch_size);
+        let reader = if !self.compaction && may_build_selective_row_selection {
+            reader.deferred_optional_page_index()
+        } else {
+            reader
+        };
         #[cfg(feature = "vector_index")]
         let reader = {
             let mut reader = reader;
@@ -1125,7 +1320,8 @@ impl ScanInput {
         let res = reader
             .expected_metadata(Some(self.mapper.metadata().clone()))
             .compaction(self.compaction)
-            .pre_filter_mode(filter_mode)
+            .pre_filter_mode(pre_filter_mode)
+            .enable_predicate_prefilter(enable_predicate_prefilter)
             .decode_primary_key_values(decode_pk_values)
             .build_reader_input(reader_metrics)
             .await;
@@ -1146,74 +1342,21 @@ impl ScanInput {
         };
 
         let need_compat = !compat::has_same_columns_and_pk_encoding(
-            self.mapper.metadata(),
-            file_range_ctx.read_format().metadata(),
+            &self.mapper,
+            file_range_ctx.read_format(),
+            self.compaction,
         );
         if need_compat {
             // They have different schema. We need to adapt the batch first so the
             // mapper can convert it.
-            let compat = if let Some(flat_format) = file_range_ctx.read_format().as_flat() {
-                let mapper = self.mapper.as_flat().unwrap();
-                FlatCompatBatch::try_new(
-                    mapper,
-                    flat_format.metadata(),
-                    flat_format.format_projection(),
-                    self.compaction,
-                )?
-                .map(CompatBatch::Flat)
-            } else {
-                let compact_batch = PrimaryKeyCompatBatch::new(
-                    &self.mapper,
-                    file_range_ctx.read_format().metadata().clone(),
-                )?;
-                Some(CompatBatch::PrimaryKey(compact_batch))
-            };
+            let compat = FlatCompatBatch::try_new(
+                &self.mapper,
+                file_range_ctx.read_format(),
+                self.compaction,
+            )?;
             file_range_ctx.set_compat_batch(compat);
         }
         Ok(FileRangeBuilder::new(Arc::new(file_range_ctx), selection))
-    }
-
-    /// Scans the input source in another task and sends batches to the sender.
-    #[tracing::instrument(
-        skip(self, input, semaphore, sender),
-        fields(region_id = %self.region_metadata().region_id)
-    )]
-    pub(crate) fn spawn_scan_task(
-        &self,
-        mut input: Source,
-        semaphore: Arc<Semaphore>,
-        sender: mpsc::Sender<Result<Batch>>,
-    ) {
-        let region_id = self.region_metadata().region_id;
-        let span = tracing::info_span!(
-            "ScanInput::parallel_scan_task",
-            region_id = %region_id,
-            stream_kind = "batch"
-        );
-        common_runtime::spawn_global(
-            async move {
-                loop {
-                    // We release the permit before sending result to avoid the task waiting on
-                    // the channel with the permit held.
-                    let maybe_batch = {
-                        // Safety: We never close the semaphore.
-                        let _permit = semaphore.acquire().await.unwrap();
-                        input.next_batch().await
-                    };
-                    match maybe_batch {
-                        Ok(Some(batch)) => {
-                            let _ = sender.send(Ok(batch)).await;
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            let _ = sender.send(Err(e)).await;
-                            break;
-                        }
-                    }
-                }
-            }
-            .instrument(span),
-        );
     }
 
     /// Scans flat sources (RecordBatch streams) in parallel.
@@ -1266,7 +1409,7 @@ impl ScanInput {
             region_id = %region_id,
             stream_kind = "flat"
         );
-        common_runtime::spawn_global(
+        common_runtime::spawn_query(
             async move {
                 loop {
                     // We release the permit before sending result to avoid the task waiting on
@@ -1330,6 +1473,18 @@ impl ScanInput {
     pub fn region_metadata(&self) -> &RegionMetadataRef {
         self.mapper.metadata()
     }
+
+    fn range_pre_filter_mode(&self, source_count: usize) -> PreFilterMode {
+        if source_count <= 1 {
+            // Duplicated rows in the same source is not a normal case and we don't provide
+            // strict dedup semantic (last_row/last_non_null) for it. We expect the duplicated rows
+            // are exactly identical in the same source so we use PreFilterMode::All for
+            // performance reason.
+            return PreFilterMode::All;
+        }
+
+        pre_filter_mode(self.append_mode, self.merge_mode)
+    }
 }
 
 #[cfg(feature = "enterprise")]
@@ -1354,6 +1509,57 @@ impl ScanInput {
     }
 }
 
+/// Lightweight [PruningStatistics] that only uses the file-level time range from manifest
+/// metadata, avoiding any parquet metadata reads. Used for early file-level pruning before
+/// accessing row-group-level statistics.
+pub(crate) struct FileLevelPruningStats {
+    /// Scalar value for the file's minimum timestamp in the time index column's unit.
+    pub(crate) min_scalar: ScalarValue,
+    /// Scalar value for the file's maximum timestamp in the time index column's unit.
+    pub(crate) max_scalar: ScalarValue,
+    /// Name of the time index column.
+    pub(crate) time_index_col_name: String,
+}
+
+impl PruningStatistics for FileLevelPruningStats {
+    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        if column.name == self.time_index_col_name {
+            ScalarValue::iter_to_array(std::iter::once(self.min_scalar.clone())).ok()
+        } else {
+            None
+        }
+    }
+
+    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        if column.name == self.time_index_col_name {
+            ScalarValue::iter_to_array(std::iter::once(self.max_scalar.clone())).ok()
+        } else {
+            None
+        }
+    }
+
+    fn num_containers(&self) -> usize {
+        1
+    }
+
+    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
+        if column.name == self.time_index_col_name {
+            // The time index column is NOT NULL.
+            Some(Arc::new(UInt64Array::from(vec![0u64])))
+        } else {
+            None
+        }
+    }
+
+    fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
+
+    fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
+        None
+    }
+}
+
 #[cfg(test)]
 impl ScanInput {
     /// Returns SST file ids to scan.
@@ -1372,14 +1578,50 @@ fn pre_filter_mode(append_mode: bool, merge_mode: MergeMode) -> PreFilterMode {
     }
 
     match merge_mode {
-        MergeMode::LastRow => PreFilterMode::SkipFieldsOnDelete,
+        MergeMode::LastRow => PreFilterMode::SkipFields,
         MergeMode::LastNonNull => PreFilterMode::SkipFields,
     }
 }
 
-/// Builds a [ScanRequestFingerprint] from a [ScanInput] if the scan is eligible
+fn json_nested_paths(column_name: &str, json_type: &JsonNativeType) -> Vec<NestedPath> {
+    let mut paths = Vec::new();
+    let mut current = vec![column_name.to_string()];
+    collect_json_nested_paths(json_type, &mut current, &mut paths);
+    paths
+}
+
+fn collect_json_nested_paths(
+    json_type: &JsonNativeType,
+    current: &mut NestedPath,
+    paths: &mut Vec<NestedPath>,
+) {
+    match json_type {
+        JsonNativeType::Object(fields) if !fields.is_empty() => {
+            for (field, child) in fields {
+                current.push(field.clone());
+                collect_json_nested_paths(child, current, paths);
+                current.pop();
+            }
+        }
+        _ => paths.push(current.clone()),
+    }
+}
+
+/// Output of [build_scan_fingerprint]: the cache fingerprint plus the derived
+/// implied time range used to decide whether the cache key can drop the time
+/// predicates for a given partition (see `build_range_cache_key`).
+pub(crate) struct ScanFingerprintBundle {
+    pub(crate) fingerprint: ScanRequestFingerprint,
+    /// `Some(r)` = all time-only predicates are guaranteed true on `r` (in the
+    /// column's `TimeUnit`).
+    /// `None`    = at least one time-only predicate could not be proven (e.g.
+    /// `OR`), so the cache-key optimization is disabled for this scan.
+    pub(crate) implied_time_range: Option<TimestampRange>,
+}
+
+/// Builds a [ScanFingerprintBundle] from a [ScanInput] if the scan is eligible
 /// for partition range caching.
-pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanRequestFingerprint> {
+pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanFingerprintBundle> {
     let eligible = !input.compaction
         && !input.files.is_empty()
         && matches!(input.cache_strategy, CacheStrategy::EnableAll(_));
@@ -1412,7 +1654,7 @@ pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanRequestFin
         .unwrap_or_default();
 
     let mut filters = Vec::new();
-    let mut time_filters = Vec::new();
+    let mut time_only_exprs: Vec<&Expr> = Vec::new();
     let mut has_tag_filter = false;
     let mut columns = HashSet::new();
 
@@ -1428,16 +1670,18 @@ pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanRequestFin
             _ => false,
         };
 
+        // Route time-only exprs that the legacy extractor recognizes into
+        // `time_only_exprs` so the implication walker
+        // (`implied_time_range_from_exprs`, called below) can attempt to drop
+        // them from the cache key when the partition's `FileTimeRange` is fully
+        // covered, then stringify them into the fingerprint's `time_filters`
+        // bucket. Time-only exprs that the extractor doesn't recognize stay in
+        // `filters` and never get stripped — conservatively correct.
         if is_time_only
             && extract_time_range_from_expr(&time_index_name, ts_col_unit, expr).is_some()
         {
-            // Range-reducible time predicates can be safely dropped from the
-            // cache key when the query time range covers the partition range.
-            time_filters.push(expr.to_string());
+            time_only_exprs.push(expr);
         } else {
-            // Non-time filters and non-range time predicates (those that
-            // extract_time_range_from_expr cannot convert to a TimestampRange)
-            // always stay in the cache key.
             filters.push(expr.to_string());
         }
     }
@@ -1447,32 +1691,38 @@ pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanRequestFin
         return None;
     }
 
+    let implied_time_range =
+        implied_time_range_from_exprs(&time_index_name, ts_col_unit, &time_only_exprs);
+    let mut time_filters: Vec<String> = time_only_exprs.iter().map(|e| e.to_string()).collect();
+
     // Ensure the filters are sorted for consistent fingerprinting.
     filters.sort_unstable();
     time_filters.sort_unstable();
+    let read_columns = input.read_cols.clone();
+    let fingerprint = crate::read::range_cache::ScanRequestFingerprintBuilder {
+        read_column_types: read_columns
+            .column_ids_iter()
+            .map(|id| {
+                metadata
+                    .column_by_id(id)
+                    .map(|col| col.column_schema.data_type.clone())
+            })
+            .collect(),
+        read_columns,
+        filters,
+        time_filters,
+        series_row_selector: input.series_row_selector,
+        append_mode: input.append_mode,
+        filter_deleted: input.filter_deleted,
+        merge_mode: input.merge_mode,
+        partition_expr_version: metadata.partition_expr_version,
+    }
+    .build();
 
-    Some(
-        crate::read::range_cache::ScanRequestFingerprintBuilder {
-            read_column_ids: input.read_column_ids.clone(),
-            read_column_types: input
-                .read_column_ids
-                .iter()
-                .map(|id| {
-                    metadata
-                        .column_by_id(*id)
-                        .map(|col| col.column_schema.data_type.clone())
-                })
-                .collect(),
-            filters,
-            time_filters,
-            series_row_selector: input.series_row_selector,
-            append_mode: input.append_mode,
-            filter_deleted: input.filter_deleted,
-            merge_mode: input.merge_mode,
-            partition_expr_version: metadata.partition_expr_version,
-        }
-        .build(),
-    )
+    Some(ScanFingerprintBundle {
+        fingerprint,
+        implied_time_range,
+    })
 }
 
 /// Context shared by different streams from a scanner.
@@ -1486,6 +1736,13 @@ pub struct StreamContext {
     /// `None` when the scan is not eligible for caching.
     #[allow(dead_code)]
     pub(crate) scan_fingerprint: Option<ScanRequestFingerprint>,
+    /// Implied range of every time-only predicate, in the time index column's
+    /// `TimeUnit`. Used by `build_range_cache_key` to decide whether the
+    /// partition's `FileTimeRange` is fully covered (allowing `time_filters`
+    /// to be stripped from the cache key). `None` when caching is ineligible
+    /// or when the implication walker bailed on an unsupported shape (e.g.
+    /// `OR`).
+    pub(crate) scan_implied_time_range: Option<TimestampRange>,
 
     // Metrics:
     /// The start time of the query.
@@ -1498,12 +1755,16 @@ impl StreamContext {
         let query_start = input.query_start.unwrap_or_else(Instant::now);
         let ranges = RangeMeta::seq_scan_ranges(&input);
         READ_SST_COUNT.observe(input.num_files() as f64);
-        let scan_fingerprint = build_scan_fingerprint(&input);
+        let (scan_fingerprint, scan_implied_time_range) = match build_scan_fingerprint(&input) {
+            Some(b) => (Some(b.fingerprint), b.implied_time_range),
+            None => (None, None),
+        };
 
         Self {
             input,
             ranges,
             scan_fingerprint,
+            scan_implied_time_range,
             query_start,
         }
     }
@@ -1513,12 +1774,16 @@ impl StreamContext {
         let query_start = input.query_start.unwrap_or_else(Instant::now);
         let ranges = RangeMeta::unordered_scan_ranges(&input);
         READ_SST_COUNT.observe(input.num_files() as f64);
-        let scan_fingerprint = build_scan_fingerprint(&input);
+        let (scan_fingerprint, scan_implied_time_range) = match build_scan_fingerprint(&input) {
+            Some(b) => (Some(b.fingerprint), b.implied_time_range),
+            None => (None, None),
+        };
 
         Self {
             input,
             ranges,
             scan_fingerprint,
+            scan_implied_time_range,
             query_start,
         }
     }
@@ -1531,6 +1796,13 @@ impl StreamContext {
     pub(crate) fn is_file_range_index(&self, index: RowGroupIndex) -> bool {
         !self.is_mem_range_index(index)
             && index.index < self.input.num_files() + self.input.num_memtables()
+    }
+
+    pub(crate) fn range_pre_filter_mode(&self, part_range: &PartitionRange) -> PreFilterMode {
+        let range_meta = &self.ranges[part_range.identifier];
+        let source_count = range_meta.indices.len();
+
+        self.input.range_pre_filter_mode(source_count)
     }
 
     /// Retrieves the partition ranges.
@@ -1826,35 +2098,33 @@ impl PredicateGroup {
 mod tests {
     use std::sync::Arc;
 
-    use datafusion::physical_plan::expressions::lit as physical_lit;
+    use common_time::timestamp::{TimeUnit, Timestamp};
+    use datafusion::physical_plan::expressions::{
+        binary as physical_binary, col as physical_col, lit as physical_lit,
+    };
     use datafusion_common::ScalarValue;
-    use datafusion_expr::{col, lit};
+    use datafusion_expr::{Operator, col, lit};
+    use datatypes::arrow::datatypes::{
+        DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit as ArrowTimeUnit,
+    };
+    use datatypes::prelude::ConcreteDataType;
+    use datatypes::schema::ColumnSchema;
+    use datatypes::types::json_type::JsonObjectType;
     use datatypes::value::Value;
     use partition::expr::col as partition_col;
-    use store_api::metadata::RegionMetadataBuilder;
-    use store_api::storage::{ScanRequest, TimeSeriesDistribution, TimeSeriesRowSelector};
+    use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
+    use store_api::storage::{RegionId, TimeSeriesDistribution, TimeSeriesRowSelector};
 
     use super::*;
     use crate::cache::CacheManager;
-    use crate::memtable::time_partition::TimePartitions;
     use crate::read::range_cache::ScanRequestFingerprintBuilder;
-    use crate::region::version::VersionBuilder;
-    use crate::test_util::memtable_util::{EmptyMemtableBuilder, metadata_with_primary_key};
+    use crate::sst::file::FileMeta;
+    use crate::test_util::memtable_util::metadata_with_primary_key;
     use crate::test_util::scheduler_util::SchedulerEnv;
-
-    fn new_version(metadata: RegionMetadataRef) -> VersionRef {
-        let mutable = Arc::new(TimePartitions::new(
-            metadata.clone(),
-            Arc::new(EmptyMemtableBuilder::default()),
-            0,
-            None,
-        ));
-        Arc::new(VersionBuilder::new(metadata, mutable).build())
-    }
 
     async fn new_scan_input(metadata: RegionMetadataRef, filters: Vec<Expr>) -> ScanInput {
         let env = SchedulerEnv::new().await;
-        let mapper = ProjectionMapper::new(&metadata, [0, 2, 3].into_iter()).unwrap();
+        let mapper = FlatProjectionMapper::new(&metadata, [0, 2, 3]).unwrap();
         let predicate = PredicateGroup::new(metadata.as_ref(), &filters).unwrap();
         let file = FileHandle::new(
             crate::sst::file::FileMeta::default(),
@@ -1871,89 +2141,112 @@ mod tests {
             .with_files(vec![file])
     }
 
-    #[tokio::test]
-    async fn test_build_read_column_ids_includes_filters() {
-        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
-        let version = new_version(metadata.clone());
-        let env = SchedulerEnv::new().await;
-        let request = ScanRequest {
-            projection: Some(vec![4]),
-            filters: vec![
-                col("v0").gt(lit(1)),
-                col("ts").gt(lit(0)),
-                col("k0").eq(lit("foo")),
-            ],
-            ..Default::default()
-        };
-        let scan_region = ScanRegion::new(
-            version,
-            env.access_layer.clone(),
-            request,
-            CacheStrategy::Disabled,
-        );
-        let predicate =
-            PredicateGroup::new(metadata.as_ref(), &scan_region.request.filters).unwrap();
-        let projection = scan_region.request.projection.as_ref().unwrap();
-        let read_ids = scan_region
-            .build_read_column_ids(projection, &predicate)
-            .unwrap();
-        assert_eq!(vec![4, 0, 2, 3], read_ids);
-    }
-
-    #[tokio::test]
-    async fn test_build_read_column_ids_empty_projection() {
-        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
-        let version = new_version(metadata.clone());
-        let env = SchedulerEnv::new().await;
-        let request = ScanRequest {
-            projection: Some(vec![]),
-            ..Default::default()
-        };
-        let scan_region = ScanRegion::new(
-            version,
-            env.access_layer.clone(),
-            request,
-            CacheStrategy::Disabled,
-        );
-        let predicate =
-            PredicateGroup::new(metadata.as_ref(), &scan_region.request.filters).unwrap();
-        let projection = scan_region.request.projection.as_ref().unwrap();
-        let read_ids = scan_region
-            .build_read_column_ids(projection, &predicate)
-            .unwrap();
-        // Empty projection should still read the time index column (id 2 in this test schema).
-        assert_eq!(vec![2], read_ids);
-    }
-
-    #[tokio::test]
-    async fn test_build_read_column_ids_keeps_projection_order() {
-        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
-        let version = new_version(metadata.clone());
-        let env = SchedulerEnv::new().await;
-        let request = ScanRequest {
-            projection: Some(vec![4, 1]),
-            filters: vec![col("v0").gt(lit(1))],
-            ..Default::default()
-        };
-        let scan_region = ScanRegion::new(
-            version,
-            env.access_layer.clone(),
-            request,
-            CacheStrategy::Disabled,
-        );
-        let predicate =
-            PredicateGroup::new(metadata.as_ref(), &scan_region.request.filters).unwrap();
-        let projection = scan_region.request.projection.as_ref().unwrap();
-        let read_ids = scan_region
-            .build_read_column_ids(projection, &predicate)
-            .unwrap();
-        // Projection order preserved, extra columns appended in schema order.
-        assert_eq!(vec![4, 1, 3], read_ids);
-    }
-
     /// Helper to create a timestamp millisecond literal.
     fn ts_lit(val: i64) -> datafusion_expr::Expr {
         lit(ScalarValue::TimestampMillisecond(Some(val), None))
+    }
+
+    fn metadata_with_time_index_unit(unit: TimeUnit) -> RegionMetadataRef {
+        let mut builder = RegionMetadataBuilder::new(RegionId::new(123, 456));
+        builder
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "k0".to_string(),
+                    ConcreteDataType::string_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 0,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "k1".to_string(),
+                    ConcreteDataType::uint32_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 1,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "ts".to_string(),
+                    ConcreteDataType::timestamp_datatype(unit),
+                    false,
+                ),
+                semantic_type: SemanticType::Timestamp,
+                column_id: 2,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "v0".to_string(),
+                    ConcreteDataType::int64_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Field,
+                column_id: 3,
+            })
+            .primary_key(vec![0, 1]);
+
+        Arc::new(builder.build().unwrap())
+    }
+
+    fn file_handle_with_time_range(start: Timestamp, end: Timestamp) -> FileHandle {
+        FileHandle::new(
+            FileMeta {
+                time_range: (start, end),
+                ..Default::default()
+            },
+            Arc::new(crate::sst::file_purger::NoopFilePurger),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_scan_input_uses_explicit_batch_size() {
+        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
+        let mapper = FlatProjectionMapper::new(&metadata, [0, 2, 3]).unwrap();
+        let env = SchedulerEnv::new().await;
+        let input = ScanInput::new(env.access_layer.clone(), mapper);
+        assert_eq!(
+            crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+            input.batch_size()
+        );
+
+        let mapper = FlatProjectionMapper::new(&metadata, [0, 2, 3]).unwrap();
+        let input = ScanInput::new(env.access_layer.clone(), mapper)
+            .with_compaction(true)
+            .with_batch_size(256);
+        assert_eq!(256, input.batch_size());
+
+        let mapper = FlatProjectionMapper::new(&metadata, [0, 2, 3]).unwrap();
+        let input = ScanInput::new(env.access_layer.clone(), mapper)
+            .with_batch_size(256)
+            .with_compaction(true)
+            .with_compaction(false);
+        assert_eq!(256, input.batch_size());
+    }
+
+    #[test]
+    fn test_fill_json_nested_paths_from_hint() -> Result<()> {
+        let hint = JsonNativeType::Object(JsonObjectType::from([
+            ("a".to_string(), JsonNativeType::i64()),
+            (
+                "b".to_string(),
+                JsonNativeType::Object(JsonObjectType::from([(
+                    "c".to_string(),
+                    JsonNativeType::String,
+                )])),
+            ),
+        ]));
+
+        fn nested_path(parts: &[&str]) -> NestedPath {
+            parts.iter().map(|part| part.to_string()).collect()
+        }
+
+        assert_eq!(
+            json_nested_paths("j", &hint),
+            vec![nested_path(&["j", "a"]), nested_path(&["j", "b", "c"])]
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1976,7 +2269,7 @@ mod tests {
         let fingerprint = build_scan_fingerprint(&input).unwrap();
 
         let expected = ScanRequestFingerprintBuilder {
-            read_column_ids: input.read_column_ids.clone(),
+            read_columns: input.read_cols,
             read_column_types: vec![
                 metadata
                     .column_by_id(0)
@@ -2000,7 +2293,7 @@ mod tests {
             partition_expr_version: 0,
         }
         .build();
-        assert_eq!(expected, fingerprint);
+        assert_eq!(expected, fingerprint.fingerprint);
     }
 
     #[tokio::test]
@@ -2022,7 +2315,7 @@ mod tests {
 
         let disabled = ScanInput::new(
             SchedulerEnv::new().await.access_layer.clone(),
-            ProjectionMapper::new(&metadata, [0, 2, 3].into_iter()).unwrap(),
+            FlatProjectionMapper::new(&metadata, [0, 2, 3].into_iter()).unwrap(),
         )
         .with_predicate(PredicateGroup::new(metadata.as_ref(), &filters).unwrap());
         assert!(build_scan_fingerprint(&disabled).is_none());
@@ -2052,7 +2345,7 @@ mod tests {
         let fingerprint = build_scan_fingerprint(&input).unwrap();
 
         let expected = ScanRequestFingerprintBuilder {
-            read_column_ids: input.read_column_ids.clone(),
+            read_columns: input.read_cols,
             read_column_types: vec![
                 metadata
                     .column_by_id(0)
@@ -2073,7 +2366,7 @@ mod tests {
             partition_expr_version: metadata.partition_expr_version,
         }
         .build();
-        assert_eq!(expected, fingerprint);
+        assert_eq!(expected, fingerprint.fingerprint);
         assert_ne!(0, metadata.partition_expr_version);
     }
 
@@ -2094,5 +2387,196 @@ mod tests {
         let predicate_without_region = predicate_group.predicate_without_region().unwrap();
         assert!(predicate_without_region.exprs().is_empty());
         assert_eq!(1, predicate_without_region.dyn_filters().len());
+    }
+
+    #[test]
+    fn test_file_level_pruning_stats_prunes_old_file() {
+        let ts_col_name = "ts";
+        let predicate = Predicate::new(vec![col(ts_col_name).gt(ts_lit(1000))]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            ts_col_name,
+            ArrowDataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+            false,
+        )]));
+
+        // File with time range [0ms, 500ms] is completely before `ts > 1000ms`.
+        let stats = FileLevelPruningStats {
+            min_scalar: ScalarValue::TimestampMillisecond(Some(0), None),
+            max_scalar: ScalarValue::TimestampMillisecond(Some(500), None),
+            time_index_col_name: ts_col_name.to_string(),
+        };
+        assert_eq!(
+            vec![false],
+            predicate.prune_with_stats(&stats, &arrow_schema)
+        );
+
+        // File with time range [0ms, 2000ms] overlaps `ts > 1000ms`, so keep it.
+        let stats = FileLevelPruningStats {
+            min_scalar: ScalarValue::TimestampMillisecond(Some(0), None),
+            max_scalar: ScalarValue::TimestampMillisecond(Some(2000), None),
+            time_index_col_name: ts_col_name.to_string(),
+        };
+        assert_eq!(
+            vec![true],
+            predicate.prune_with_stats(&stats, &arrow_schema)
+        );
+    }
+
+    #[test]
+    fn test_file_level_pruning_stats_no_predicate_keeps_all() {
+        let predicate = Predicate::new(vec![]);
+        assert!(predicate.is_empty());
+
+        let stats = FileLevelPruningStats {
+            min_scalar: ScalarValue::TimestampMillisecond(Some(0), None),
+            max_scalar: ScalarValue::TimestampMillisecond(Some(500), None),
+            time_index_col_name: "ts".to_string(),
+        };
+        let arrow_schema = Arc::new(ArrowSchema::new(Vec::<Field>::new()));
+        assert_eq!(
+            vec![true],
+            predicate.prune_with_stats(&stats, &arrow_schema)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_level_pruning_stats_ceil_max_unit_conversion() {
+        let metadata = metadata_with_time_index_unit(TimeUnit::Millisecond);
+        let input = new_scan_input(metadata, vec![]).await;
+        let file = file_handle_with_time_range(
+            Timestamp::new(1_000_001, TimeUnit::Nanosecond),
+            Timestamp::new(1_000_001, TimeUnit::Nanosecond),
+        );
+
+        let stats = input.try_file_level_pruning_stats(&file).unwrap();
+        assert_eq!(
+            ScalarValue::TimestampMillisecond(Some(1), None),
+            stats.min_scalar
+        );
+        assert_eq!(
+            ScalarValue::TimestampMillisecond(Some(2), None),
+            stats.max_scalar
+        );
+
+        // The actual max timestamp is slightly greater than 1ms. It must be kept for `ts > 1ms`.
+        let predicate = Predicate::new(vec![col("ts").gt(ts_lit(1))]);
+        assert_eq!(
+            vec![true],
+            predicate.prune_with_stats(&stats, input.mapper.metadata().schema.arrow_schema())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_level_pruning_stats_overflow_keeps_file() {
+        let metadata = metadata_with_time_index_unit(TimeUnit::Nanosecond);
+        let input = new_scan_input(metadata, vec![]).await;
+        let file = file_handle_with_time_range(
+            Timestamp::new(0, TimeUnit::Second),
+            Timestamp::new(i64::MAX, TimeUnit::Second),
+        );
+
+        assert!(input.try_file_level_pruning_stats(&file).is_none());
+    }
+
+    #[test]
+    fn test_file_level_pruning_stats_keeps_inclusive_boundary() {
+        let ts_col_name = "ts";
+        let predicate = Predicate::new(vec![col(ts_col_name).gt_eq(ts_lit(1000))]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            ts_col_name,
+            ArrowDataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+            false,
+        )]));
+        let stats = FileLevelPruningStats {
+            min_scalar: ScalarValue::TimestampMillisecond(Some(0), None),
+            max_scalar: ScalarValue::TimestampMillisecond(Some(1000), None),
+            time_index_col_name: ts_col_name.to_string(),
+        };
+
+        assert_eq!(
+            vec![true],
+            predicate.prune_with_stats(&stats, &arrow_schema)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_level_pruning_with_dyn_filter_only_predicate() {
+        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
+        let mapper = FlatProjectionMapper::new(&metadata, [0, 2, 3]).unwrap();
+        let predicate_group = PredicateGroup::new(metadata.as_ref(), &[]).unwrap();
+        predicate_group.add_dyn_filters(vec![Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![],
+            physical_lit(false),
+        ))]);
+        let input = ScanInput::new(SchedulerEnv::new().await.access_layer.clone(), mapper)
+            .with_predicate(predicate_group);
+        let file = file_handle_with_time_range(
+            Timestamp::new_millisecond(0),
+            Timestamp::new_millisecond(1000),
+        );
+        let mut reader_metrics = ReaderMetrics::default();
+
+        let builder = input
+            .prune_file(&file, PreFilterMode::SkipFields, &mut reader_metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(1, reader_metrics.filter_metrics.files_time_range_pruned);
+        let mut ranges = SmallVec::new();
+        builder.build_ranges(-1, &mut ranges);
+        assert!(ranges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_manifest_pruning_observes_dynamic_filter_update() {
+        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
+        let mapper = FlatProjectionMapper::new(&metadata, [0, 2, 3]).unwrap();
+        let predicate_group = PredicateGroup::new(metadata.as_ref(), &[]).unwrap();
+        let arrow_schema = metadata.schema.arrow_schema();
+        let ts_expr = physical_col("ts", arrow_schema.as_ref()).unwrap();
+        let dyn_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![ts_expr.clone()],
+            physical_lit(true),
+        ));
+        predicate_group.add_dyn_filters(vec![dyn_filter.clone()]);
+        let input = ScanInput::new(SchedulerEnv::new().await.access_layer.clone(), mapper)
+            .with_predicate(predicate_group);
+        let file = file_handle_with_time_range(
+            Timestamp::new_millisecond(0),
+            Timestamp::new_millisecond(1000),
+        );
+
+        assert!(!input.can_manifest_prune_file(&file));
+
+        let updated = physical_binary(
+            ts_expr,
+            Operator::Gt,
+            physical_lit(ScalarValue::TimestampMillisecond(Some(1000), None)),
+            arrow_schema.as_ref(),
+        )
+        .unwrap();
+        dyn_filter.update(updated).unwrap();
+
+        assert!(input.can_manifest_prune_file(&file));
+    }
+
+    #[tokio::test]
+    async fn test_range_pre_filter_mode() {
+        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
+        let cases = [
+            (true, MergeMode::LastRow, 1, PreFilterMode::All),
+            (false, MergeMode::LastNonNull, 1, PreFilterMode::All),
+            (false, MergeMode::LastRow, 2, PreFilterMode::SkipFields),
+            (true, MergeMode::LastRow, 2, PreFilterMode::All),
+        ];
+
+        for (append_mode, merge_mode, source_count, expected_mode) in cases {
+            let input = new_scan_input(metadata.clone(), vec![])
+                .await
+                .with_append_mode(append_mode)
+                .with_merge_mode(merge_mode);
+
+            assert_eq!(expected_mode, input.range_pre_filter_mode(source_count));
+        }
     }
 }

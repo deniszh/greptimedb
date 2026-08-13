@@ -31,10 +31,12 @@ use api::v1::{
     UnsetIndex, UnsetIndexes, UnsetInverted, UnsetSkipping, UnsetTableOptions, set_index,
     unset_index,
 };
+use common_datasource::object_store::LocalFileAccess;
 use common_error::ext::BoxedError;
 use common_grpc_expr::util::ColumnExpr;
 use common_time::Timezone;
 use datafusion::sql::planner::object_name_to_table_reference;
+use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{
     COLUMN_FULLTEXT_OPT_KEY_ANALYZER, COLUMN_FULLTEXT_OPT_KEY_BACKEND,
     COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE, COLUMN_FULLTEXT_OPT_KEY_FALSE_POSITIVE_RATE,
@@ -140,6 +142,7 @@ pub fn extract_add_columns_expr(
 pub(crate) async fn create_external_expr(
     create: CreateExternalTable,
     query_ctx: &QueryContextRef,
+    local_file_access: &LocalFileAccess,
 ) -> Result<CreateTableExpr> {
     let (catalog_name, schema_name, table_name) =
         table_idents_to_full_name(&create.name, query_ctx)
@@ -148,7 +151,7 @@ pub(crate) async fn create_external_expr(
 
     let mut table_options = create.options.into_map();
 
-    let (object_store, files) = prepare_file_table_files(&table_options)
+    let (object_store, files) = prepare_file_table_files(&table_options, local_file_access)
         .await
         .context(PrepareFileTableSnafu)?;
 
@@ -213,12 +216,11 @@ pub fn create_to_expr(
             .context(ExternalSnafu)?;
 
     let time_index = find_time_index(&create.constraints)?;
-    let table_options = HashMap::from(
+    let mut table_options = HashMap::from(
         &TableOptions::try_from_iter(create.options.to_str_map())
             .context(UnrecognizedTableOptionSnafu)?,
     );
 
-    let mut table_options = table_options;
     if table_options.contains_key(COMPACTION_TYPE) {
         table_options.insert(COMPACTION_OVERRIDE.to_string(), "true".to_string());
     }
@@ -441,14 +443,34 @@ pub fn validate_create_expr(create: &CreateTableExpr) -> Result<()> {
     }
 
     // verify time_index exists
-    let _ = column_to_indices
-        .get(&create.time_index)
-        .with_context(|| InvalidSqlSnafu {
+    let time_index_idx =
+        column_to_indices
+            .get(&create.time_index)
+            .with_context(|| InvalidSqlSnafu {
+                err_msg: format!(
+                    "column name `{}` is not found in column list",
+                    create.time_index
+                ),
+            })?;
+
+    // verify time_index is a timestamp column
+    let time_index_column = &create.column_defs[*time_index_idx];
+    let data_type = ConcreteDataType::from(
+        ColumnDataTypeWrapper::try_new(
+            time_index_column.data_type,
+            time_index_column.datatype_extension.clone(),
+        )
+        .context(ColumnDataTypeSnafu)?,
+    );
+    ensure!(
+        data_type.is_timestamp(),
+        InvalidSqlSnafu {
             err_msg: format!(
-                "column name `{}` is not found in column list",
+                "column `{}` is not a timestamp type, it can't be used as time index",
                 create.time_index
             ),
-        })?;
+        }
+    );
 
     // verify primary_key exists
     for pk in &create.primary_keys {
@@ -689,9 +711,20 @@ pub struct RepartitionRequest {
     pub catalog_name: String,
     pub schema_name: String,
     pub table_name: String,
-    pub from_exprs: Vec<Expr>,
+    pub source: RepartitionSource,
     pub into_exprs: Vec<Expr>,
     pub options: OptionMap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepartitionSource {
+    Partitions {
+        from_exprs: Vec<Expr>,
+        target_partition_columns: Option<Vec<String>>,
+    },
+    Unpartitioned {
+        partition_columns: Vec<String>,
+    },
 }
 
 pub(crate) fn to_repartition_request(
@@ -708,19 +741,43 @@ pub(crate) fn to_repartition_request(
         .map_err(BoxedError::new)
         .context(ExternalSnafu)?;
 
-    let AlterTableOperation::Repartition { operation } = alter_operation else {
-        return InvalidSqlSnafu {
-            err_msg: "expected REPARTITION operation",
+    let (source, into_exprs) = match alter_operation {
+        AlterTableOperation::Repartition { operation } => (
+            RepartitionSource::Partitions {
+                from_exprs: operation.from_exprs,
+                target_partition_columns: operation.partition_columns.map(|columns| {
+                    columns
+                        .into_iter()
+                        .map(|ident| ident.value)
+                        .collect::<Vec<_>>()
+                }),
+            },
+            operation.into_exprs,
+        ),
+        AlterTableOperation::Partition { partitions } => (
+            RepartitionSource::Unpartitioned {
+                partition_columns: partitions
+                    .column_list
+                    .into_iter()
+                    .map(|ident| ident.value)
+                    .collect(),
+            },
+            partitions.exprs,
+        ),
+        _ => {
+            return InvalidSqlSnafu {
+                err_msg: "expected REPARTITION or PARTITION operation",
+            }
+            .fail();
         }
-        .fail();
     };
 
     Ok(RepartitionRequest {
         catalog_name,
         schema_name,
         table_name,
-        from_exprs: operation.from_exprs,
-        into_exprs: operation.into_exprs,
+        source,
+        into_exprs,
         options,
     })
 }
@@ -771,8 +828,7 @@ pub(crate) fn to_alter_table_expr(
             target_type,
         } => {
             let target_type =
-                sql_data_type_to_concrete_data_type(&target_type, &Default::default())
-                    .context(ParseSqlSnafu)?;
+                sql_data_type_to_concrete_data_type(&target_type).context(ParseSqlSnafu)?;
             let (target_type, target_type_extension) = ColumnDataTypeWrapper::try_from(target_type)
                 .map(|w| w.to_parts())
                 .context(ColumnDataTypeSnafu)?;
@@ -811,6 +867,12 @@ pub(crate) fn to_alter_table_expr(
         AlterTableOperation::Repartition { .. } => {
             return NotSupportedSnafu {
                 feat: "ALTER TABLE ... REPARTITION",
+            }
+            .fail();
+        }
+        AlterTableOperation::Partition { .. } => {
+            return NotSupportedSnafu {
+                feat: "ALTER TABLE ... PARTITION ON COLUMNS",
             }
             .fail();
         }
@@ -1047,8 +1109,20 @@ pub fn to_create_flow_task_expr(
         eval_interval: eval_interval.map(|seconds| api::v1::EvalInterval { seconds }),
         comment: create_flow.comment.unwrap_or_default(),
         sql: create_flow.query.to_string(),
-        flow_options: Default::default(),
+        flow_options: stringify_flow_options(create_flow.flow_options)?,
     })
+}
+
+fn stringify_flow_options(flow_options: OptionMap) -> Result<HashMap<String, String>> {
+    let options_len = flow_options.len();
+    let flow_options = flow_options.into_map();
+    ensure!(
+        flow_options.len() == options_len,
+        InvalidSqlSnafu {
+            err_msg: "flow options only support scalar string-compatible values".to_string(),
+        }
+    );
+    Ok(flow_options)
 }
 
 /// sanitize the flow name, remove possible quotes
@@ -1065,6 +1139,8 @@ fn sanitize_flow_name(mut flow_name: ObjectName) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use api::v1::{SetDatabaseOptions, UnsetDatabaseOptions};
     use datatypes::value::Value;
     use session::context::{QueryContext, QueryContextBuilder};
@@ -1327,6 +1403,75 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;";
             to_dot_sep(expr.source_table_names[0].clone())
         );
         assert_eq!("SELECT max(c1), min(c2) FROM schema_2.table_2", expr.sql);
+        assert!(expr.flow_options.is_empty());
+
+        let sql = r"
+CREATE FLOW task_3
+SINK TO schema_1.table_1
+WITH (defer_on_missing_source = 'true', foo = 'bar')
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;";
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Statement::CreateFlow(create_flow) = stmt else {
+            unreachable!()
+        };
+        let expr = to_create_flow_task_expr(create_flow, &QueryContext::arc()).unwrap();
+        assert_eq!(
+            expr.flow_options,
+            HashMap::from([
+                ("defer_on_missing_source".to_string(), "true".to_string()),
+                ("foo".to_string(), "bar".to_string()),
+            ])
+        );
+
+        let sql = r"
+CREATE FLOW task_4
+SINK TO schema_1.table_1
+WITH (defer_on_missing_source = true)
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;";
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Statement::CreateFlow(create_flow) = stmt else {
+            unreachable!()
+        };
+        let expr = to_create_flow_task_expr(create_flow, &QueryContext::arc()).unwrap();
+        assert_eq!(
+            expr.flow_options,
+            HashMap::from([("defer_on_missing_source".to_string(), "true".to_string(),)])
+        );
+
+        let sql = r"
+CREATE FLOW task_5
+SINK TO schema_1.table_1
+WITH (defer_on_missing_source = [true])
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;";
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Statement::CreateFlow(create_flow) = stmt else {
+            unreachable!()
+        };
+        let res = to_create_flow_task_expr(create_flow, &QueryContext::arc());
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("flow options only support scalar string-compatible values")
+        );
 
         let sql = r"
 CREATE FLOW abc.`task_2`
@@ -1369,6 +1514,23 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;";
         assert_eq!(
             "1.0MiB",
             expr.table_options.get("write_buffer_size").unwrap()
+        );
+
+        let sql = "CREATE TABLE monitor (ts TIMESTAMP TIME INDEX) WITH(skip_wal='false');";
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+        let Statement::CreateTable(create_table) = stmt else {
+            unreachable!()
+        };
+        let expr = create_to_expr(&create_table, &QueryContext::arc()).unwrap();
+        assert_eq!(
+            Some("false"),
+            expr.table_options
+                .get(store_api::mito_engine_options::SKIP_WAL_KEY)
+                .map(String::as_str)
         );
     }
 
@@ -1604,14 +1766,93 @@ ALTER TABLE metrics REPARTITION (
         assert_eq!("greptime", request.catalog_name);
         assert_eq!("public", request.schema_name);
         assert_eq!("metrics", request.table_name);
+        let RepartitionSource::Partitions {
+            from_exprs,
+            target_partition_columns,
+        } = request.source
+        else {
+            unreachable!()
+        };
+        assert!(target_partition_columns.is_none());
         assert_eq!(
-            request
-                .from_exprs
+            from_exprs
                 .into_iter()
                 .map(|x| x.to_string())
                 .collect::<Vec<_>>(),
             vec!["device_id < 100".to_string()]
         );
+        assert_eq!(
+            request
+                .into_exprs
+                .into_iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "device_id < 100 AND area < 'South'".to_string(),
+                "device_id < 100 AND area >= 'South'".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_to_repartition_request_with_target_partition_columns() {
+        let sql = r#"
+ALTER TABLE metrics REPARTITION (
+  device_id < 100
+) ON COLUMNS (device_id, area) INTO (
+  device_id < 100 AND area < 'South',
+  device_id < 100 AND area >= 'South'
+);"#;
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Statement::AlterTable(alter_table) = stmt else {
+            unreachable!()
+        };
+
+        let request = to_repartition_request(alter_table, &QueryContext::arc()).unwrap();
+        let RepartitionSource::Partitions {
+            target_partition_columns,
+            ..
+        } = request.source
+        else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            target_partition_columns,
+            Some(vec!["device_id".to_string(), "area".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_to_repartition_request_with_unpartitioned_source() {
+        let sql = r#"
+ALTER TABLE metrics PARTITION ON COLUMNS (device_id, area) (
+  device_id < 100 AND area < 'South',
+  device_id < 100 AND area >= 'South'
+);"#;
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Statement::AlterTable(alter_table) = stmt else {
+            unreachable!()
+        };
+
+        let request = to_repartition_request(alter_table, &QueryContext::arc()).unwrap();
+        assert_eq!("greptime", request.catalog_name);
+        assert_eq!("public", request.schema_name);
+        assert_eq!("metrics", request.table_name);
+        let RepartitionSource::Unpartitioned { partition_columns } = request.source else {
+            unreachable!()
+        };
+        assert_eq!(partition_columns, vec!["device_id", "area"]);
         assert_eq!(
             request
                 .into_exprs

@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Display};
-use std::ops::Range;
+use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use api::v1::meta::mailbox_message::Payload;
 use api::v1::meta::{
-    HeartbeatRequest, HeartbeatResponse, MailboxMessage, PROTOCOL_VERSION, RegionLease,
-    ResponseHeader, Role,
+    HeartbeatConfig, HeartbeatRequest, HeartbeatResponse, MailboxMessage, PROTOCOL_VERSION,
+    RegionLease, ResponseHeader, Role,
 };
 use check_leader_handler::CheckLeaderHandler;
 use collect_cluster_info_handler::{
@@ -118,6 +119,8 @@ pub struct HeartbeatAccumulator {
     pub stat: Option<Stat>,
     pub inactive_region_ids: HashSet<RegionId>,
     pub region_lease: Option<RegionLease>,
+    /// Generic heartbeat response extensions accumulated by handlers.
+    pub extensions: HashMap<String, Vec<u8>>,
 }
 
 impl HeartbeatAccumulator {
@@ -134,6 +137,26 @@ impl HeartbeatAccumulator {
 pub struct PusherId {
     pub role: Role,
     pub id: u64,
+}
+
+impl PartialEq for PusherId {
+    fn eq(&self, other: &Self) -> bool {
+        self.role as i32 == other.role as i32 && self.id == other.id
+    }
+}
+
+impl Eq for PusherId {}
+
+impl PartialOrd for PusherId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PusherId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.role as i32, self.id).cmp(&(other.role as i32, other.id))
+    }
 }
 
 impl Debug for PusherId {
@@ -153,8 +176,11 @@ impl PusherId {
         Self { role, id }
     }
 
-    pub fn string_key(&self) -> String {
-        format!("{}-{}", self.role as i32, self.id)
+    fn role_range(role: Role) -> (Bound<Self>, Bound<Self>) {
+        (
+            Bound::Included(Self::new(role, u64::MIN)),
+            Bound::Included(Self::new(role, u64::MAX)),
+        )
     }
 }
 
@@ -214,7 +240,7 @@ impl Pusher {
 
 /// The group of heartbeat pushers.
 #[derive(Clone, Default)]
-pub struct Pushers(Arc<RwLock<BTreeMap<String, Pusher>>>);
+pub struct Pushers(Arc<RwLock<BTreeMap<PusherId, Pusher>>>);
 
 impl Pushers {
     async fn push(
@@ -222,11 +248,12 @@ impl Pushers {
         pusher_id: PusherId,
         mailbox_message: MailboxMessage,
     ) -> Result<DeregisterSignalReceiver> {
-        let pusher_id = pusher_id.string_key();
         let pushers = self.0.read().await;
         let pusher = pushers
             .get(&pusher_id)
-            .context(error::PusherNotFoundSnafu { pusher_id })?;
+            .with_context(|| error::PusherNotFoundSnafu {
+                pusher_id: pusher_id.to_string(),
+            })?;
 
         pusher
             .push(HeartbeatResponse {
@@ -239,14 +266,10 @@ impl Pushers {
         Ok(pusher.deregister_signal_receiver.clone())
     }
 
-    async fn broadcast(
-        &self,
-        range: Range<String>,
-        mailbox_message: &MailboxMessage,
-    ) -> Result<()> {
+    async fn broadcast(&self, role: Role, mailbox_message: &MailboxMessage) -> Result<()> {
         let pushers = self.0.read().await;
         let pushers = pushers
-            .range(range)
+            .range(PusherId::role_range(role))
             .map(|(_, value)| value)
             .collect::<Vec<_>>();
         let mut results = Vec::with_capacity(pushers.len());
@@ -271,21 +294,12 @@ impl Pushers {
         Ok(())
     }
 
-    pub(crate) async fn insert(&self, pusher_id: String, pusher: Pusher) -> Option<Pusher> {
+    pub(crate) async fn insert(&self, pusher_id: PusherId, pusher: Pusher) -> Option<Pusher> {
         self.0.write().await.insert(pusher_id, pusher)
     }
 
-    async fn remove(&self, pusher_id: &str) -> Option<Pusher> {
-        self.0.write().await.remove(pusher_id)
-    }
-
-    pub(crate) async fn clear(&self) -> Vec<String> {
-        let mut pushers = self.0.write().await;
-        let keys = pushers.keys().cloned().collect::<Vec<_>>();
-        if !keys.is_empty() {
-            pushers.clear();
-        }
-        keys
+    async fn remove(&self, pusher_id: PusherId) -> Option<Pusher> {
+        self.0.write().await.remove(&pusher_id)
     }
 }
 
@@ -317,15 +331,22 @@ impl HeartbeatHandlerGroup {
     pub async fn register_pusher(&self, pusher_id: PusherId, pusher: Pusher) {
         METRIC_META_HEARTBEAT_CONNECTION_NUM.inc();
         info!("Pusher register: {}", pusher_id);
-        let _ = self.pushers.insert(pusher_id.string_key(), pusher).await;
+        let _ = self.pushers.insert(pusher_id, pusher).await;
     }
 
     /// Deregisters the heartbeat response [`Pusher`] with the given key from the group.
     pub async fn deregister_push(&self, pusher_id: PusherId) {
-        info!("Pusher unregister: {}", pusher_id);
-        if self.pushers.remove(&pusher_id.string_key()).await.is_some() {
+        if self.pushers.remove(pusher_id).await.is_some() {
+            info!("Pusher unregister: {}", pusher_id);
             METRIC_META_HEARTBEAT_CONNECTION_NUM.dec();
         }
+    }
+
+    #[cfg(test)]
+    /// Returns whether the group contains the heartbeat response [`Pusher`] with the given key.
+    pub async fn contains_pusher(&self, pusher_id: &PusherId) -> bool {
+        let pushers = self.pushers.0.read().await;
+        pushers.contains_key(pusher_id)
     }
 
     /// Returns the [`Pushers`] of the group.
@@ -368,7 +389,8 @@ impl HeartbeatHandlerGroup {
 
         // Populate heartbeat_config during handshake
         let heartbeat_config = if is_handshake {
-            let config = ctx.heartbeat_options_for(role).into();
+            let mut config: HeartbeatConfig = ctx.heartbeat_options_for(role).into();
+            config.gc_enabled = ctx.gc_enabled;
 
             info!(
                 "Handshake with {:?} node, sending config: {:?}",
@@ -385,6 +407,7 @@ impl HeartbeatHandlerGroup {
             region_lease: acc.region_lease,
             mailbox_message,
             heartbeat_config,
+            extensions: std::mem::take(&mut acc.extensions),
         };
         Ok(res)
     }
@@ -533,7 +556,7 @@ impl Mailbox for HeartbeatMailbox {
     }
 
     async fn broadcast(&self, ch: &BroadcastChannel, msg: &MailboxMessage) -> Result<()> {
-        self.pushers.broadcast(ch.pusher_range(), msg).await
+        self.pushers.broadcast(ch.role(), msg).await
     }
 
     async fn on_recv(&self, id: MessageId, maybe_msg: Result<MailboxMessage>) -> Result<()> {
@@ -549,14 +572,6 @@ impl Mailbox for HeartbeatMailbox {
         }
 
         Ok(())
-    }
-
-    async fn reset(&self) {
-        let keys = self.pushers.clear().await;
-        if !keys.is_empty() {
-            info!("Reset mailbox, deregister pushers: {:?}", keys);
-            METRIC_META_HEARTBEAT_CONNECTION_NUM.sub(keys.len() as i64);
-        }
     }
 }
 
@@ -871,19 +886,25 @@ impl HeartbeatHandlerGroupBuilderCustomizer for DefaultHeartbeatHandlerGroupBuil
 mod tests {
 
     use std::assert_matches;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use api::v1::meta::{MailboxMessage, Role};
+    use api::v1::meta::{HeartbeatRequest, MailboxMessage, RequestHeader, Role};
     use common_meta::kv_backend::memory::MemoryKvBackend;
     use common_meta::sequence::SequenceBuilder;
     use tokio::sync::mpsc;
 
-    use super::{HeartbeatHandlerGroupBuilder, PusherId, Pushers};
+    use super::{
+        HandleControl, HeartbeatAccumulator, HeartbeatHandler, HeartbeatHandlerGroupBuilder,
+        PusherId, Pushers,
+    };
     use crate::error;
     use crate::handler::collect_stats_handler::CollectStatsHandler;
     use crate::handler::response_header_handler::ResponseHeaderHandler;
+    use crate::handler::test_utils::TestEnv;
     use crate::handler::{HeartbeatHandlerGroup, HeartbeatMailbox, Pusher};
+    use crate::metasrv::Context;
     use crate::service::mailbox::{Channel, MailboxReceiver, MailboxRef};
 
     #[tokio::test]
@@ -944,6 +965,62 @@ mod tests {
         assert_eq!(message.subject, "req-test".to_string());
 
         (mailbox, receiver)
+    }
+
+    #[test]
+    fn test_pusher_id_role_range() {
+        let mut pushers = BTreeMap::new();
+        pushers.insert(PusherId::new(Role::Datanode, u64::MAX), "datanode");
+        pushers.insert(PusherId::new(Role::Frontend, u64::MIN), "frontend-min");
+        pushers.insert(PusherId::new(Role::Frontend, u64::MAX), "frontend-max");
+        pushers.insert(PusherId::new(Role::Flownode, u64::MIN), "flownode");
+
+        let frontend_pushers = pushers
+            .range(PusherId::role_range(Role::Frontend))
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>();
+
+        assert_eq!(frontend_pushers, vec!["frontend-min", "frontend-max"]);
+    }
+
+    #[tokio::test]
+    async fn test_pushers_broadcast_by_role() {
+        let pushers = Pushers::default();
+        let (datanode_tx, mut datanode_rx) = mpsc::channel(1);
+        let (frontend_tx, mut frontend_rx) = mpsc::channel(1);
+        let (flownode_tx, mut flownode_rx) = mpsc::channel(1);
+
+        pushers
+            .insert(
+                PusherId::new(Role::Datanode, u64::MAX),
+                Pusher::new(datanode_tx),
+            )
+            .await;
+        pushers
+            .insert(PusherId::new(Role::Frontend, 1), Pusher::new(frontend_tx))
+            .await;
+        pushers
+            .insert(
+                PusherId::new(Role::Flownode, u64::MIN),
+                Pusher::new(flownode_tx),
+            )
+            .await;
+
+        let msg = MailboxMessage {
+            id: 42,
+            subject: "broadcast-test".to_string(),
+            timestamp_millis: 123,
+            ..Default::default()
+        };
+
+        pushers.broadcast(Role::Frontend, &msg).await.unwrap();
+
+        let received = frontend_rx.recv().await.unwrap().unwrap();
+        let mailbox_message = received.mailbox_message.unwrap();
+        assert_eq!(mailbox_message.id, 0);
+        assert_eq!(mailbox_message.subject, "broadcast-test");
+        assert!(datanode_rx.try_recv().is_err());
+        assert!(flownode_rx.try_recv().is_err());
     }
 
     #[test]
@@ -1245,5 +1322,45 @@ mod tests {
 
         drop(pusher);
         deregister_signal_tx.changed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_custom_handler_extension_reaches_response() {
+        struct CustomExtensionHandler;
+
+        #[async_trait::async_trait]
+        impl HeartbeatHandler for CustomExtensionHandler {
+            fn is_acceptable(&self, role: Role) -> bool {
+                role == Role::Frontend
+            }
+
+            async fn handle(
+                &self,
+                _req: &HeartbeatRequest,
+                _ctx: &mut Context,
+                acc: &mut HeartbeatAccumulator,
+            ) -> crate::error::Result<HandleControl> {
+                acc.extensions
+                    .insert("custom.key".to_string(), b"custom-value".to_vec());
+                Ok(HandleControl::Continue)
+            }
+        }
+
+        let mut builder =
+            HeartbeatHandlerGroupBuilder::new(Pushers::default()).add_default_handlers();
+        builder.add_handler_last(CustomExtensionHandler);
+
+        let group = builder.build().unwrap();
+
+        let req = HeartbeatRequest {
+            header: Some(RequestHeader::new(1, Role::Frontend, Default::default())),
+            ..Default::default()
+        };
+        let ctx = TestEnv::new().ctx();
+
+        let res = group.handle(req, ctx).await.unwrap();
+
+        let extensions = res.extensions;
+        assert_eq!(extensions.get("custom.key").unwrap(), b"custom-value");
     }
 }

@@ -26,6 +26,7 @@ use sqlparser::ast::{ColumnDef, DataType, Expr, Ident, ObjectName, TableConstrai
 use sqlparser_derive::{Visit, VisitMut};
 
 use crate::statements::OptionMap;
+use crate::statements::create::Partitions;
 
 #[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
 pub struct AlterTable {
@@ -119,6 +120,10 @@ pub enum AlterTableOperation {
     Repartition {
         operation: RepartitionOperation,
     },
+    /// `PARTITION ON COLUMNS (...) (...)`
+    Partition {
+        partitions: Partitions,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
@@ -135,6 +140,12 @@ pub struct SetDefaultsOperation {
 pub struct RepartitionOperation {
     pub from_exprs: Vec<Expr>,
     pub into_exprs: Vec<Expr>,
+    /// Optional new partition columns for `REPARTITION ... ON COLUMNS (...) INTO (...)` and
+    /// `SPLIT PARTITION ... ON COLUMNS (...) INTO (...)`.
+    ///
+    /// This is `Some` only when the statement explicitly carries `ON COLUMNS`.
+    /// Legacy `REPARTITION`, `SPLIT PARTITION`, and `MERGE PARTITION` keep this as `None`.
+    pub partition_columns: Option<Vec<Ident>>,
 }
 
 impl RepartitionOperation {
@@ -142,6 +153,19 @@ impl RepartitionOperation {
         Self {
             from_exprs,
             into_exprs,
+            partition_columns: None,
+        }
+    }
+
+    pub fn with_partition_columns(
+        from_exprs: Vec<Expr>,
+        into_exprs: Vec<Expr>,
+        partition_columns: Vec<Ident>,
+    ) -> Self {
+        Self {
+            from_exprs,
+            into_exprs,
+            partition_columns: Some(partition_columns),
         }
     }
 }
@@ -159,7 +183,15 @@ impl Display for RepartitionOperation {
             .map(|expr| expr.to_string())
             .join(", ");
 
-        write!(f, "({from}) INTO ({into})")
+        if let Some(partition_columns) = &self.partition_columns {
+            let partition_columns = partition_columns
+                .iter()
+                .map(|ident| ident.to_string())
+                .join(", ");
+            write!(f, "({from}) ON COLUMNS ({partition_columns}) INTO ({into})")
+        } else {
+            write!(f, "({from}) INTO ({into})")
+        }
     }
 }
 
@@ -247,6 +279,9 @@ impl Display for AlterTableOperation {
             }
             AlterTableOperation::Repartition { operation } => {
                 write!(f, "REPARTITION {operation}")
+            }
+            AlterTableOperation::Partition { partitions } => {
+                write!(f, "{partitions}")
             }
             AlterTableOperation::SetIndex { options } => match options {
                 SetIndexOperation::Fulltext {

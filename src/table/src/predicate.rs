@@ -23,6 +23,7 @@ use datafusion::common::ScalarValue;
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion_common::ToDFSchema;
 use datafusion_common::pruning::PruningStatistics;
+use datafusion_common::tree_node::TreeNode;
 use datafusion_expr::expr::{Expr, InList};
 use datafusion_expr::{Between, BinaryExpr, Operator};
 use datafusion_physical_expr::execution_props::ExecutionProps;
@@ -41,7 +42,7 @@ mod stats;
 /// In theory, it should be converted to a timestamp scalar value by `TypeConversionRule`.
 macro_rules! return_none_if_utf8 {
     ($lit: ident) => {
-        if matches!($lit, ScalarValue::Utf8(_)) {
+        if is_string_timestamp_literal($lit) {
             warn!(
                 "Unexpected ScalarValue::Utf8 in time range predicate: {:?}. Maybe it's an implicit bug, please report it to https://github.com/GreptimeTeam/greptimedb/issues",
                 $lit
@@ -51,6 +52,13 @@ macro_rules! return_none_if_utf8 {
             return None;
         }
     };
+}
+
+pub fn is_string_timestamp_literal(scalar: &ScalarValue) -> bool {
+    matches!(
+        scalar,
+        ScalarValue::Utf8(_) | ScalarValue::LargeUtf8(_) | ScalarValue::Utf8View(_)
+    )
 }
 
 /// Reference-counted pointer to a list of logical exprs and a list of dynamic filter physical exprs.
@@ -120,11 +128,11 @@ impl Predicate {
             .context(error::DatafusionSnafu)
     }
 
-    /// Builds physical exprs according to provided schema.
-    pub fn to_physical_exprs(
-        &self,
+    /// Builds a single physical expr according to provided schema.
+    pub fn to_physical_expr(
+        expr: &Expr,
         schema: &arrow::datatypes::SchemaRef,
-    ) -> error::Result<Vec<Arc<dyn PhysicalExpr>>> {
+    ) -> error::Result<Arc<dyn PhysicalExpr>> {
         let df_schema = schema
             .clone()
             .to_dfschema_ref()
@@ -135,12 +143,21 @@ impl Predicate {
         // registering variables.
         let execution_props = &ExecutionProps::new();
 
+        create_physical_expr(expr, df_schema.as_ref(), execution_props)
+            .context(error::DatafusionSnafu)
+    }
+
+    /// Builds physical exprs according to provided schema.
+    pub fn to_physical_exprs(
+        &self,
+        schema: &arrow::datatypes::SchemaRef,
+    ) -> error::Result<Vec<Arc<dyn PhysicalExpr>>> {
         let dyn_filters = self.dyn_filter_phy_exprs()?;
 
         Ok(self
             .exprs
             .iter()
-            .filter_map(|expr| create_physical_expr(expr, df_schema.as_ref(), execution_props).ok())
+            .filter_map(|expr| Self::to_physical_expr(expr, schema).ok())
             .chain(dyn_filters)
             .collect::<Vec<_>>())
     }
@@ -199,6 +216,83 @@ pub fn build_time_range_predicate(
         }
     }
     res
+}
+
+/// The outcome of strictly extracting the time range of `ts_col_name` from a
+/// scan's filters. Unlike [`build_time_range_predicate`], which quietly widens
+/// to `min_to_max` on anything it cannot parse (fine for pruning), this
+/// distinguishes "the column is not filtered at all" from "it is filtered in a
+/// way that cannot be safely turned into a range" — for callers whose contract
+/// forbids silently falling back to a default window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimeRangeExtraction {
+    /// No filter references the column.
+    Absent,
+    /// Every filter referencing the column was folded into this range, which
+    /// over-approximates the filters' satisfying set.
+    Extracted(TimestampRange),
+    /// At least one filter references the column in a shape that cannot be
+    /// safely extracted (e.g. under `OR`/`NOT`, or compared to a non-literal).
+    Unsupported,
+}
+
+/// Strictly extracts the time range of `ts_col_name` from the (implicitly
+/// AND-ed) scan filters. See [`TimeRangeExtraction`].
+pub fn extract_time_range_strict(
+    ts_col_name: &str,
+    ts_col_unit: TimeUnit,
+    filters: &[Expr],
+) -> TimeRangeExtraction {
+    let mut range: Option<TimestampRange> = None;
+    for expr in filters {
+        if !expr
+            .column_refs()
+            .iter()
+            .any(|column| column.name == ts_col_name)
+        {
+            continue;
+        }
+        // Disjunctive shapes (`OR`, `IN`) collapse disjoint ranges into their
+        // convex hull, which is not exactly representable as one contiguous
+        // range; callers deriving synthetic timestamps from the bounds would
+        // emit points inside the gaps.
+        if contains_disjunction_over_column(expr, ts_col_name) {
+            return TimeRangeExtraction::Unsupported;
+        }
+        // `Some` from the lenient extractor over-approximates the expression's
+        // satisfying set (an `AND` side it cannot parse is dropped, which only
+        // widens), so intersecting extracted conjuncts stays an
+        // over-approximation.
+        match extract_time_range_from_expr(ts_col_name, ts_col_unit, expr) {
+            Some(extracted) => {
+                range = Some(match range {
+                    Some(acc) => acc.and(&extracted),
+                    None => extracted,
+                });
+            }
+            None => return TimeRangeExtraction::Unsupported,
+        }
+    }
+    match range {
+        Some(range) => TimeRangeExtraction::Extracted(range),
+        None => TimeRangeExtraction::Absent,
+    }
+}
+
+fn contains_disjunction_over_column(expr: &Expr, ts_col_name: &str) -> bool {
+    let is_disjunction = |expr: &Expr| {
+        matches!(
+            expr,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Or,
+                ..
+            }) | Expr::InList(_)
+        ) && expr
+            .column_refs()
+            .iter()
+            .any(|column| column.name == ts_col_name)
+    };
+    expr.exists(|expr| Ok(is_disjunction(expr))).unwrap_or(true)
 }
 
 /// Extract time range filter from `WHERE`/`IN (...)`/`BETWEEN` clauses.
@@ -577,6 +671,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_extract_time_range_strict() {
+        fn ts_lit(ms: i64) -> Expr {
+            lit(ScalarValue::TimestampMillisecond(Some(ms), None))
+        }
+        let extract =
+            |filters: &[Expr]| extract_time_range_strict("ts", TimeUnit::Millisecond, filters);
+        let range = |start: i64, end: i64| {
+            TimestampRange::new(
+                Timestamp::new_millisecond(start),
+                Timestamp::new_millisecond(end),
+            )
+            .unwrap()
+        };
+
+        // No filter references the column.
+        assert_eq!(extract(&[]), TimeRangeExtraction::Absent);
+        assert_eq!(
+            extract(&[col("host").eq(lit("a"))]),
+            TimeRangeExtraction::Absent
+        );
+
+        // Both bounds across conjuncts; unrelated filters are ignored.
+        assert_eq!(
+            extract(&[
+                col("ts").gt_eq(ts_lit(1000)),
+                col("ts").lt(ts_lit(2000)),
+                col("host").eq(lit("a")),
+            ]),
+            TimeRangeExtraction::Extracted(range(1000, 2000))
+        );
+
+        // Lower bound only / upper bound only.
+        assert_eq!(
+            extract(&[col("ts").gt_eq(ts_lit(1000))]),
+            TimeRangeExtraction::Extracted(TimestampRange::from_start(Timestamp::new_millisecond(
+                1000
+            )))
+        );
+        assert_eq!(
+            extract(&[col("ts").lt(ts_lit(2000))]),
+            TimeRangeExtraction::Extracted(TimestampRange::until_end(
+                Timestamp::new_millisecond(2000),
+                false
+            ))
+        );
+
+        // BETWEEN is inclusive on both ends.
+        assert_eq!(
+            extract(&[col("ts").between(ts_lit(1000), ts_lit(2000))]),
+            TimeRangeExtraction::Extracted(range(1000, 2001))
+        );
+
+        // Equality pins a single point.
+        assert_eq!(
+            extract(&[col("ts").eq(ts_lit(1500))]),
+            TimeRangeExtraction::Extracted(TimestampRange::single(Timestamp::new_millisecond(
+                1500
+            )))
+        );
+
+        // An unparsable side under AND only widens; the extraction stays safe.
+        assert_eq!(
+            extract(&[col("ts").gt_eq(ts_lit(1000)).and(col("ts").lt(col("t2")))]),
+            TimeRangeExtraction::Extracted(TimestampRange::from_start(Timestamp::new_millisecond(
+                1000
+            )))
+        );
+
+        // Contradictory bounds collapse to the empty range, not an error.
+        let TimeRangeExtraction::Extracted(empty) =
+            extract(&[col("ts").gt_eq(ts_lit(2000)), col("ts").lt(ts_lit(1000))])
+        else {
+            panic!("expected an extraction");
+        };
+        assert!(empty.is_empty());
+
+        // Shapes that could widen the satisfying set beyond what is extractable
+        // must be refused: OR with an unparsable side, NOT, non-literal bounds.
+        assert_eq!(
+            extract(&[col("ts").gt(ts_lit(1000)).or(col("host").eq(lit("a")))]),
+            TimeRangeExtraction::Unsupported
+        );
+        assert_eq!(
+            extract(&[!col("ts").gt(ts_lit(1000))]),
+            TimeRangeExtraction::Unsupported
+        );
+        assert_eq!(
+            extract(&[col("ts").gt_eq(col("t2"))]),
+            TimeRangeExtraction::Unsupported
+        );
+    }
+
     async fn gen_test_parquet_file(dir: &TempDir, cnt: usize) -> (String, Arc<Schema>) {
         let path = dir
             .path()
@@ -596,7 +783,7 @@ mod tests {
             .unwrap();
 
         let write_props = WriterProperties::builder()
-            .set_max_row_group_size(10)
+            .set_max_row_group_row_count(Some(10))
             .build();
         let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(write_props)).unwrap();
 
@@ -730,5 +917,8 @@ mod tests {
 
         let predicates = predicate.to_physical_exprs(&schema).unwrap();
         assert!(!predicates.is_empty());
+
+        let physical_expr = Predicate::to_physical_expr(&col("host").eq(lit("host_a")), &schema);
+        assert!(physical_expr.is_ok());
     }
 }

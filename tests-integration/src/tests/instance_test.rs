@@ -17,17 +17,18 @@ use std::sync::Arc;
 
 use client::{DEFAULT_SCHEMA_NAME, OutputData};
 use common_catalog::consts::DEFAULT_CATALOG_NAME;
-use common_error::ext::ErrorExt;
+use common_error::ext::{ErrorExt, RetryHint};
+use common_error::status_code::StatusCode;
 use common_query::Output;
 use common_recordbatch::util;
 use common_test_util::recordbatch::check_output_stream;
-use common_test_util::temp_dir;
 use datatypes::arrow::array::{
     ArrayRef, AsArray, StringArray, TimestampMillisecondArray, UInt64Array,
 };
 use frontend::error::Error;
 use frontend::instance::Instance;
 use operator::error::Error as OperatorError;
+use query::datafusion::QUERY_PARALLELISM_HINT;
 use rstest::rstest;
 use rstest_reuse::apply;
 use servers::error as server_error;
@@ -36,9 +37,9 @@ use session::context::{QueryContext, QueryContextRef};
 
 use crate::tests::test_util::{
     MockInstance, both_instances_cases, both_instances_cases_with_custom_storages,
-    check_unordered_output_stream, distributed, distributed_with_multiple_object_stores,
-    find_testing_resource, prepare_path, standalone, standalone_instance_case,
-    standalone_with_multiple_object_stores,
+    check_unordered_output_stream, create_local_file_test_dir, distributed,
+    distributed_with_multiple_object_stores, find_testing_resource, prepare_path, standalone,
+    standalone_instance_case, standalone_with_multiple_object_stores,
 };
 
 #[apply(both_instances_cases)]
@@ -87,6 +88,173 @@ async fn test_create_database_and_insert_query(instance: Arc<dyn MockInstance>) 
         }
         _ => unreachable!(),
     }
+}
+
+#[apply(both_instances_cases)]
+async fn test_admin_discard_unflushed_data(instance: Arc<dyn MockInstance>) {
+    let instance = instance.frontend();
+
+    execute_sql(
+        &instance,
+        r#"CREATE TABLE discard_unflushed_data_test (
+            host STRING PRIMARY KEY,
+            val DOUBLE,
+            ts TIMESTAMP TIME INDEX
+        ) ENGINE = mito"#,
+    )
+    .await;
+    execute_sql(
+        &instance,
+        "INSERT INTO discard_unflushed_data_test VALUES ('persisted', 1, 1)",
+    )
+    .await;
+    execute_sql(
+        &instance,
+        "ADMIN FLUSH_TABLE('discard_unflushed_data_test')",
+    )
+    .await;
+    execute_sql(
+        &instance,
+        "INSERT INTO discard_unflushed_data_test VALUES ('unflushed', 2, 2)",
+    )
+    .await;
+
+    let region_output = execute_sql(
+        &instance,
+        "SELECT greptime_partition_id FROM information_schema.partitions \
+         WHERE table_name = 'discard_unflushed_data_test' LIMIT 1",
+    )
+    .await;
+    let OutputData::Stream(stream) = region_output.data else {
+        panic!("expected region id stream");
+    };
+    let batches = util::collect(stream).await.unwrap();
+    let region_ids = batches[0].column(0);
+    let region_ids = region_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
+    let region_id = region_ids.value(0);
+
+    let admin_sql = format!("ADMIN discard_unflushed({region_id})");
+    for _ in 0..2 {
+        let output = execute_sql(&instance, &admin_sql).await;
+        let OutputData::RecordBatches(batches) = output.data else {
+            panic!("expected ADMIN result batches");
+        };
+        let result = batches.iter().next().unwrap().column(0);
+        let result = result.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(0, result.value(0));
+    }
+
+    let output = execute_sql(
+        &instance,
+        "SELECT host, val FROM discard_unflushed_data_test ORDER BY host",
+    )
+    .await;
+    assert_eq!(
+        "+-----------+-----+\n\
+         | host      | val |\n\
+         +-----------+-----+\n\
+         | persisted | 1.0 |\n\
+         +-----------+-----+",
+        output.data.pretty_print().await
+    );
+
+    assert!(
+        try_execute_sql(&instance, &format!("SELECT discard_unflushed({region_id})"),)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_distributed_scalar_latest_with_query_parallelism_below_regions() {
+    common_telemetry::init_default_ut_logging();
+
+    let distributed = crate::tests::create_distributed_instance(
+        "test_distributed_scalar_latest_with_query_parallelism_below_regions",
+    )
+    .await;
+    let frontend = distributed.frontend();
+
+    execute_sql(
+        &frontend,
+        r#"
+CREATE TABLE cpu (
+    rack STRING NULL,
+    os STRING NULL,
+    usage_user BIGINT NULL,
+    greptime_timestamp TIMESTAMP(9) NOT NULL,
+    TIME INDEX (greptime_timestamp)
+)
+PARTITION ON COLUMNS (rack) (
+    rack < '2',
+    rack >= '2' AND rack < '4',
+    rack >= '4' AND rack < '6',
+    rack >= '6' AND rack < '8',
+    rack >= '8'
+)
+ENGINE = mito
+WITH (append_mode = 'true', sst_format = 'flat')
+"#,
+    )
+    .await;
+
+    execute_sql(
+        &frontend,
+        r#"
+INSERT INTO cpu VALUES
+    ('1', 'linux', 10, '2023-06-12 01:04:49'),
+    ('1', 'linux', 15, '2023-06-12 01:04:50'),
+    ('3', 'windows', 25, '2023-06-12 01:05:00'),
+    ('5', 'mac', 30, '2023-06-12 01:03:00'),
+    ('7', 'linux', 45, '2023-06-12 02:00:00'),
+    ('2', 'linux', 20, '2023-06-12 01:04:51'),
+    ('2', 'windows', 22, '2023-06-12 01:06:00'),
+    ('4', 'mac', 12, '2023-06-12 00:59:00'),
+    ('6', 'linux', 35, '2023-06-12 01:04:55'),
+    ('8', 'windows', 50, '2023-06-12 02:10:00')
+"#,
+    )
+    .await;
+
+    let latest_sql = r#"
+SELECT rack, os, greptime_timestamp
+FROM cpu
+WHERE greptime_timestamp = (
+    SELECT greptime_timestamp
+    FROM cpu
+    ORDER BY greptime_timestamp DESC
+    LIMIT 1
+)
+"#;
+
+    let result = execute_sql_with_query_parallelism(&frontend, latest_sql, 1)
+        .await
+        .data
+        .pretty_print()
+        .await;
+    assert_eq!(
+        result,
+        r#"+------+---------+---------------------+
+| rack | os      | greptime_timestamp  |
++------+---------+---------------------+
+| 8    | windows | 2023-06-12T02:10:00 |
++------+---------+---------------------+"#
+    );
+
+    let explain =
+        execute_sql_with_query_parallelism(&frontend, &format!("EXPLAIN {latest_sql}"), 1)
+            .await
+            .data
+            .pretty_print()
+            .await;
+    assert!(
+        explain.contains("SortExec"),
+        "query_parallelism=1 with five regions should insert SortExec below MergeSortExec; explain:\n{explain}"
+    );
+    assert!(
+        explain.contains("MergeSortExec"),
+        "query_parallelism=1 with five regions should keep the distributed merge stage stable; explain:\n{explain}"
+    );
 }
 
 #[apply(both_instances_cases)]
@@ -157,7 +325,7 @@ PARTITION ON COLUMNS (n) (
     check_output_stream(output, expected).await;
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_extra_external_table_options(instance: Arc<dyn MockInstance>) {
     let frontend = instance.frontend();
     let format = "json";
@@ -184,7 +352,7 @@ async fn test_extra_external_table_options(instance: Arc<dyn MockInstance>) {
     ));
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_show_create_external_table(instance: Arc<dyn MockInstance>) {
     unsafe {
         std::env::set_var("TZ", "UTC");
@@ -568,11 +736,52 @@ async fn test_execute_create(instance: Arc<dyn MockInstance>) {
     assert!(matches!(output, OutputData::AffectedRows(0)));
 }
 
-#[apply(both_instances_cases)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_distributed_local_file_access_disabled() {
+    let instance = distributed().await.frontend();
+    execute_sql(
+        &instance,
+        "CREATE TABLE local_file_access_distributed (
+            ts TIMESTAMP TIME INDEX,
+            host STRING PRIMARY KEY,
+            val DOUBLE
+        );",
+    )
+    .await;
+
+    let statements = [
+        "COPY local_file_access_distributed TO 'local_file_access/table.parquet';",
+        "COPY local_file_access_distributed FROM 'local_file_access/table.parquet';",
+        "COPY (SELECT * FROM local_file_access_distributed) TO 'local_file_access/query.parquet';",
+        "COPY DATABASE public TO 'local_file_access/database/';",
+        "COPY DATABASE public FROM 'local_file_access/database/';",
+        "CREATE EXTERNAL TABLE local_file_access_external WITH (
+            location = 'local_file_access/table.parquet',
+            format = 'parquet'
+        );",
+    ];
+
+    for statement in statements {
+        let error = try_execute_sql(&instance, statement).await.unwrap_err();
+        assert_eq!(error.status_code(), StatusCode::InvalidArguments);
+        assert_eq!(error.retry_hint(), RetryHint::NonRetryable);
+        let message = error.output_msg();
+        assert!(
+            message.contains("SQL access to the local filesystem is disabled"),
+            "{message}"
+        );
+        assert!(
+            message.contains("use S3, OSS, GCS, or AzBlob instead"),
+            "{message}"
+        );
+    }
+}
+
+#[apply(standalone_instance_case)]
 async fn test_execute_external_create(instance: Arc<dyn MockInstance>) {
     let instance = instance.frontend();
 
-    let tmp_dir = temp_dir::create_temp_dir("test_execute_external_create");
+    let tmp_dir = create_local_file_test_dir("test_execute_external_create");
     let location = prepare_path(tmp_dir.path().to_str().unwrap());
 
     let output = execute_sql(
@@ -607,11 +816,11 @@ async fn test_execute_external_create(instance: Arc<dyn MockInstance>) {
     assert!(matches!(output, OutputData::AffectedRows(0)));
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_external_create_infer_format(instance: Arc<dyn MockInstance>) {
     let instance = instance.frontend();
 
-    let tmp_dir = temp_dir::create_temp_dir("test_execute_external_create_infer_format");
+    let tmp_dir = create_local_file_test_dir("test_execute_external_create_infer_format");
     let location = prepare_path(tmp_dir.path().to_str().unwrap());
 
     let output = execute_sql(
@@ -623,11 +832,11 @@ async fn test_execute_external_create_infer_format(instance: Arc<dyn MockInstanc
     assert!(matches!(output, OutputData::AffectedRows(0)));
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_external_create_without_ts(instance: Arc<dyn MockInstance>) {
     let instance = instance.frontend();
 
-    let tmp_dir = temp_dir::create_temp_dir("test_execute_external_create_without_ts");
+    let tmp_dir = create_local_file_test_dir("test_execute_external_create_without_ts");
     let location = prepare_path(tmp_dir.path().to_str().unwrap());
 
     let result = try_execute_sql(
@@ -648,11 +857,11 @@ async fn test_execute_external_create_without_ts(instance: Arc<dyn MockInstance>
     ));
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_external_create_with_invalid_ts(instance: Arc<dyn MockInstance>) {
     let instance = instance.frontend();
 
-    let tmp_dir = temp_dir::create_temp_dir("test_execute_external_create_with_invalid_ts");
+    let tmp_dir = create_local_file_test_dir("test_execute_external_create_with_invalid_ts");
     let location = prepare_path(tmp_dir.path().to_str().unwrap());
 
     let result = try_execute_sql(
@@ -692,7 +901,7 @@ async fn test_execute_external_create_with_invalid_ts(instance: Arc<dyn MockInst
     ));
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_query_external_table_parquet(instance: Arc<dyn MockInstance>) {
     unsafe {
         std::env::set_var("TZ", "UTC");
@@ -767,7 +976,7 @@ async fn test_execute_query_external_table_parquet(instance: Arc<dyn MockInstanc
     check_output_stream(output, expect).await;
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_query_external_table_orc(instance: Arc<dyn MockInstance>) {
     unsafe {
         std::env::set_var("TZ", "UTC");
@@ -852,7 +1061,7 @@ async fn test_execute_query_external_table_orc(instance: Arc<dyn MockInstance>) 
     check_output_stream(output, expect).await;
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_query_external_table_orc_with_schema(instance: Arc<dyn MockInstance>) {
     unsafe {
         std::env::set_var("TZ", "UTC");
@@ -910,7 +1119,7 @@ async fn test_execute_query_external_table_orc_with_schema(instance: Arc<dyn Moc
     check_output_stream(output, expect).await;
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_query_external_table_csv(instance: Arc<dyn MockInstance>) {
     unsafe {
         std::env::set_var("TZ", "UTC");
@@ -965,7 +1174,264 @@ async fn test_execute_query_external_table_csv(instance: Arc<dyn MockInstance>) 
     check_output_stream(output, expect).await;
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
+async fn test_execute_copy_from_headerless_csv(instance: Arc<dyn MockInstance>) {
+    let instance = instance.frontend();
+    let csv_path = find_testing_resource("/tests/data/csv/headerless.csv");
+    let skip_bad_records_csv_path =
+        find_testing_resource("/tests/data/csv/headerless_skip_bad_records.csv");
+    let extra_columns_csv_path =
+        find_testing_resource("/tests/data/csv/headerless_extra_columns.csv");
+    let fewer_columns_csv_path =
+        find_testing_resource("/tests/data/csv/headerless_fewer_columns.csv");
+
+    let output = execute_sql(
+        &instance,
+        "CREATE TABLE csv_headerless(host_id INT, host_name STRING, reading_value DOUBLE, ts TIMESTAMP TIME INDEX);",
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(0)));
+
+    let output = execute_sql(
+        &instance,
+        &format!("COPY csv_headerless FROM '{csv_path}' WITH (FORMAT='csv', HEADERS='false');"),
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(2)));
+
+    let output = execute_sql(&instance, "SELECT * FROM csv_headerless ORDER BY ts;")
+        .await
+        .data;
+    let expect = "\
++---------+-----------+---------------+---------------------+
+| host_id | host_name | reading_value | ts                  |
++---------+-----------+---------------+---------------------+
+| 1       | Alice     | 10.5          | 2024-01-01T00:00:00 |
+| 2       | Bob       | 30.5          | 2024-01-01T00:00:02 |
++---------+-----------+---------------+---------------------+";
+    check_output_stream(output, expect).await;
+
+    let output = execute_sql(
+        &instance,
+        "CREATE TABLE csv_headerless_skip_bad_records(host_id INT, host_name STRING, reading_value DOUBLE, ts TIMESTAMP TIME INDEX);",
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(0)));
+
+    let output = execute_sql(
+        &instance,
+        &format!(
+            "COPY csv_headerless_skip_bad_records FROM '{skip_bad_records_csv_path}' WITH (FORMAT='csv', HEADERS='false', SKIP_BAD_RECORDS='true');"
+        ),
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(2)));
+
+    let output = execute_sql(
+        &instance,
+        "SELECT * FROM csv_headerless_skip_bad_records ORDER BY ts;",
+    )
+    .await
+    .data;
+    check_output_stream(output, expect).await;
+
+    let output = execute_sql(
+        &instance,
+        "CREATE TABLE csv_headerless_extra_columns(host_id INT, host_name STRING, reading_value DOUBLE, ts TIMESTAMP TIME INDEX);",
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(0)));
+
+    let output = execute_sql(
+        &instance,
+        &format!(
+            "COPY csv_headerless_extra_columns FROM '{extra_columns_csv_path}' WITH (FORMAT='csv', HEADERS='false');"
+        ),
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(2)));
+
+    let output = execute_sql(
+        &instance,
+        "SELECT * FROM csv_headerless_extra_columns ORDER BY ts;",
+    )
+    .await
+    .data;
+    check_output_stream(output, expect).await;
+
+    let output = execute_sql(
+        &instance,
+        "CREATE TABLE csv_headerless_fewer_columns(host_id INT, host_name STRING, ts TIMESTAMP TIME INDEX, reading_value DOUBLE DEFAULT 42.0);",
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(0)));
+
+    let output = execute_sql(
+        &instance,
+        &format!(
+            "COPY csv_headerless_fewer_columns FROM '{fewer_columns_csv_path}' WITH (FORMAT='csv', HEADERS='false');"
+        ),
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(2)));
+
+    let output = execute_sql(
+        &instance,
+        "SELECT * FROM csv_headerless_fewer_columns ORDER BY ts;",
+    )
+    .await
+    .data;
+    let expect = "\
++---------+-----------+---------------------+---------------+
+| host_id | host_name | ts                  | reading_value |
++---------+-----------+---------------------+---------------+
+| 1       | Alice     | 2024-01-01T00:00:00 | 42.0          |
+| 2       | Bob       | 2024-01-01T00:00:02 | 42.0          |
++---------+-----------+---------------------+---------------+";
+    check_output_stream(output, expect).await;
+}
+
+#[apply(standalone_instance_case)]
+async fn test_execute_copy_from_csv_strict_headers(instance: Arc<dyn MockInstance>) {
+    let instance = instance.frontend();
+    let tmp_dir = create_local_file_test_dir("test_execute_copy_from_csv_strict_headers");
+    let matching_path = tmp_dir.path().join("matching.csv");
+    let unknown_path = tmp_dir.path().join("unknown.csv");
+    let missing_path = tmp_dir.path().join("missing.csv");
+    let duplicate_path = tmp_dir.path().join("duplicate.csv");
+    let matching_location = prepare_path(matching_path.to_str().unwrap());
+    let unknown_location = prepare_path(unknown_path.to_str().unwrap());
+    let missing_location = prepare_path(missing_path.to_str().unwrap());
+    let duplicate_location = prepare_path(duplicate_path.to_str().unwrap());
+    std::fs::write(
+        &matching_path,
+        "ts,host_id,reading_value\n2024-01-01T00:00:00,1,10.5\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &unknown_path,
+        "host_id,reading_value,ts,extra\n1,10.5,2024-01-01T00:00:00,ignored\n",
+    )
+    .unwrap();
+    std::fs::write(&missing_path, "host_id,ts\n1,2024-01-01T00:00:00\n").unwrap();
+    std::fs::write(
+        &duplicate_path,
+        "host_id,reading_value,ts,host_id\n1,10.5,2024-01-01T00:00:00,2\n",
+    )
+    .unwrap();
+
+    let output = execute_sql(
+        &instance,
+        "CREATE TABLE csv_strict_headers(host_id INT, reading_value DOUBLE, ts TIMESTAMP TIME INDEX);",
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(0)));
+
+    let output = execute_sql(
+        &instance,
+        &format!(
+            "COPY csv_strict_headers FROM '{}' WITH (FORMAT='csv', STRICT_HEADERS='true');",
+            matching_location
+        ),
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(1)));
+
+    let output = execute_sql(&instance, "SELECT * FROM csv_strict_headers;")
+        .await
+        .data;
+    let expect = "\
++---------+---------------+---------------------+
+| host_id | reading_value | ts                  |
++---------+---------------+---------------------+
+| 1       | 10.5          | 2024-01-01T00:00:00 |
++---------+---------------+---------------------+";
+    check_output_stream(output, expect).await;
+
+    let err = try_execute_sql(
+        &instance,
+        &format!(
+            "COPY csv_strict_headers FROM '{}' WITH (FORMAT='csv', STRICT_HEADERS='true');",
+            unknown_location
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        unwrap_frontend_error(&err),
+        Error::TableOperation {
+            source: OperatorError::CsvHeaderMismatch {
+                unknown_columns,
+                missing_columns,
+                duplicate_columns,
+                ..
+            },
+            ..
+        } if unknown_columns == &vec!["extra".to_string()]
+            && missing_columns.is_empty()
+            && duplicate_columns.is_empty()
+    ));
+
+    let err = try_execute_sql(
+        &instance,
+        &format!(
+            "COPY csv_strict_headers FROM '{}' WITH (FORMAT='csv', STRICT_HEADERS='true');",
+            missing_location
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        unwrap_frontend_error(&err),
+        Error::TableOperation {
+            source: OperatorError::CsvHeaderMismatch {
+                unknown_columns,
+                missing_columns,
+                duplicate_columns,
+                ..
+            },
+            ..
+        } if unknown_columns.is_empty()
+            && missing_columns == &vec!["reading_value".to_string()]
+            && duplicate_columns.is_empty()
+    ));
+
+    let err = try_execute_sql(
+        &instance,
+        &format!(
+            "COPY csv_strict_headers FROM '{}' WITH (FORMAT='csv', STRICT_HEADERS='true');",
+            duplicate_location
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        unwrap_frontend_error(&err),
+        Error::TableOperation {
+            source: OperatorError::CsvHeaderMismatch {
+                unknown_columns,
+                missing_columns,
+                duplicate_columns,
+                ..
+            },
+            ..
+        } if unknown_columns.is_empty()
+            && missing_columns.is_empty()
+            && duplicate_columns == &vec!["host_id".to_string()]
+    ));
+}
+
+#[apply(standalone_instance_case)]
 async fn test_execute_query_external_table_json(instance: Arc<dyn MockInstance>) {
     unsafe {
         std::env::set_var("TZ", "UTC");
@@ -1027,7 +1493,7 @@ async fn test_execute_query_external_table_json(instance: Arc<dyn MockInstance>)
     check_output_stream(output, expect).await;
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_query_external_table_json_with_schema(instance: Arc<dyn MockInstance>) {
     unsafe {
         std::env::set_var("TZ", "UTC");
@@ -1098,7 +1564,7 @@ async fn test_execute_query_external_table_json_with_schema(instance: Arc<dyn Mo
     check_output_stream(output, expect).await;
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_query_external_table_json_type_cast(instance: Arc<dyn MockInstance>) {
     unsafe {
         std::env::set_var("TZ", "UTC");
@@ -1173,7 +1639,7 @@ async fn test_execute_query_external_table_json_type_cast(instance: Arc<dyn Mock
     check_output_stream(output, expect).await;
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_query_external_table_json_default_ts_column(instance: Arc<dyn MockInstance>) {
     unsafe {
         std::env::set_var("TZ", "UTC");
@@ -2234,7 +2700,7 @@ async fn test_execute_copy_from_azblob(instance: Arc<dyn MockInstance>) {
     }
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_copy_from_orc_with_cast(instance: Arc<dyn MockInstance>) {
     common_telemetry::init_default_ut_logging();
     let instance = instance.frontend();
@@ -2273,7 +2739,7 @@ async fn test_execute_copy_from_orc_with_cast(instance: Arc<dyn MockInstance>) {
     check_output_stream(output, expected).await;
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_execute_copy_from_orc(instance: Arc<dyn MockInstance>) {
     common_telemetry::init_default_ut_logging();
     let instance = instance.frontend();
@@ -2311,7 +2777,7 @@ async fn test_execute_copy_from_orc(instance: Arc<dyn MockInstance>) {
     check_output_stream(output, expected).await;
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_cast_type_issue_1594(instance: Arc<dyn MockInstance>) {
     let instance = instance.frontend();
 
@@ -2345,6 +2811,46 @@ async fn test_cast_type_issue_1594(instance: Arc<dyn MockInstance>) {
 | host_3   | test        | 98.0       | 95.0         | 7.0        | 48.0       | 99.0         | 67.0      | 14.0          | 86.0        | 36.0        | 23.0             | 2023-04-01T00:00:00 |
 | host_4   | test        | 32.0       | 44.0         | 11.0       | 53.0       | 64.0         | 9.0       | 17.0          | 39.0        | 20.0        | 7.0              | 2023-04-01T00:00:00 |
 +----------+-------------+------------+--------------+------------+------------+--------------+-----------+---------------+-------------+-------------+------------------+---------------------+";
+    check_output_stream(output, expected).await;
+}
+
+#[apply(standalone_instance_case)]
+async fn test_copy_from_csv_skip_bad_records(instance: Arc<dyn MockInstance>) {
+    let instance = instance.frontend();
+
+    assert!(matches!(execute_sql(
+        &instance,
+        "create table csv_skip_bad_records(host_id INT, host_name STRING, reading_value DOUBLE, ts TIMESTAMP TIME INDEX, PRIMARY KEY(host_id));",
+    )
+    .await.data, OutputData::AffectedRows(0)));
+
+    let filepath = find_testing_resource("/tests/data/csv/skip_bad_records.csv");
+
+    let output = execute_sql(
+        &instance,
+        &format!(
+            "copy csv_skip_bad_records from '{}' WITH(FORMAT='csv', skip_bad_records='true');",
+            &filepath
+        ),
+    )
+    .await
+    .data;
+
+    assert!(matches!(output, OutputData::AffectedRows(2)));
+
+    let output = execute_sql(
+        &instance,
+        "select * from csv_skip_bad_records order by host_id;",
+    )
+    .await
+    .data;
+    let expected = "\
++---------+-----------+---------------+---------------------+
+| host_id | host_name | reading_value | ts                  |
++---------+-----------+---------------+---------------------+
+| 1       | Alice     | 10.5          | 2024-01-01T00:00:00 |
+| 2       | Bob       | 30.5          | 2024-01-01T00:00:02 |
++---------+-----------+---------------+---------------------+";
     check_output_stream(output, expected).await;
 }
 
@@ -2579,6 +3085,16 @@ async fn execute_sql(instance: &Arc<Instance>, sql: &str) -> Output {
     execute_sql_with(instance, sql, QueryContext::arc()).await
 }
 
+async fn execute_sql_with_query_parallelism(
+    instance: &Arc<Instance>,
+    sql: &str,
+    parallelism: usize,
+) -> Output {
+    let mut query_ctx = QueryContext::with_db_name(None);
+    query_ctx.set_extension(QUERY_PARALLELISM_HINT, parallelism.to_string());
+    execute_sql_with(instance, sql, Arc::new(query_ctx)).await
+}
+
 async fn try_execute_sql(instance: &Arc<Instance>, sql: &str) -> server_error::Result<Output> {
     try_execute_sql_with(instance, sql, QueryContext::arc()).await
 }
@@ -2716,7 +3232,7 @@ WITH(
     }
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_copy_parquet_map_to_json(instance: Arc<dyn MockInstance>) {
     let instance = instance.frontend();
 
@@ -2783,7 +3299,7 @@ async fn test_copy_parquet_map_to_json(instance: Arc<dyn MockInstance>) {
     check_output_stream(output, &expected).await;
 }
 
-#[apply(both_instances_cases)]
+#[apply(standalone_instance_case)]
 async fn test_copy_parquet_map_to_binary(instance: Arc<dyn MockInstance>) {
     let instance = instance.frontend();
 
@@ -2835,53 +3351,28 @@ async fn test_create_table_with_json_datatype(instance: Arc<dyn MockInstance>) {
     let instance = instance.frontend();
 
     let sql = r#"
-CREATE TABLE a (
-    j JSON(format = "partial", unstructured_keys = ["foo", "foo.bar"]),
-    ts TIMESTAMP TIME INDEX,
-)"#;
-    let output = execute_sql(&instance, sql).await.data;
-    assert!(matches!(output, OutputData::AffectedRows(0)));
-
-    // "show create table" finds the information from table metadata.
-    // So if the output is expected, we know the options are really set.
-    let output = execute_sql(&instance, "SHOW CREATE TABLE a").await.data;
-    let expected = r#"
-+-------+------------------------------------------------------------------------------+
-| Table | Create Table                                                                 |
-+-------+------------------------------------------------------------------------------+
-| a     | CREATE TABLE IF NOT EXISTS "a" (                                             |
-|       |   "j" JSON(format = 'partial', unstructured_keys = ['foo', 'foo.bar']) NULL, |
-|       |   "ts" TIMESTAMP(3) NOT NULL,                                                |
-|       |   TIME INDEX ("ts")                                                          |
-|       | )                                                                            |
-|       |                                                                              |
-|       | ENGINE=mito                                                                  |
-|       |                                                                              |
-+-------+------------------------------------------------------------------------------+"#;
-    check_output_stream(output, expected).await;
-
-    // test the default options
-    let sql = r#"
 CREATE TABLE b (
-    j JSON,
+    j JSON2,
     ts TIMESTAMP TIME INDEX,
-)"#;
+) WITH (append_mode='true')"#;
     let output = execute_sql(&instance, sql).await.data;
     assert!(matches!(output, OutputData::AffectedRows(0)));
 
     let output = execute_sql(&instance, "SHOW CREATE TABLE b").await.data;
     let expected = r#"
-+-------+-----------------------------------------+
-| Table | Create Table                            |
-+-------+-----------------------------------------+
-| b     | CREATE TABLE IF NOT EXISTS "b" (        |
-|       |   "j" JSON(format = 'structured') NULL, |
-|       |   "ts" TIMESTAMP(3) NOT NULL,           |
-|       |   TIME INDEX ("ts")                     |
-|       | )                                       |
-|       |                                         |
-|       | ENGINE=mito                             |
-|       |                                         |
-+-------+-----------------------------------------+"#;
++-------+----------------------------------+
+| Table | Create Table                     |
++-------+----------------------------------+
+| b     | CREATE TABLE IF NOT EXISTS "b" ( |
+|       |   "j" JSON2 NULL,                |
+|       |   "ts" TIMESTAMP(3) NOT NULL,    |
+|       |   TIME INDEX ("ts")              |
+|       | )                                |
+|       |                                  |
+|       | ENGINE=mito                      |
+|       | WITH(                            |
+|       |   append_mode = 'true'           |
+|       | )                                |
++-------+----------------------------------+"#;
     check_output_stream(output, expected).await;
 }

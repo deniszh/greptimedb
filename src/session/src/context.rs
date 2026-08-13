@@ -22,6 +22,7 @@ use api::v1::ExplainOptions;
 use api::v1::region::RegionRequestHeader;
 use arc_swap::ArcSwap;
 use auth::UserInfoRef;
+pub use common_base::protocol::Channel;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_catalog::{build_db_string, parse_catalog_and_schema_from_db_string};
 use common_recordbatch::cursor::RecordBatchStreamCursor;
@@ -32,14 +33,29 @@ use datafusion_common::config::ConfigOptions;
 use derive_builder::Builder;
 use sql::dialect::{Dialect, GenericDialect, GreptimeDbDialect, MySqlDialect, PostgreSqlDialect};
 
+pub use crate::hints::{
+    LIVE_ANALYZE_METRICS_EXTENSION_KEY, REMOTE_QUERY_ID_EXTENSION_KEY,
+    SUPPORT_FLIGHT_METRICS_BEFORE_BATCH_EXTENSION_KEY,
+};
 use crate::protocol_ctx::ProtocolCtx;
+use crate::query_id::QueryId;
 use crate::session_config::{PGByteaOutputValue, PGDateOrder, PGDateTimeStyle, PGIntervalStyle};
 use crate::{MutableInner, ReadPreference};
 
 pub type QueryContextRef = Arc<QueryContext>;
 pub type ConnInfoRef = Arc<ConnInfo>;
 
+pub const FLIGHT_METRICS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
 const CURSOR_COUNT_WARNING_LIMIT: usize = 10;
+
+pub fn generate_remote_query_id() -> String {
+    generate_remote_query_id_value().to_string()
+}
+
+pub fn generate_remote_query_id_value() -> QueryId {
+    QueryId::new()
+}
 
 #[derive(Debug, Builder, Clone)]
 #[builder(pattern = "owned")]
@@ -152,7 +168,12 @@ impl From<&RegionRequestHeader> for QueryContext {
         if let Some(ctx) = &value.query_context {
             ctx.clone().into()
         } else {
-            QueryContextBuilder::default().build()
+            QueryContextBuilder::default()
+                .set_extension(
+                    REMOTE_QUERY_ID_EXTENSION_KEY.to_string(),
+                    generate_remote_query_id(),
+                )
+                .build()
         }
     }
 }
@@ -218,8 +239,27 @@ impl From<&QueryContext> for api::v1::QueryContext {
 }
 
 impl QueryContext {
+    /// Forks this context with an independent snapshot of mutable session data.
+    ///
+    /// Unlike [`Clone`], changes to the schema, user, timezone, and other fields
+    /// held in mutable session data do not affect this context.
+    pub fn fork(&self) -> Self {
+        let mut fork = self.clone();
+        fork.mutable_session_data = Arc::new(RwLock::new(
+            self.mutable_session_data.read().unwrap().clone(),
+        ));
+        fork
+    }
+
     pub fn arc() -> QueryContextRef {
-        Arc::new(QueryContextBuilder::default().build())
+        Arc::new(
+            QueryContextBuilder::default()
+                .set_extension(
+                    REMOTE_QUERY_ID_EXTENSION_KEY.to_string(),
+                    generate_remote_query_id(),
+                )
+                .build(),
+        )
     }
 
     /// Create a new  datafusion's ConfigOptions instance based on the current QueryContext.
@@ -233,6 +273,10 @@ impl QueryContext {
         QueryContextBuilder::default()
             .current_catalog(catalog.to_string())
             .current_schema(schema.to_string())
+            .set_extension(
+                REMOTE_QUERY_ID_EXTENSION_KEY.to_string(),
+                generate_remote_query_id(),
+            )
             .build()
     }
 
@@ -241,6 +285,10 @@ impl QueryContext {
             .current_catalog(catalog.to_string())
             .current_schema(schema.to_string())
             .channel(channel)
+            .set_extension(
+                REMOTE_QUERY_ID_EXTENSION_KEY.to_string(),
+                generate_remote_query_id(),
+            )
             .build()
     }
 
@@ -259,6 +307,10 @@ impl QueryContext {
         QueryContextBuilder::default()
             .current_catalog(catalog)
             .current_schema(schema.clone())
+            .set_extension(
+                REMOTE_QUERY_ID_EXTENSION_KEY.to_string(),
+                generate_remote_query_id(),
+            )
             .build()
     }
 
@@ -318,6 +370,27 @@ impl QueryContext {
 
     pub fn extension<S: AsRef<str>>(&self, key: S) -> Option<&str> {
         self.extensions.get(key.as_ref()).map(|v| v.as_str())
+    }
+
+    pub fn remote_query_id(&self) -> Option<&str> {
+        self.extension(REMOTE_QUERY_ID_EXTENSION_KEY)
+    }
+
+    pub fn remote_query_id_value(&self) -> Option<QueryId> {
+        self.remote_query_id()
+            .and_then(|query_id| query_id.parse().ok())
+    }
+
+    pub fn enable_live_analyze_metrics(&mut self) {
+        if let Some(remote_query_id) = self.remote_query_id().map(str::to_string) {
+            self.set_extension(LIVE_ANALYZE_METRICS_EXTENSION_KEY, remote_query_id);
+        }
+    }
+
+    pub fn live_analyze_metrics_enabled(&self) -> bool {
+        self.remote_query_id()
+            .zip(self.extension(LIVE_ANALYZE_METRICS_EXTENSION_KEY))
+            .is_some_and(|(remote_query_id, value)| value == remote_query_id)
     }
 
     pub fn extensions(&self) -> HashMap<String, String> {
@@ -483,6 +556,10 @@ impl QueryContext {
 impl QueryContextBuilder {
     pub fn build(self) -> QueryContext {
         let channel = self.channel.unwrap_or_default();
+        let mut extensions = self.extensions.unwrap_or_default();
+        extensions
+            .entry(REMOTE_QUERY_ID_EXTENSION_KEY.to_string())
+            .or_insert_with(generate_remote_query_id);
         QueryContext {
             current_catalog: self
                 .current_catalog
@@ -494,7 +571,7 @@ impl QueryContextBuilder {
             sql_dialect: self
                 .sql_dialect
                 .unwrap_or_else(|| Arc::new(GreptimeDbDialect {})),
-            extensions: self.extensions.unwrap_or_default(),
+            extensions,
             configuration_parameter: self
                 .configuration_parameter
                 .unwrap_or_else(|| Arc::new(ConfigurationVariables::default())),
@@ -542,82 +619,12 @@ impl ConnInfo {
     }
 }
 
-#[derive(Debug, PartialEq, Default, Clone, Copy)]
-#[repr(u8)]
-pub enum Channel {
-    #[default]
-    Unknown = 0,
-
-    Mysql = 1,
-    Postgres = 2,
-    HttpSql = 3,
-    Prometheus = 4,
-    Otlp = 5,
-    Grpc = 6,
-    Influx = 7,
-    Opentsdb = 8,
-    Loki = 9,
-    Elasticsearch = 10,
-    Jaeger = 11,
-    Log = 12,
-    Promql = 13,
-}
-
-impl From<u32> for Channel {
-    fn from(value: u32) -> Self {
-        match value {
-            1 => Self::Mysql,
-            2 => Self::Postgres,
-            3 => Self::HttpSql,
-            4 => Self::Prometheus,
-            5 => Self::Otlp,
-            6 => Self::Grpc,
-            7 => Self::Influx,
-            8 => Self::Opentsdb,
-            9 => Self::Loki,
-            10 => Self::Elasticsearch,
-            11 => Self::Jaeger,
-            12 => Self::Log,
-            13 => Self::Promql,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-impl Channel {
-    pub fn dialect(&self) -> Arc<dyn Dialect + Send + Sync> {
-        match self {
-            Channel::Mysql => Arc::new(MySqlDialect {}),
-            Channel::Postgres => Arc::new(PostgreSqlDialect {}),
-            _ => Arc::new(GenericDialect {}),
-        }
-    }
-}
-
-impl Display for Channel {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.as_ref())
-    }
-}
-
-impl AsRef<str> for Channel {
-    fn as_ref(&self) -> &str {
-        match self {
-            Channel::Mysql => "mysql",
-            Channel::Postgres => "postgres",
-            Channel::HttpSql => "httpsql",
-            Channel::Prometheus => "prometheus",
-            Channel::Otlp => "otlp",
-            Channel::Grpc => "grpc",
-            Channel::Influx => "influx",
-            Channel::Opentsdb => "opentsdb",
-            Channel::Loki => "loki",
-            Channel::Elasticsearch => "elasticsearch",
-            Channel::Jaeger => "jaeger",
-            Channel::Log => "log",
-            Channel::Promql => "promql",
-            Channel::Unknown => "unknown",
-        }
+/// Returns the SQL dialect for the given query channel.
+pub fn dialect_for_channel(channel: Channel) -> Arc<dyn Dialect + Send + Sync> {
+    match channel {
+        Channel::Mysql => Arc::new(MySqlDialect {}),
+        Channel::Postgres => Arc::new(PostgreSqlDialect {}),
+        _ => Arc::new(GenericDialect {}),
     }
 }
 
@@ -707,6 +714,9 @@ mod test {
 
         assert_eq!("mysql[127.0.0.1:9000]", session.conn_info().to_string());
         assert_eq!(100, session.process_id());
+
+        let query_ctx = session.new_query_context();
+        assert!(query_ctx.remote_query_id().is_some());
     }
 
     #[test]
@@ -716,6 +726,17 @@ mod test {
 
         let context = QueryContext::with(DEFAULT_CATALOG_NAME, "test");
         assert_eq!("test", context.get_db_string());
+    }
+
+    #[test]
+    fn test_fork_has_independent_mutable_session_data() {
+        let context = QueryContext::with(DEFAULT_CATALOG_NAME, "public");
+        let fork = context.fork();
+
+        fork.set_current_schema("private");
+
+        assert_eq!(context.current_schema(), "public");
+        assert_eq!(fork.current_schema(), "private");
     }
 
     #[test]
@@ -739,8 +760,55 @@ mod test {
         assert_eq!(roundtrip_api.current_catalog, api_ctx.current_catalog);
         assert_eq!(roundtrip_api.current_schema, api_ctx.current_schema);
         assert_eq!(roundtrip_api.timezone, api_ctx.timezone);
-        assert_eq!(roundtrip_api.extensions, api_ctx.extensions);
+        assert_eq!(
+            roundtrip_api.extensions.get("flow.return_region_seq"),
+            Some(&"true".to_string())
+        );
+        assert!(
+            roundtrip_api
+                .extensions
+                .contains_key(REMOTE_QUERY_ID_EXTENSION_KEY)
+        );
         assert_eq!(roundtrip_api.channel, api_ctx.channel);
         assert_eq!(roundtrip_api.snapshot_seqs, api_ctx.snapshot_seqs);
+    }
+
+    #[test]
+    fn test_query_context_remote_query_id_round_trip() {
+        let query_id = "0195f4fd-c503-7c54-8b8f-7dfb8f6f9c4a";
+        let ctx = QueryContextBuilder::default()
+            .current_catalog(DEFAULT_CATALOG_NAME.to_string())
+            .current_schema("public".to_string())
+            .set_extension(
+                REMOTE_QUERY_ID_EXTENSION_KEY.to_string(),
+                query_id.to_string(),
+            )
+            .build();
+
+        assert_eq!(ctx.remote_query_id(), Some(query_id));
+        assert_eq!(ctx.remote_query_id_value().unwrap().to_string(), query_id);
+
+        let proto: api::v1::QueryContext = (&ctx).into();
+        let restored = QueryContext::from(proto);
+        assert_eq!(restored.remote_query_id(), Some(query_id));
+        assert_eq!(
+            restored.remote_query_id_value().unwrap().to_string(),
+            query_id
+        );
+    }
+
+    #[test]
+    fn test_live_analyze_metrics_requires_matching_remote_query_id() {
+        let mut ctx = QueryContext::arc().as_ref().clone();
+        assert!(!ctx.live_analyze_metrics_enabled());
+
+        ctx.enable_live_analyze_metrics();
+        assert!(ctx.live_analyze_metrics_enabled());
+
+        ctx.set_extension(LIVE_ANALYZE_METRICS_EXTENSION_KEY, "true");
+        assert!(!ctx.live_analyze_metrics_enabled());
+
+        ctx.set_extension(LIVE_ANALYZE_METRICS_EXTENSION_KEY, "another-query-id");
+        assert!(!ctx.live_analyze_metrics_enabled());
     }
 }

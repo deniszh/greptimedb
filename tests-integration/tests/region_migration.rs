@@ -17,12 +17,17 @@ use std::time::Duration;
 
 use client::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, OutputData};
 use common_catalog::consts::DEFAULT_PRIVATE_SCHEMA_NAME;
+use common_event_recorder::event_table::{
+    REGION_ID_COLUMN, REGION_MIGRATION_DST_NODE_ID_COLUMN, REGION_MIGRATION_SRC_NODE_ID_COLUMN,
+    REGION_MIGRATION_TRIGGER_REASON_COLUMN,
+};
 use common_event_recorder::{
     DEFAULT_EVENTS_TABLE_NAME, DEFAULT_FLUSH_INTERVAL_SECONDS, EVENTS_TABLE_TIMESTAMP_COLUMN_NAME,
-    EVENTS_TABLE_TYPE_COLUMN_NAME,
+    EVENTS_TABLE_TYPE_COLUMN_NAME, PersistentEventContext, TriggerReason,
 };
 use common_meta::key::{RegionDistribution, RegionRoleSet, TableMetadataManagerRef};
 use common_meta::peer::Peer;
+use common_procedure::ProcedureContext;
 use common_procedure::event::{
     EVENTS_TABLE_PROCEDURE_ID_COLUMN_NAME, EVENTS_TABLE_PROCEDURE_STATE_COLUMN_NAME,
 };
@@ -40,17 +45,13 @@ use frontend::instance::Instance;
 use futures::future::BoxFuture;
 use meta_srv::error;
 use meta_srv::error::Result as MetaResult;
-use meta_srv::events::region_migration_event::{
-    EVENTS_TABLE_DST_NODE_ID_COLUMN_NAME, EVENTS_TABLE_REGION_ID_COLUMN_NAME,
-    EVENTS_TABLE_REGION_MIGRATION_TRIGGER_REASON_COLUMN_NAME, EVENTS_TABLE_SRC_NODE_ID_COLUMN_NAME,
-    REGION_MIGRATION_EVENT_TYPE,
-};
+use meta_srv::event::region_migration::REGION_MIGRATION_EVENT_TYPE;
 use meta_srv::metasrv::SelectorContext;
 use meta_srv::procedure::region_migration::{
     RegionMigrationProcedureTask, RegionMigrationTriggerReason,
 };
 use meta_srv::selector::{Selector, SelectorOptions};
-use sea_query::{Expr, Iden, Order, PostgresQueryBuilder, Query};
+use sea_query::{Alias, Expr, Iden, Order, PostgresQueryBuilder, Query};
 use servers::error::Result as ServerResult;
 use servers::query_handler::sql::SqlQueryHandler;
 use session::context::{QueryContext, QueryContextRef};
@@ -183,13 +184,18 @@ pub async fn test_region_migration(store_type: StorageType, endpoints: Vec<Strin
     let region_id = RegionId::new(table_id, from_regions.leader_regions[0]);
     // Trigger region migration.
     let procedure = region_migration_manager
-        .submit_procedure(RegionMigrationProcedureTask::new(
-            region_id,
-            peer_factory(from_peer_id),
-            peer_factory(to_peer_id),
-            Duration::from_millis(1000),
-            RegionMigrationTriggerReason::Manual,
-        ))
+        .submit_procedure(
+            ProcedureContext::from_event_context(PersistentEventContext::new(
+                TriggerReason::Manual,
+            )),
+            RegionMigrationProcedureTask::new(
+                region_id,
+                peer_factory(from_peer_id),
+                peer_factory(to_peer_id),
+                Duration::from_millis(1000),
+                RegionMigrationTriggerReason::Manual,
+            ),
+        )
         .await
         .unwrap();
     info!("Started region procedure: {}!", procedure.unwrap());
@@ -235,13 +241,18 @@ pub async fn test_region_migration(store_type: StorageType, endpoints: Vec<Strin
 
     // Triggers again.
     let err = region_migration_manager
-        .submit_procedure(RegionMigrationProcedureTask::new(
-            region_id,
-            peer_factory(from_peer_id),
-            peer_factory(to_peer_id),
-            Duration::from_millis(1000),
-            RegionMigrationTriggerReason::Manual,
-        ))
+        .submit_procedure(
+            ProcedureContext::from_event_context(PersistentEventContext::new(
+                TriggerReason::Manual,
+            )),
+            RegionMigrationProcedureTask::new(
+                region_id,
+                peer_factory(from_peer_id),
+                peer_factory(to_peer_id),
+                Duration::from_millis(1000),
+                RegionMigrationTriggerReason::Manual,
+            ),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, error::Error::RegionMigrated { .. }));
@@ -523,13 +534,18 @@ pub async fn test_region_migration_by_sql(store_type: StorageType, endpoints: Ve
 
     // Triggers again.
     let err = region_migration_manager
-        .submit_procedure(RegionMigrationProcedureTask::new(
-            region_id,
-            peer_factory(from_peer_id),
-            peer_factory(to_peer_id),
-            Duration::from_millis(1000),
-            RegionMigrationTriggerReason::Manual,
-        ))
+        .submit_procedure(
+            ProcedureContext::from_event_context(PersistentEventContext::new(
+                TriggerReason::Manual,
+            )),
+            RegionMigrationProcedureTask::new(
+                region_id,
+                peer_factory(from_peer_id),
+                peer_factory(to_peer_id),
+                Duration::from_millis(1000),
+                RegionMigrationTriggerReason::Manual,
+            ),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, error::Error::RegionMigrated { .. }));
@@ -628,13 +644,18 @@ pub async fn test_region_migration_multiple_regions(
     let region_id = RegionId::new(table_id, from_regions.leader_regions[0]);
     // Trigger region migration.
     let procedure = region_migration_manager
-        .submit_procedure(RegionMigrationProcedureTask::new(
-            region_id,
-            peer_factory(from_peer_id),
-            peer_factory(to_peer_id),
-            Duration::from_millis(1000),
-            RegionMigrationTriggerReason::Manual,
-        ))
+        .submit_procedure(
+            ProcedureContext::from_event_context(PersistentEventContext::new(
+                TriggerReason::Manual,
+            )),
+            RegionMigrationProcedureTask::new(
+                region_id,
+                peer_factory(from_peer_id),
+                peer_factory(to_peer_id),
+                Duration::from_millis(1000),
+                RegionMigrationTriggerReason::Manual,
+            ),
+        )
         .await
         .unwrap();
     info!("Started region procedure: {}!", procedure.unwrap());
@@ -689,13 +710,18 @@ pub async fn test_region_migration_multiple_regions(
 
     // Triggers again.
     let err = region_migration_manager
-        .submit_procedure(RegionMigrationProcedureTask::new(
-            region_id,
-            peer_factory(from_peer_id),
-            peer_factory(to_peer_id),
-            Duration::from_millis(1000),
-            RegionMigrationTriggerReason::Manual,
-        ))
+        .submit_procedure(
+            ProcedureContext::from_event_context(PersistentEventContext::new(
+                TriggerReason::Manual,
+            )),
+            RegionMigrationProcedureTask::new(
+                region_id,
+                peer_factory(from_peer_id),
+                peer_factory(to_peer_id),
+                Duration::from_millis(1000),
+                RegionMigrationTriggerReason::Manual,
+            ),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, error::Error::RegionMigrated { .. }));
@@ -779,13 +805,18 @@ pub async fn test_region_migration_all_regions(store_type: StorageType, endpoint
     let region_id = RegionId::new(table_id, from_regions.leader_regions[0]);
     // Trigger region migration.
     let procedure = region_migration_manager
-        .submit_procedure(RegionMigrationProcedureTask::new(
-            region_id,
-            peer_factory(from_peer_id),
-            peer_factory(to_peer_id),
-            Duration::from_millis(1000),
-            RegionMigrationTriggerReason::Manual,
-        ))
+        .submit_procedure(
+            ProcedureContext::from_event_context(PersistentEventContext::new(
+                TriggerReason::Manual,
+            )),
+            RegionMigrationProcedureTask::new(
+                region_id,
+                peer_factory(from_peer_id),
+                peer_factory(to_peer_id),
+                Duration::from_millis(1000),
+                RegionMigrationTriggerReason::Manual,
+            ),
+        )
         .await
         .unwrap();
     info!("Started region procedure: {}!", procedure.unwrap());
@@ -838,13 +869,18 @@ pub async fn test_region_migration_all_regions(store_type: StorageType, endpoint
 
     // Triggers again.
     let err = region_migration_manager
-        .submit_procedure(RegionMigrationProcedureTask::new(
-            region_id,
-            peer_factory(from_peer_id),
-            peer_factory(to_peer_id),
-            Duration::from_millis(1000),
-            RegionMigrationTriggerReason::Manual,
-        ))
+        .submit_procedure(
+            ProcedureContext::from_event_context(PersistentEventContext::new(
+                TriggerReason::Manual,
+            )),
+            RegionMigrationProcedureTask::new(
+                region_id,
+                peer_factory(from_peer_id),
+                peer_factory(to_peer_id),
+                Duration::from_millis(1000),
+                RegionMigrationTriggerReason::Manual,
+            ),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, error::Error::RegionMigrated { .. }));
@@ -917,13 +953,18 @@ pub async fn test_region_migration_incorrect_from_peer(
 
     // Trigger region migration.
     let err = region_migration_manager
-        .submit_procedure(RegionMigrationProcedureTask::new(
-            region_id,
-            peer_factory(5),
-            peer_factory(1),
-            Duration::from_millis(1000),
-            RegionMigrationTriggerReason::Manual,
-        ))
+        .submit_procedure(
+            ProcedureContext::from_event_context(PersistentEventContext::new(
+                TriggerReason::Manual,
+            )),
+            RegionMigrationProcedureTask::new(
+                region_id,
+                peer_factory(5),
+                peer_factory(1),
+                Duration::from_millis(1000),
+                RegionMigrationTriggerReason::Manual,
+            ),
+        )
         .await
         .unwrap_err();
 
@@ -1000,13 +1041,18 @@ pub async fn test_region_migration_incorrect_region_id(
 
     // Trigger region migration.
     let err = region_migration_manager
-        .submit_procedure(RegionMigrationProcedureTask::new(
-            region_id,
-            peer_factory(2),
-            peer_factory(1),
-            Duration::from_millis(1000),
-            RegionMigrationTriggerReason::Manual,
-        ))
+        .submit_procedure(
+            ProcedureContext::from_event_context(PersistentEventContext::new(
+                TriggerReason::Manual,
+            )),
+            RegionMigrationProcedureTask::new(
+                region_id,
+                peer_factory(2),
+                peer_factory(1),
+                Duration::from_millis(1000),
+                RegionMigrationTriggerReason::Manual,
+            ),
+        )
         .await
         .unwrap_err();
 
@@ -1309,11 +1355,10 @@ impl Iden for RegionMigrationEvents {
                 Self::Schema => DEFAULT_PRIVATE_SCHEMA_NAME,
                 Self::Table => DEFAULT_EVENTS_TABLE_NAME,
                 Self::EventType => EVENTS_TABLE_TYPE_COLUMN_NAME,
-                Self::RegionMigrationTriggerReason =>
-                    EVENTS_TABLE_REGION_MIGRATION_TRIGGER_REASON_COLUMN_NAME,
-                Self::RegionId => EVENTS_TABLE_REGION_ID_COLUMN_NAME,
-                Self::SrcNodeId => EVENTS_TABLE_SRC_NODE_ID_COLUMN_NAME,
-                Self::DstNodeId => EVENTS_TABLE_DST_NODE_ID_COLUMN_NAME,
+                Self::RegionMigrationTriggerReason => REGION_MIGRATION_TRIGGER_REASON_COLUMN.name(),
+                Self::RegionId => REGION_ID_COLUMN.name(),
+                Self::SrcNodeId => REGION_MIGRATION_SRC_NODE_ID_COLUMN.name(),
+                Self::DstNodeId => REGION_MIGRATION_DST_NODE_ID_COLUMN.name(),
             }
         )
         .unwrap();
@@ -1331,7 +1376,9 @@ async fn check_region_migration_events_system_table(
     tokio::time::sleep(DEFAULT_FLUSH_INTERVAL_SECONDS * 2).await;
 
     // The query is equivalent to the following SQL:
-    //   SELECT region_migration_trigger_reason, procedure_state FROM greptime_private.events WHERE
+    //   SELECT region_migration_trigger_reason, procedure_state,
+    //          json_get_string(procedure_trigger, 'type') AS procedure_trigger
+    //   FROM greptime_private.events WHERE
     //       type = 'region_migration' AND
     //       procedure_id = '${procedure_id}' AND
     //       table_id = ${table_id} AND
@@ -1342,6 +1389,14 @@ async fn check_region_migration_events_system_table(
     let query = Query::select()
         .column(RegionMigrationEvents::RegionMigrationTriggerReason)
         .column(RegionMigrationEvents::ProcedureState)
+        .expr_as(
+            Expr::cust("json_get_string(procedure_trigger, 'type')"),
+            Alias::new("procedure_trigger"),
+        )
+        .expr_as(
+            Expr::cust("json_to_string(event_context)"),
+            Alias::new("event_context"),
+        )
         .from((RegionMigrationEvents::Schema, RegionMigrationEvents::Table))
         .and_where(Expr::col(RegionMigrationEvents::EventType).eq(REGION_MIGRATION_EVENT_TYPE))
         .and_where(Expr::col(RegionMigrationEvents::ProcedureId).eq(procedure_id))
@@ -1357,11 +1412,11 @@ async fn check_region_migration_events_system_table(
         .remove(0);
 
     let expected = "\
-+---------------------------------+-----------------+
-| region_migration_trigger_reason | procedure_state |
-+---------------------------------+-----------------+
-| Manual                          | Running         |
-| Manual                          | Done            |
-+---------------------------------+-----------------+";
++---------------------------------+-----------------+-------------------+---------------------+
+| region_migration_trigger_reason | procedure_state | procedure_trigger | event_context       |
++---------------------------------+-----------------+-------------------+---------------------+
+| Manual                          | Running         | Submitted         | {\"reason\":\"manual\"} |
+| Manual                          | Done            | Succeeded         |                     |
++---------------------------------+-----------------+-------------------+---------------------+";
     check_output_stream(result.unwrap().data, expected).await;
 }

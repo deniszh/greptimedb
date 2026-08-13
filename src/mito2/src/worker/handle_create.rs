@@ -54,7 +54,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         }
 
         // Create a MitoRegion from the RegionMetadata.
-        let region = RegionOpener::new(
+        let requirements = request.requirements;
+        let opener = RegionOpener::new(
             region_id,
             &request.table_dir,
             request.path_type,
@@ -70,16 +71,26 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         .metadata_builder(builder)
         .parse_options(request.options)?
         .cache(Some(self.cache_manager.clone()))
-        .create_or_open(&self.config, &self.wal)
-        .await?;
+        .hook(self.plugins.get());
+
+        opener.ensure_region_requirements(requirements)?;
+
+        let region = opener.create_or_open(&self.config, &self.wal).await?;
 
         info!(
-            "A new region created, worker: {}, region: {:?}",
+            "A new region created with requirement {:?}, worker: {}, region: {:?}",
+            requirements,
             self.id,
             region.metadata()
         );
 
         self.region_count.inc();
+
+        // Notify the region hook that the region has been opened (created).
+        // Fires before registration; allocates nothing when no hook is registered.
+        if let Some(hook) = region.manifest_ctx.hook() {
+            hook.on_region_opened(region_id, &region.metadata()).await;
+        }
 
         // Insert the MitoRegion into the RegionMap.
         self.regions.insert_region(region);

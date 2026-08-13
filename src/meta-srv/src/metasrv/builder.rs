@@ -22,13 +22,14 @@ use client::inserter::InsertOptions;
 use common_base::Plugins;
 use common_catalog::consts::{MIN_USER_FLOW_ID, MIN_USER_TABLE_ID};
 use common_event_recorder::{DEFAULT_COMPACTION_TIME_WINDOW, EventRecorderImpl, EventRecorderRef};
-use common_grpc::channel_manager::ChannelConfig;
 use common_meta::ddl::flow_meta::FlowMetadataAllocator;
 use common_meta::ddl::table_meta::{TableMetadataAllocator, TableMetadataAllocatorRef};
 use common_meta::ddl::{
     DdlContext, NoopRegionFailureDetectorControl, RegionFailureDetectorControllerRef,
 };
-use common_meta::ddl_manager::{DdlManager, DdlManagerConfiguratorRef};
+use common_meta::ddl_manager::{
+    DdlManager, DdlManagerConfiguratorRef, RepartitionProcedureFactoryRef,
+};
 use common_meta::distributed_time_constants::default_distributed_time_constants;
 use common_meta::key::TableMetadataManager;
 use common_meta::key::flow::FlowMetadataManager;
@@ -55,8 +56,8 @@ use crate::bootstrap::build_default_meta_peer_client;
 use crate::cache_invalidator::MetasrvCacheInvalidator;
 use crate::cluster::MetaPeerClientRef;
 use crate::error::{self, BuildWalProviderSnafu, OtherSnafu, Result};
-use crate::events::EventHandlerImpl;
-use crate::gc::GcScheduler;
+use crate::event::EventHandlerImpl;
+use crate::gc::{DefaultGcSchedulerCtx, GcScheduler};
 use crate::greptimedb_telemetry::get_greptimedb_telemetry_task;
 use crate::handler::failure_handler::RegionFailureHandler;
 use crate::handler::flow_state_handler::FlowStateHandler;
@@ -70,7 +71,10 @@ use crate::metasrv::{
 use crate::peer::MetasrvPeerAllocator;
 use crate::procedure::region_migration::DefaultContextFactory;
 use crate::procedure::region_migration::manager::RegionMigrationManager;
-use crate::procedure::repartition::DefaultRepartitionProcedureFactory;
+use crate::procedure::repartition::gc_requirement::RepartitionGcRequirementManager;
+use crate::procedure::repartition::{
+    DefaultRepartitionProcedureFactory, GcDisabledRepartitionProcedureFactory,
+};
 use crate::procedure::wal_prune::Context as WalPruneContext;
 use crate::procedure::wal_prune::manager::{WalPruneManager, WalPruneTicker};
 use crate::region::flush_trigger::RegionFlushTrigger;
@@ -84,6 +88,7 @@ use crate::selector::round_robin::RoundRobinSelector;
 use crate::service::mailbox::MailboxRef;
 use crate::service::store::cached_kv::LeaderCachedKvBackend;
 use crate::state::State;
+use crate::utils::database::DatabaseOperator;
 use crate::utils::insert_forwarder::InsertForwarder;
 
 /// The time window for twcs compaction of the region stats table.
@@ -175,6 +180,30 @@ impl MetasrvBuilder {
         self
     }
 
+    pub fn options_ref(&self) -> Option<&MetasrvOptions> {
+        self.options.as_ref()
+    }
+
+    pub fn kv_backend_ref(&self) -> Option<&KvBackendRef> {
+        self.kv_backend.as_ref()
+    }
+
+    pub fn in_memory_ref(&self) -> Option<&ResettableKvBackendRef> {
+        self.in_memory.as_ref()
+    }
+
+    pub fn election_ref(&self) -> Option<&ElectionRef> {
+        self.election.as_ref()
+    }
+
+    pub fn meta_peer_client_ref(&self) -> Option<&MetaPeerClientRef> {
+        self.meta_peer_client.as_ref()
+    }
+
+    pub fn node_manager_ref(&self) -> Option<&NodeManagerRef> {
+        self.node_manager.as_ref()
+    }
+
     pub async fn build(self) -> Result<Metasrv> {
         let MetasrvBuilder {
             election,
@@ -190,6 +219,7 @@ impl MetasrvBuilder {
         } = self;
 
         let options = options.unwrap_or_default();
+        options.gc.validate()?;
 
         let kv_backend = kv_backend.unwrap_or_else(|| Arc::new(MemoryKvBackend::new()));
         let in_memory = in_memory.unwrap_or_else(|| Arc::new(MemoryKvBackend::new()));
@@ -206,9 +236,10 @@ impl MetasrvBuilder {
 
         let meta_peer_client = meta_peer_client
             .unwrap_or_else(|| build_default_meta_peer_client(&election, &in_memory));
+        let database_operator = Arc::new(DatabaseOperator::new(meta_peer_client.clone()));
 
         let event_inserter = Box::new(InsertForwarder::new(
-            meta_peer_client.clone(),
+            database_operator.clone(),
             Some(InsertOptions {
                 ttl: options.event_recorder.ttl,
                 append_mode: true,
@@ -216,14 +247,17 @@ impl MetasrvBuilder {
             }),
         ));
         // Builds the event recorder to record important events and persist them as the system table.
-        let event_recorder = Arc::new(EventRecorderImpl::new(Box::new(EventHandlerImpl::new(
-            event_inserter,
-        ))));
+        let event_recorder = Arc::new(EventRecorderImpl::with_event_type_filter(
+            Box::new(EventHandlerImpl::new(event_inserter)),
+            options.event_recorder.event_types.clone(),
+        ));
 
         let selector = selector.unwrap_or_else(|| Arc::new(LeaseBasedSelector));
         let pushers = Pushers::default();
         let mailbox = build_mailbox(&kv_backend, &pushers);
         let runtime_switch_manager = Arc::new(RuntimeSwitchManager::new(kv_backend.clone()));
+        let repartition_gc_requirement_manager =
+            Arc::new(RepartitionGcRequirementManager::new(kv_backend.clone()));
         let procedure_manager = build_procedure_manager(
             &options,
             &kv_backend,
@@ -293,10 +327,7 @@ impl MetasrvBuilder {
 
         let memory_region_keeper = Arc::new(MemoryRegionKeeper::default());
         let node_manager = node_manager.unwrap_or_else(|| {
-            let datanode_client_channel_config = ChannelConfig::new()
-                .timeout(Some(options.datanode.client.timeout))
-                .connect_timeout(options.datanode.client.connect_timeout)
-                .tcp_nodelay(options.datanode.client.tcp_nodelay);
+            let datanode_client_channel_config = options.datanode.client.channel_config();
             Arc::new(NodeClients::new(datanode_client_channel_config))
         });
         let cache_invalidator = Arc::new(MetasrvCacheInvalidator::new(
@@ -399,19 +430,29 @@ impl MetasrvBuilder {
             flow_metadata_manager: flow_metadata_manager.clone(),
             flow_metadata_allocator: flow_metadata_allocator.clone(),
             region_failure_detector_controller,
+            soft_drop_enabled: ddl_soft_drop_enabled(&options),
+            soft_drop_retention: ddl_soft_drop_retention(&options),
+            create_database_metadata_committer: None,
         };
         let procedure_manager_c = procedure_manager.clone();
-        let repartition_procedure_factory = Arc::new(DefaultRepartitionProcedureFactory::new(
-            mailbox.clone(),
-            options.grpc.server_addr.clone(),
-        ));
-        let ddl_manager = DdlManager::try_new(
+        let repartition_procedure_factory: RepartitionProcedureFactoryRef = if options.gc.enable {
+            Arc::new(DefaultRepartitionProcedureFactory::new(
+                mailbox.clone(),
+                options.grpc.server_addr.clone(),
+                repartition_gc_requirement_manager.clone(),
+            ))
+        } else {
+            Arc::new(GcDisabledRepartitionProcedureFactory::new(
+                mailbox.clone(),
+                options.grpc.server_addr.clone(),
+                repartition_gc_requirement_manager.clone(),
+            ))
+        };
+        let ddl_manager = DdlManager::new(
             ddl_context,
             procedure_manager_c,
             repartition_procedure_factory,
-            true,
-        )
-        .context(error::InitDdlManagerSnafu)?;
+        );
 
         let ddl_manager = if let Some(configurator) = plugins
             .as_ref()
@@ -428,6 +469,9 @@ impl MetasrvBuilder {
         } else {
             ddl_manager
         };
+        ddl_manager
+            .register_loaders()
+            .context(error::InitDdlManagerSnafu)?;
 
         let ddl_manager = Arc::new(ddl_manager);
 
@@ -441,6 +485,8 @@ impl MetasrvBuilder {
                 options.grpc.server_addr.clone(),
                 remote_wal_options.flush_trigger_size,
                 remote_wal_options.checkpoint_trigger_size,
+                remote_wal_options.region_flush_trigger_interval,
+                remote_wal_options.periodic_checkpoint_persist_interval,
             );
             region_flush_trigger.try_start()?;
 
@@ -464,6 +510,7 @@ impl MetasrvBuilder {
             };
             let wal_prune_manager = WalPruneManager::new(
                 remote_wal_options.auto_prune_parallelism,
+                remote_wal_options.auto_prune_logical_delete,
                 rx,
                 procedure_manager.clone(),
                 wal_prune_context,
@@ -480,12 +527,18 @@ impl MetasrvBuilder {
         };
 
         let gc_ticker = if options.gc.enable {
-            let (gc_scheduler, gc_ticker) = GcScheduler::new_with_config(
+            let gc_scheduler_ctx = DefaultGcSchedulerCtx::try_new(
                 table_metadata_manager.clone(),
                 procedure_manager.clone(),
+                #[cfg(feature = "enterprise")]
+                ddl_manager.clone(),
                 meta_peer_client.clone(),
                 mailbox.clone(),
                 options.grpc.server_addr.clone(),
+            )?;
+            let (gc_scheduler, gc_ticker) = GcScheduler::new_with_config(
+                gc_scheduler_ctx,
+                runtime_switch_manager.clone(),
                 options.gc.clone(),
             )?;
             gc_scheduler.try_start()?;
@@ -501,7 +554,7 @@ impl MetasrvBuilder {
 
         let persist_region_stats_handler = if !options.stats_persistence.ttl.is_zero() {
             let inserter = Box::new(InsertForwarder::new(
-                meta_peer_client.clone(),
+                database_operator.clone(),
                 Some(InsertOptions {
                     ttl: options.stats_persistence.ttl,
                     append_mode: true,
@@ -581,6 +634,7 @@ impl MetasrvBuilder {
             wal_provider,
             table_metadata_manager,
             runtime_switch_manager,
+            repartition_gc_requirement_manager,
             greptimedb_telemetry_task: get_greptimedb_telemetry_task(
                 Some(metasrv_home),
                 meta_peer_client,
@@ -600,6 +654,7 @@ impl MetasrvBuilder {
             topic_stats_registry,
             resource_stat: Arc::new(resource_stat),
             gc_ticker,
+            database_operator,
         })
     }
 }
@@ -643,6 +698,19 @@ fn build_procedure_manager(
     ))
 }
 
+/// Resolves if soft-drop is enabled from metasrv options.
+///
+/// Soft drop is an enterprise-only feature; it is always disabled in
+/// non-enterprise builds regardless of the configuration.
+fn ddl_soft_drop_enabled(options: &MetasrvOptions) -> bool {
+    cfg!(feature = "enterprise") && options.gc.experimental_soft_drop.enable
+}
+
+/// Returns soft-drop retention for recovering persisted procedures.
+fn ddl_soft_drop_retention(options: &MetasrvOptions) -> Option<Duration> {
+    Some(options.gc.experimental_soft_drop.retention)
+}
+
 impl Default for MetasrvBuilder {
     fn default() -> Self {
         Self::new()
@@ -653,4 +721,82 @@ impl Default for MetasrvBuilder {
 pub struct DdlManagerConfigureContext {
     pub kv_backend: KvBackendRef,
     pub meta_peer_client: MetaPeerClientRef,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn test_ddl_soft_drop_gate_preserves_retention_for_recovery() {
+        let mut options = MetasrvOptions::default();
+        options.gc.enable = true;
+        options.gc.experimental_soft_drop.enable = true;
+        options.gc.experimental_soft_drop.retention = Duration::from_secs(123);
+
+        assert!(ddl_soft_drop_enabled(&options));
+        assert_eq!(
+            Some(Duration::from_secs(123)),
+            ddl_soft_drop_retention(&options)
+        );
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    #[test]
+    fn test_ddl_soft_drop_is_always_disabled_in_non_enterprise_build() {
+        let mut options = MetasrvOptions::default();
+        options.gc.enable = true;
+        options.gc.experimental_soft_drop.enable = true;
+        options.gc.experimental_soft_drop.retention = Duration::from_secs(123);
+
+        assert!(!ddl_soft_drop_enabled(&options));
+        // Retention is preserved for recovering persisted procedures.
+        assert_eq!(
+            Some(Duration::from_secs(123)),
+            ddl_soft_drop_retention(&options)
+        );
+    }
+
+    #[test]
+    fn test_ddl_soft_drop_is_disabled_by_default() {
+        assert!(!ddl_soft_drop_enabled(&MetasrvOptions::default()));
+    }
+
+    #[test]
+    fn test_soft_drop_options_are_validated() {
+        let mut options = MetasrvOptions::default();
+        options.gc.enable = true;
+        options.gc.experimental_soft_drop.enable = true;
+        options.gc.experimental_soft_drop.retention = Duration::ZERO;
+
+        assert!(options.gc.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_soft_drop_when_gc_is_disabled() {
+        let mut options = MetasrvOptions::default();
+        options.gc.experimental_soft_drop.enable = true;
+
+        assert!(
+            MetasrvBuilder::new()
+                .options(options)
+                .build()
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_skips_gc_validation_when_gc_is_disabled() {
+        let mut options = MetasrvOptions::default();
+        options.gc.enable = false;
+        options.gc.max_concurrent_tables = 0;
+
+        MetasrvBuilder::new()
+            .options(options)
+            .build()
+            .await
+            .unwrap();
+    }
 }

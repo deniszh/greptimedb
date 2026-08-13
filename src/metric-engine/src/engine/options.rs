@@ -22,8 +22,13 @@ use store_api::metric_engine_consts::{
     METRIC_ENGINE_INDEX_SKIPPING_INDEX_FALSE_POSITIVE_RATE_OPTION_DEFAULT,
     METRIC_ENGINE_INDEX_SKIPPING_INDEX_GRANULARITY_OPTION,
     METRIC_ENGINE_INDEX_SKIPPING_INDEX_GRANULARITY_OPTION_DEFAULT, METRIC_ENGINE_INDEX_TYPE_OPTION,
+    PRIMARY_KEY_ENCODING,
 };
 use store_api::mito_engine_options::{COMPACTION_TYPE, COMPACTION_TYPE_TWCS, TWCS_TIME_WINDOW};
+
+/// Prefix for legacy `memtable.partition_tree.*` option keys. These keys are
+/// silently dropped by the metric engine; the partition tree memtable is gone.
+const LEGACY_PARTITION_TREE_OPTION_PREFIX: &str = "memtable.partition_tree.";
 
 use crate::error::{Error, ParseRegionOptionsSnafu, Result};
 
@@ -55,10 +60,7 @@ pub enum IndexOptions {
 }
 
 /// Sets data region specific options.
-pub fn set_data_region_options(
-    options: &mut HashMap<String, String>,
-    sparse_primary_key_encoding_if_absent: bool,
-) {
+pub fn set_data_region_options(options: &mut HashMap<String, String>) {
     options.remove(METRIC_ENGINE_INDEX_TYPE_OPTION);
     options.remove(METRIC_ENGINE_INDEX_SKIPPING_INDEX_GRANULARITY_OPTION);
     options.remove(METRIC_ENGINE_INDEX_SKIPPING_INDEX_FALSE_POSITIVE_RATE_OPTION);
@@ -66,16 +68,27 @@ pub fn set_data_region_options(
         "index.inverted_index.segment_row_count".to_string(),
         SEG_ROW_COUNT_FOR_DATA_REGION.to_string(),
     );
-    // Set memtable options for the data region.
-    options.insert("memtable.type".to_string(), "partition_tree".to_string());
-    if sparse_primary_key_encoding_if_absent
-        && !options.contains_key(MEMTABLE_PARTITION_TREE_PRIMARY_KEY_ENCODING)
-    {
-        options.insert(
-            MEMTABLE_PARTITION_TREE_PRIMARY_KEY_ENCODING.to_string(),
-            "sparse".to_string(),
-        );
+
+    // Extract primary key encoding from the legacy nested key before dropping
+    // all `memtable.partition_tree.*` keys.
+    let legacy_encoding = options.remove(MEMTABLE_PARTITION_TREE_PRIMARY_KEY_ENCODING);
+    options.retain(|k, _| !k.starts_with(LEGACY_PARTITION_TREE_OPTION_PREFIX));
+
+    // Set memtable options for the data region. Bulk memtable produces
+    // flat-encoded ranges, so the SST format must be flat to match.
+    options.insert("memtable.type".to_string(), "bulk".to_string());
+    options.insert("sst_format".to_string(), "flat".to_string());
+
+    // Decide the top-level primary key encoding: caller-supplied top-level key wins,
+    // then extracted legacy value, then the `sparse` default.
+    if !options.contains_key(PRIMARY_KEY_ENCODING) {
+        if let Some(encoding) = legacy_encoding {
+            options.insert(PRIMARY_KEY_ENCODING.to_string(), encoding);
+        } else {
+            options.insert(PRIMARY_KEY_ENCODING.to_string(), "sparse".to_string());
+        }
     }
+
     if !options.contains_key(TWCS_TIME_WINDOW) {
         options.insert(
             COMPACTION_TYPE.to_string(),
@@ -159,7 +172,7 @@ mod tests {
             METRIC_ENGINE_INDEX_SKIPPING_INDEX_FALSE_POSITIVE_RATE_OPTION.to_string(),
             "0.01".to_string(),
         );
-        set_data_region_options(&mut options, false);
+        set_data_region_options(&mut options);
 
         for key in [
             METRIC_ENGINE_INDEX_TYPE_OPTION,
@@ -211,8 +224,10 @@ mod tests {
     fn test_set_data_region_options_default_compaction_time_window() {
         // Test that default time window is set when not specified
         let mut options = HashMap::new();
-        set_data_region_options(&mut options, false);
+        set_data_region_options(&mut options);
 
+        assert_eq!(options.get("memtable.type"), Some(&"bulk".to_string()));
+        assert_eq!(options.get("sst_format"), Some(&"flat".to_string()));
         assert_eq!(
             options.get(COMPACTION_TYPE),
             Some(&COMPACTION_TYPE_TWCS.to_string())
@@ -221,12 +236,64 @@ mod tests {
     }
 
     #[test]
+    fn test_set_data_region_options_sparse_primary_key_encoding() {
+        let mut options = HashMap::new();
+        set_data_region_options(&mut options);
+
+        assert_eq!(options.get("memtable.type"), Some(&"bulk".to_string()));
+        assert_eq!(options.get("sst_format"), Some(&"flat".to_string()));
+        assert_eq!(
+            options.get(PRIMARY_KEY_ENCODING),
+            Some(&"sparse".to_string())
+        );
+        assert!(!options.contains_key(MEMTABLE_PARTITION_TREE_PRIMARY_KEY_ENCODING));
+    }
+
+    #[test]
+    fn test_set_data_region_options_migrates_legacy_partition_tree_options() {
+        let mut options = HashMap::new();
+        options.insert("memtable.type".to_string(), "partition_tree".to_string());
+        options.insert(
+            MEMTABLE_PARTITION_TREE_PRIMARY_KEY_ENCODING.to_string(),
+            "sparse".to_string(),
+        );
+        options.insert(
+            "memtable.partition_tree.index_max_keys_per_shard".to_string(),
+            "2048".to_string(),
+        );
+        set_data_region_options(&mut options);
+
+        assert_eq!(options.get("memtable.type"), Some(&"bulk".to_string()));
+        assert_eq!(options.get("sst_format"), Some(&"flat".to_string()));
+        assert_eq!(
+            options.get(PRIMARY_KEY_ENCODING),
+            Some(&"sparse".to_string())
+        );
+        // All legacy partition-tree-specific keys should be stripped.
+        assert!(!options.contains_key(MEMTABLE_PARTITION_TREE_PRIMARY_KEY_ENCODING));
+        assert!(!options.contains_key("memtable.partition_tree.index_max_keys_per_shard"));
+    }
+
+    #[test]
+    fn test_set_data_region_options_preserves_existing_top_level_encoding() {
+        let mut options = HashMap::new();
+        options.insert(PRIMARY_KEY_ENCODING.to_string(), "dense".to_string());
+        // Sparse flag is on but caller already specified dense.
+        set_data_region_options(&mut options);
+
+        assert_eq!(
+            options.get(PRIMARY_KEY_ENCODING),
+            Some(&"dense".to_string())
+        );
+    }
+
+    #[test]
     fn test_set_data_region_options_respects_user_compaction_time_window() {
         // Test that user-specified time window is preserved
         let mut options = HashMap::new();
         options.insert(TWCS_TIME_WINDOW.to_string(), "2h".to_string());
         options.insert(COMPACTION_TYPE.to_string(), "twcs".to_string());
-        set_data_region_options(&mut options, false);
+        set_data_region_options(&mut options);
 
         // User's time window should be preserved
         assert_eq!(options.get(TWCS_TIME_WINDOW), Some(&"2h".to_string()));

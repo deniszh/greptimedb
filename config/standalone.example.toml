@@ -2,9 +2,30 @@
 ## @toml2docs:none-default
 default_timezone = "UTC"
 
-## The default column prefix for auto-created time index and value columns.
+## The default column prefix for auto-created time index, value, and native histogram columns.
+## Legacy OTLP summary columns keep their historical `greptime_` prefix.
 ## @toml2docs:none-default
 default_column_prefix = "greptime"
+
+## Server-side global switch for auto table creation on write.
+## When `false`, a missing table is never auto-created even if the request sets the `auto_create_table` hint to `true`. Default: `true`.
+#+ auto_create_table = true
+
+## The user provider for authentication.
+## Examples: "static_user_provider:file:/path/to/users", "static_user_provider:cmd:greptime_user=greptime_pwd"
+## Password verifier formats: "plain:<password>", "pbkdf2_sha256:<iterations>:<hex_salt>:<hex_hash>",
+## "mysql_native_password:<hex_sha1_sha1_password>",
+## "pg_scram_sha256:<iterations>:<hex_salt>:<hex_stored_key>:<hex_server_key>"
+## "pbkdf2_sha256" and "pg_scram_sha256" protect passwords at rest, but cannot authenticate over MySQL's
+## native password handshake; a MySQL client must send the password in cleartext for such users.
+## "mysql_native_password" is MySQL-specific and cannot authenticate over PostgreSQL at all.
+## PostgreSQL SCRAM only covers "plain" and "pg_scram_sha256" users; if any user is "pbkdf2_sha256" or
+## "mysql_native_password", PostgreSQL falls back to cleartext password auth for every user.
+## For "pg_scram_sha256" users, keep the default iteration count (4096) and salt length (16): both are
+## observable in the SCRAM server-first message, and non-default values weaken resistance to username
+## enumeration.
+## @toml2docs:none-default
+#+ user_provider = "static_user_provider:file:/path/to/users"
 
 ## Maximum total memory for all concurrent write request bodies and messages (HTTP, gRPC, Flight).
 ## Set to 0 to disable the limit. Default: "0" (unlimited)
@@ -33,14 +54,19 @@ max_concurrent_queries = 0
 #+ [runtime]
 ## The number of threads to execute the runtime for global read operations.
 #+ global_rt_size = 8
-## The number of threads to execute the runtime for global write operations.
+## The number of threads to execute compact operations.
 #+ compact_rt_size = 4
+## The maximum number of blocking threads for compact operations.
+## Defaults to max(num_cpus / 2, 1).
+#+ compact_rt_max_blocking_threads = 4
 
 ## The HTTP server options.
 [http]
 ## The address to bind the HTTP server.
 addr = "127.0.0.1:4000"
 ## HTTP request timeout. Set to 0 to disable timeout.
+## When Prometheus pending-row batching is enabled, a nonzero timeout less than or equal to the
+## `prom_store.pending_rows_flush_interval` plus 1 second is adjusted to that value.
 timeout = "0s"
 ## HTTP request body limit.
 ## The following units are supported: `B`, `KB`, `KiB`, `MB`, `MiB`, `GB`, `GiB`, `TB`, `TiB`, `PB`, `PiB`.
@@ -56,12 +82,16 @@ enable_cors = true
 ## @toml2docs:none-default
 cors_allowed_origins = ["https://example.com"]
 
-## Whether to enable validation for Prometheus remote write requests.
-## Available options:
-## - strict: deny invalid UTF-8 strings (default).
-## - lossy: allow invalid UTF-8 strings, replace invalid characters with REPLACEMENT_CHARACTER(U+FFFD).
-## - unchecked: do not valid strings.
-prom_validation_mode = "strict"
+## Experimental: enable POST /v1/sql/analyze/stream for streaming EXPLAIN ANALYZE VERBOSE metrics.
+experimental_enable_explain_analyze_stream = true
+
+## Whether to start the dedicated public HTTP **API** server. This server serves
+## only the `v1` interfaces plus the dashboard, and shares every other `[http]`
+## option with the main server. It is disabled by default; set to `true` to enable.
+enable_api_server = false
+## The address to bind the dedicated HTTP API server, in the same form as `addr`.
+## Defaults to `127.0.0.1:4006`.
+api_server_addr = "127.0.0.1:4006"
 
 ## The gRPC server options.
 [grpc]
@@ -164,11 +194,21 @@ enable = true
 [influxdb]
 ## Whether to enable InfluxDB protocol in HTTP API.
 enable = true
+## Default merge mode for tables automatically created by InfluxDB protocol.
+## Available values: "last_non_null", "last_row".
+default_merge_mode = "last_non_null"
 
 ## Jaeger protocol options.
 [jaeger]
 ## Whether to enable Jaeger protocol in HTTP API.
 enable = true
+
+## OpenTelemetry protocol options.
+[otlp]
+## Whether to enable OpenTelemetry protocol in HTTP API.
+enable = true
+## Maximum spans per trace ingest chunk. Set to 0 to disable splitting.
+trace_ingest_chunk_size = 512
 
 ## Prometheus remote storage options
 [prom_store]
@@ -176,6 +216,27 @@ enable = true
 enable = true
 ## Whether to store the data from Prometheus remote write in metric engine.
 with_metric_engine = true
+## Whether to enable validation for Prometheus remote write requests.
+## Available options:
+## - strict: deny invalid UTF-8 strings (default).
+## - lossy: allow invalid UTF-8 strings, replace invalid characters with REPLACEMENT_CHARACTER(U+FFFD).
+## - unchecked: do not valid strings.
+prom_validation_mode = "strict"
+## Experimental: enable Prometheus remote write v2 native histogram ingestion.
+experimental_enable_prometheus_native_histogram = false
+## Interval to flush pending rows batcher.
+## Set to "0s" to disable batching mode in Prometheus Remote Write endpoint
+#+pending_rows_flush_interval = "0s"
+## Max rows per pending batch before triggering a flush.
+#+max_batch_rows = 100000
+## Max number of concurrent batch flushes.
+#+max_concurrent_flushes = 256
+## Capacity of the pending batch worker channel.
+#+worker_channel_capacity = 65526
+## Max inflight write requests before backpressure.
+#+max_inflight_requests = 3000
+## Maximum number of logical-table flow notifications waiting in the shared queue.
+#+flow_notification_queue_capacity = 1024
 
 ## The WAL options.
 [wal]
@@ -219,7 +280,7 @@ prefill_log_files = false
 
 ## Duration for fsyncing log files.
 ## **It's only used when the provider is `raft_engine`**.
-sync_period = "10s"
+sync_period = "5s"
 
 ## Parallelism during WAL recovery.
 recovery_parallelism = 2
@@ -387,6 +448,15 @@ memory_pool_size = "50%"
 ## The working home directory.
 data_home = "./greptimedb_data"
 
+## Root directory for standalone SQL access to local files.
+## Relative SQL paths are resolved below this directory. Absolute paths are accepted only when
+## they are inside this directory. Defaults to `<data_home>/copy`.
+## Distributed deployments always reject SQL access to local files.
+## Upgrade note: COPY commands and existing external tables that reference paths outside this
+## directory will fail. Move those files below the copy root, set this option to a dedicated
+## directory containing them, or migrate the files to object storage before upgrading.
+#+ copy_root = "./greptimedb_data/copy"
+
 ## The storage type used to store the data.
 ## - `File`: the data is stored in the local file system.
 ## - `S3`: the data is stored in the S3 object storage.
@@ -541,7 +611,9 @@ compress_manifest = false
 ## @toml2docs:none-default="Auto"
 #+ max_background_purges = 8
 
-## Memory budget for compaction tasks. Setting it to 0 or "unlimited" disables the limit.
+## Memory budget for compaction tasks.
+## Supports absolute size (e.g., "2GiB", "512MB") or percentage of system memory (e.g., "50%").
+## Setting it to 0 or "unlimited" disables the limit.
 ## @toml2docs:none-default="0"
 #+ experimental_compaction_memory_limit = "0"
 
@@ -561,10 +633,13 @@ auto_flush_interval = "1h"
 ## @toml2docs:none-default="Auto"
 #+ global_write_buffer_reject_size = "2GB"
 
+## Default write buffer size for each region. Regions stall at this size and reject writes at twice this size. Setting it to 0 disables both limits unless the table specifies `write_buffer_size`.
+#+ default_region_write_buffer_size = "0"
+
 ## Cache size for SST metadata. Setting it to 0 to disable the cache.
-## If not set, it's default to 1/32 of OS memory with a max limitation of 128MB.
+## If not set, it's default to 1/8 of OS memory with a max limitation of 512MB.
 ## @toml2docs:none-default="Auto"
-#+ sst_meta_cache_size = "128MB"
+#+ sst_meta_cache_size = "512MB"
 
 ## Cache size for vectors and arrow arrays. Setting it to 0 to disable the cache.
 ## If not set, it's default to 1/16 of OS memory with a max limitation of 512MB.
@@ -580,6 +655,16 @@ auto_flush_interval = "1h"
 ## If not set, it's default to 1/16 of OS memory with a max limitation of 512MB.
 ## @toml2docs:none-default="Auto"
 #+ selector_result_cache_size = "512MB"
+
+## Cache size for flat range scan results. Setting it to 0 to disable the cache.
+## If not set, it's default to 1/16 of OS memory with a max limitation of 512MB.
+## @toml2docs:none-default="Auto"
+#+ range_result_cache_size = "512MB"
+
+## Cache size for prefilter results. Setting it to 0 to disable the cache.
+## If not set, it's default to 1/32 of OS memory with a max limitation of 128MB.
+## @toml2docs:none-default="Auto"
+#+ prefilter_result_cache_size = "128MB"
 
 ## Whether to enable the write cache, it's enabled by default when using object storage. It is recommended to enable it when using object storage for better performance.
 enable_write_cache = false
@@ -623,8 +708,8 @@ allow_stale_entries = false
 
 ## Memory limit for table scans across all queries.
 ## Supports absolute size (e.g., "2GB") or percentage of system memory (e.g., "20%").
-## Setting it to 0 disables the limit.
-scan_memory_limit = "50%"
+## Setting it to 0 or "unlimited" disables the limit.
+scan_memory_limit = "unlimited"
 ## Controls what happens when a scan cannot get memory immediately.
 ## "fail" (default) fails fast and is the recommended option for most users.
 ## "wait" / "wait(<duration>)" waits for memory to become available. This is mainly
@@ -636,6 +721,13 @@ scan_memory_on_exhausted = "fail"
 ## Minimum time interval between two compactions.
 ## To align with the old behavior, the default value is 0 (no restrictions).
 min_compaction_interval = "0m"
+
+## Whether to allow to schedule a compaction after a successful region edit.
+##
+## Setting this to "true" is a necessary but not sufficient condition for scheduling compaction after a region edit.
+## Other constraints, such as "min_compaction_interval", may still prevent compaction from being scheduled.
+## Setting this to "false", however, guarantees that compaction will not be scheduled after a region edit.
+schedule_compaction_after_edit = true
 
 ## Whether to enable flat format as the default SST format.
 default_flat_format = true
@@ -747,24 +839,6 @@ apply_on_query = "auto"
 ## - `[size]` e.g. `64MB`: fixed memory threshold
 mem_threshold_on_create = "auto"
 
-[region_engine.mito.memtable]
-## Memtable type.
-## - `time_series`: time-series memtable
-## - `partition_tree`: partition tree memtable (experimental)
-type = "time_series"
-
-## The max number of keys in one shard.
-## Only available for `partition_tree` memtable.
-index_max_keys_per_shard = 8192
-
-## The max rows of data inside the actively writing buffer in one shard.
-## Only available for `partition_tree` memtable.
-data_freeze_threshold = 32768
-
-## Max dictionary bytes.
-## Only available for `partition_tree` memtable.
-fork_dictionary_bytes = "1GiB"
-
 [[region_engine]]
 ## Enable the file engine.
 [region_engine.file]
@@ -772,8 +846,6 @@ fork_dictionary_bytes = "1GiB"
 [[region_engine]]
 ## Metric engine options.
 [region_engine.metric]
-## Whether to use sparse primary key encoding.
-sparse_primary_key_encoding = true
 
 ## The logging options.
 [logging]
@@ -793,11 +865,18 @@ otlp_endpoint = "http://localhost:4318/v1/traces"
 ## Whether to append logs to stdout.
 append_stdout = true
 
+## Whether to write logs to files in `dir`.
+enable_file_logging = true
+
 ## The log format. Can be `text`/`json`.
 log_format = "text"
 
 ## The maximum amount of log files.
 max_log_files = 720
+
+## Whether to enable per-region metrics.
+## Default to false.
+enable_per_region_metrics = false
 
 ## The OTLP tracing export protocol. Can be `grpc`/`http`.
 otlp_export_protocol = "http"
@@ -837,6 +916,19 @@ default_ratio = 1.0
 ## The tokio console address.
 ## @toml2docs:none-default
 #+ tokio_console_addr = "127.0.0.1"
+
+## Configuration options for the event recorder.
+[event_recorder]
+## TTL for the events table that will be used to store the events. Default is `90d`.
+ttl = "90d"
+## Event types to record. Current available event types: `create_database`,
+## `alter_database`, `drop_database`, `create_flow`, `drop_flow`,
+## `create_table`, `create_logical_tables`, `alter_table`, `alter_logical_tables`,
+## `drop_table`, `undrop_table`, `purge_dropped_table`, `truncate_table`,
+## `create_view`, `drop_view`, `admin_function`.
+## When omitted, all current and future event types are recorded.
+## Set to an empty array to disable event recording.
+#+ event_types = ["create_database"]
 
 ## The memory options.
 [memory]

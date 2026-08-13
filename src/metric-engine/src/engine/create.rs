@@ -17,6 +17,7 @@ mod extract_new_columns;
 use std::collections::{HashMap, HashSet};
 
 use api::v1::SemanticType;
+use common_query::native_histogram::is_native_histogram_value_type;
 use common_telemetry::info;
 use common_time::{FOREVER, Timestamp};
 use datatypes::data_type::ConcreteDataType;
@@ -145,7 +146,7 @@ impl MetricEngineInner {
         let physical_columns = create_data_region_request
             .column_metadatas
             .iter()
-            .map(|metadata| (metadata.column_schema.name.clone(), metadata.column_id))
+            .map(|metadata| (metadata.column_schema.name.clone(), metadata.clone()))
             .collect::<HashMap<_, _>>();
         let time_index_unit = create_data_region_request
             .column_metadatas
@@ -321,7 +322,7 @@ impl MetricEngineInner {
         let new_add_columns = new_column_names.iter().map(|name| {
             // Safety: previous steps ensure the physical region exist
             let column_metadata = *physical_schema_map.get(name).unwrap();
-            (name.to_string(), column_metadata.column_id)
+            (name.to_string(), column_metadata.clone())
         });
 
         extension_return_value.insert(
@@ -390,8 +391,8 @@ impl MetricEngineInner {
             ConflictRegionOptionSnafu {}
         );
 
-        // check if only one field column is declared, and all tag columns are string
-        let mut field_col: Option<&ColumnMetadata> = None;
+        // check if field columns are either a normal metric value or a native histogram.
+        let mut field_cols = Vec::new();
         for col in &request.column_metadatas {
             // Verified in above steps.
             if is_metric_engine_internal_column(&col.column_schema.name) {
@@ -406,21 +407,27 @@ impl MetricEngineInner {
                     }
                 ),
                 SemanticType::Field => {
-                    if let Some(field_col) = field_col {
-                        MultipleFieldColumnSnafu {
-                            previous: field_col.column_schema.name.clone(),
-                            current: col.column_schema.name.clone(),
-                        }
-                        .fail()?;
-                    }
-                    field_col = Some(col)
+                    field_cols.push(col);
                 }
                 SemanticType::Timestamp => {}
             }
         }
-        let field_col = field_col.context(NoFieldColumnSnafu)?;
+        let [field_col] = field_cols.as_slice() else {
+            if field_cols.is_empty() {
+                NoFieldColumnSnafu.fail()?;
+            }
+            return MultipleFieldColumnSnafu {
+                previous: field_cols[0].column_schema.name.clone(),
+                current: field_cols[1].column_schema.name.clone(),
+            }
+            .fail();
+        };
 
-        // make sure the field column is float64 type
+        if is_native_histogram_value_type(&field_col.column_schema.data_type) {
+            return Ok(());
+        }
+
+        // make sure the normal field column is float64 type
         ensure!(
             field_col.column_schema.data_type == ConcreteDataType::float64_datatype(),
             ColumnTypeMismatchSnafu {
@@ -497,6 +504,7 @@ impl MetricEngineInner {
             table_dir: request.table_dir.clone(),
             path_type: PathType::Metadata,
             partition_expr_json: Some("".to_string()),
+            requirements: request.requirements,
         }
     }
 
@@ -543,10 +551,7 @@ impl MetricEngineInner {
         data_region_request.primary_key = primary_key;
 
         // set data region options
-        set_data_region_options(
-            &mut data_region_request.options,
-            self.config.sparse_primary_key_encoding,
-        );
+        set_data_region_options(&mut data_region_request.options);
 
         data_region_request
     }
@@ -652,9 +657,10 @@ pub(crate) fn region_options_for_metadata_region(
 mod test {
     use common_meta::ddl::test_util::assert_column_name_and_id;
     use common_meta::ddl::utils::{parse_column_metadatas, parse_manifest_infos_from_extensions};
-    use common_query::prelude::{greptime_timestamp, greptime_value};
+    use common_query::native_histogram::native_histogram_value_type;
+    use common_query::prelude::{greptime_native_histogram, greptime_timestamp, greptime_value};
     use store_api::metric_engine_consts::{METRIC_ENGINE_NAME, PHYSICAL_TABLE_METADATA_KEY};
-    use store_api::region_request::BatchRegionDdlRequest;
+    use store_api::region_request::{BatchRegionDdlRequest, RegionRequirements};
 
     use super::*;
     use crate::config::EngineConfig;
@@ -699,6 +705,7 @@ mod test {
             primary_key: vec![],
             options: HashMap::new(),
             partition_expr_json: Some("".to_string()),
+            requirements: RegionRequirements::object_storage(),
         };
         let result = MetricEngineInner::verify_region_create_request(&request);
         assert!(result.is_err());
@@ -748,6 +755,7 @@ mod test {
                 .into_iter()
                 .collect(),
             partition_expr_json: Some("".to_string()),
+            requirements: Default::default(),
         };
         MetricEngineInner::verify_region_create_request(&request).unwrap();
 
@@ -790,6 +798,7 @@ mod test {
                 .into_iter()
                 .collect(),
             partition_expr_json: Some("".to_string()),
+            requirements: Default::default(),
         };
         MetricEngineInner::verify_region_create_request(&request).unwrap();
     }
@@ -823,6 +832,7 @@ mod test {
             primary_key: vec![],
             options: HashMap::new(),
             partition_expr_json: Some("".to_string()),
+            requirements: Default::default(),
         };
         MetricEngineInner::verify_region_create_request(&request).unwrap_err();
 
@@ -838,6 +848,96 @@ mod test {
         options.remove(PHYSICAL_TABLE_METADATA_KEY).unwrap();
         request.options = options;
         MetricEngineInner::verify_region_create_request(&request).unwrap();
+    }
+
+    #[test]
+    fn test_verify_region_create_request_native_histogram_fields() {
+        let native_histogram_columns = vec![
+            ColumnMetadata {
+                column_id: 0,
+                semantic_type: SemanticType::Timestamp,
+                column_schema: ColumnSchema::new(
+                    greptime_timestamp(),
+                    ConcreteDataType::timestamp_millisecond_datatype(),
+                    false,
+                ),
+            },
+            ColumnMetadata {
+                column_id: 1,
+                semantic_type: SemanticType::Tag,
+                column_schema: ColumnSchema::new("job", ConcreteDataType::string_datatype(), true),
+            },
+            ColumnMetadata {
+                column_id: 2,
+                semantic_type: SemanticType::Field,
+                column_schema: ColumnSchema::new(
+                    greptime_native_histogram(),
+                    native_histogram_value_type().clone(),
+                    true,
+                ),
+            },
+        ];
+        let request = RegionCreateRequest {
+            column_metadatas: native_histogram_columns,
+            table_dir: "test_dir".to_string(),
+            path_type: PathType::Bare,
+            engine: METRIC_ENGINE_NAME.to_string(),
+            primary_key: vec![],
+            options: [(
+                LOGICAL_TABLE_METADATA_KEY.to_string(),
+                "physical".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            partition_expr_json: Some("".to_string()),
+            requirements: Default::default(),
+        };
+        MetricEngineInner::verify_region_create_request(&request).unwrap();
+
+        let request = RegionCreateRequest {
+            column_metadatas: vec![
+                ColumnMetadata {
+                    column_id: 0,
+                    semantic_type: SemanticType::Timestamp,
+                    column_schema: ColumnSchema::new(
+                        greptime_timestamp(),
+                        ConcreteDataType::timestamp_millisecond_datatype(),
+                        false,
+                    ),
+                },
+                ColumnMetadata {
+                    column_id: 1,
+                    semantic_type: SemanticType::Field,
+                    column_schema: ColumnSchema::new(
+                        "value_a",
+                        ConcreteDataType::float64_datatype(),
+                        true,
+                    ),
+                },
+                ColumnMetadata {
+                    column_id: 2,
+                    semantic_type: SemanticType::Field,
+                    column_schema: ColumnSchema::new(
+                        "value_b",
+                        ConcreteDataType::float64_datatype(),
+                        true,
+                    ),
+                },
+            ],
+            table_dir: "test_dir".to_string(),
+            path_type: PathType::Bare,
+            engine: METRIC_ENGINE_NAME.to_string(),
+            primary_key: vec![],
+            options: [(
+                LOGICAL_TABLE_METADATA_KEY.to_string(),
+                "physical".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            partition_expr_json: Some("".to_string()),
+            requirements: Default::default(),
+        };
+        assert!(MetricEngineInner::verify_region_create_request(&request).is_err());
     }
 
     #[tokio::test]
@@ -876,6 +976,7 @@ mod test {
             table_dir: "/test_dir".to_string(),
             path_type: PathType::Bare,
             partition_expr_json: Some("".to_string()),
+            requirements: RegionRequirements::object_storage(),
         };
 
         // set up
@@ -893,6 +994,10 @@ mod test {
             vec![ReservedColumnId::table_id(), ReservedColumnId::tsid(), 1]
         );
         assert!(data_region_request.options.contains_key("ttl"));
+        assert_eq!(
+            data_region_request.requirements,
+            RegionRequirements::object_storage()
+        );
 
         // check create metadata region request
         let metadata_region_request = engine_inner.create_request_for_metadata_region(&request);
@@ -903,6 +1008,10 @@ mod test {
             "forever"
         );
         assert!(!metadata_region_request.options.contains_key("skip_wal"));
+        assert_eq!(
+            metadata_region_request.requirements,
+            RegionRequirements::object_storage()
+        );
     }
 
     #[tokio::test]
@@ -951,6 +1060,7 @@ mod test {
             table_dir: "/test_dir".to_string(),
             path_type: PathType::Bare,
             partition_expr_json: Some("".to_string()),
+            requirements: Default::default(),
         };
 
         let env = TestEnv::new().await;

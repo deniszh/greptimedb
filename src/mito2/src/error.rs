@@ -16,7 +16,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use common_datasource::compression::CompressionType;
-use common_error::ext::{BoxedError, ErrorExt};
+use common_error::ext::{BoxedError, ErrorExt, RetryHint};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use common_memory_manager;
@@ -26,6 +26,7 @@ use common_time::timestamp::TimeUnit;
 use datatypes::arrow::error::ArrowError;
 use datatypes::prelude::ConcreteDataType;
 use object_store::ErrorKind;
+use object_store::error::retry_hint_from_opendal_error;
 use partition::error::Error as PartitionError;
 use prost::DecodeError;
 use snafu::{Location, Snafu};
@@ -54,13 +55,6 @@ pub enum Error {
     External {
         source: BoxedError,
         context: String,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Failed to encode sparse primary key, reason: {}", reason))]
-    EncodeSparsePrimaryKey {
-        reason: String,
         #[snafu(implicit)]
         location: Location,
     },
@@ -198,6 +192,28 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display(
+        "Cannot assign a stable field id to native histogram sub-field '{}' of column id {} (unknown sub-field name or derived id overflows i32)",
+        field_name,
+        column_id
+    ))]
+    InvalidNativeHistogramSubfield {
+        column_id: i32,
+        field_name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Native histogram column '{}' has no usable PARQUET:field_id to namespace its sub-field ids (missing, malformed, or exceeds i32::MAX)",
+        field_name
+    ))]
+    InvalidNativeHistogramFieldId {
+        field_name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Region {} not found", region_id))]
     RegionNotFound {
         region_id: RegionId,
@@ -224,6 +240,34 @@ pub enum Error {
     InvalidRequest {
         region_id: RegionId,
         reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "STALE_CURSOR: incremental query stale, region: {}, given_seq: {}, min_readable_seq: {}, retry_hint: FALLBACK_FULL_RECOMPUTE",
+        region_id,
+        given_seq,
+        min_readable_seq
+    ))]
+    IncrementalQueryStale {
+        region_id: RegionId,
+        given_seq: u64,
+        min_readable_seq: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "STALE_SNAPSHOT_FENCE: snapshot upper bound stale, region: {}, given_seq: {}, min_enforceable_seq: {}, retry_hint: REBIND_SNAPSHOT_FENCE",
+        region_id,
+        given_seq,
+        min_enforceable_seq
+    ))]
+    SnapshotFenceStale {
+        region_id: RegionId,
+        given_seq: u64,
+        min_enforceable_seq: u64,
         #[snafu(implicit)]
         location: Location,
     },
@@ -421,6 +465,14 @@ pub enum Error {
         error: datafusion::error::DataFusionError,
     },
 
+    #[snafu(display("Failed to merge candidate series"))]
+    MergeCandidateSeries {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: datafusion::error::DataFusionError,
+    },
+
     #[snafu(display("Failed to compute vector"))]
     ComputeVector {
         #[snafu(implicit)]
@@ -510,6 +562,16 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display(
+        "Stale compaction execution for region {}, the region may have been reopened, truncated or the compaction was superseded",
+        region_id
+    ))]
+    StaleCompactionExecution {
+        region_id: RegionId,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Region {} is truncated", region_id))]
     RegionTruncated {
         region_id: RegionId,
@@ -529,6 +591,14 @@ pub enum Error {
 
     #[snafu(display("Failed to compact region {}", region_id))]
     CompactRegion {
+        region_id: RegionId,
+        source: Arc<Error>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to edit region {}", region_id))]
+    EditRegion {
         region_id: RegionId,
         source: Arc<Error>,
         #[snafu(implicit)]
@@ -901,6 +971,20 @@ pub enum Error {
         source: Arc<Error>,
     },
 
+    #[snafu(display(
+        "Region {} does not satisfy requirement '{}': {}",
+        region_id,
+        requirement,
+        reason
+    ))]
+    RegionRequirement {
+        region_id: RegionId,
+        requirement: &'static str,
+        reason: &'static str,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to parse job id"))]
     ParseJobId {
         #[snafu(implicit)]
@@ -1073,6 +1157,15 @@ pub enum Error {
     #[snafu(display("Manual compaction is override by following operations."))]
     ManualCompactionOverride {},
 
+    #[snafu(display("Manual compaction is already running for region {region_id}."))]
+    ManualCompactionAlreadyRunning { region_id: RegionId },
+
+    #[snafu(display("Compaction is cancelled."))]
+    CompactionCancelled {},
+
+    #[snafu(display("Flush is cancelled."))]
+    FlushCancelled {},
+
     #[snafu(display("Compaction memory exhausted for region {region_id} (policy: {policy})",))]
     CompactionMemoryExhausted {
         region_id: RegionId,
@@ -1223,6 +1316,35 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Failed to cast column"))]
+    CastColumn {
+        #[snafu(source)]
+        error: datafusion::error::DataFusionError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to generate Arrow schema from Parquet file: {}", file))]
+    ParquetToArrowSchema {
+        file: String,
+        #[snafu(source)]
+        error: parquet::errors::ParquetError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Region {} is in {:?} state, expect: Writable, Staging or Downgrading",
+        region_id,
+        state
+    ))]
+    FlushableRegionState {
+        region_id: RegionId,
+        state: RegionRoleState,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1238,6 +1360,36 @@ impl Error {
         match self {
             Error::OpenDal { error, .. } => error.kind() == ErrorKind::NotFound,
             _ => false,
+        }
+    }
+
+    /// Returns whether a failed manifest update may have been persisted.
+    ///
+    /// Unknown errors are treated conservatively because deleting output SSTs after an ambiguous
+    /// manifest write could leave the manifest referencing missing files.
+    pub(crate) fn may_have_persisted_manifest_update(&self) -> bool {
+        match self {
+            Error::UpdateManifest { .. }
+            | Error::RegionState { .. }
+            | Error::RegionTruncated { .. }
+            | Error::RegionStopped { .. }
+            | Error::SerdeJson { .. }
+            | Error::CompressObject { .. } => false,
+            Error::OpenDal { error, .. } => !matches!(
+                error.kind(),
+                ErrorKind::Unsupported
+                    | ErrorKind::ConfigInvalid
+                    | ErrorKind::NotFound
+                    | ErrorKind::PermissionDenied
+                    | ErrorKind::IsADirectory
+                    | ErrorKind::NotADirectory
+                    | ErrorKind::AlreadyExists
+                    | ErrorKind::RateLimited
+                    | ErrorKind::IsSameFile
+                    | ErrorKind::ConditionNotMatch
+                    | ErrorKind::RangeNotSatisfied
+            ),
+            _ => true,
         }
     }
 }
@@ -1295,6 +1447,8 @@ impl ErrorExt for Error {
             | SerializePartitionExpr { .. }
             | InvalidSourceAndTargetRegion { .. } => StatusCode::InvalidArguments,
 
+            IncrementalQueryStale { .. } | SnapshotFenceStale { .. } => StatusCode::RequestOutdated,
+
             RegionMetadataNotFound { .. }
             | Join { .. }
             | WorkerStopped { .. }
@@ -1302,6 +1456,7 @@ impl ErrorExt for Error {
             | DecodeWal { .. }
             | ComputeArrow { .. }
             | EvalPartitionFilter { .. }
+            | MergeCandidateSeries { .. }
             | BiErrors { .. }
             | StopScheduler { .. }
             | ComputeVector { .. }
@@ -1310,7 +1465,9 @@ impl ErrorExt for Error {
             | ReadDataPart { .. }
             | BuildEntry { .. }
             | Metadata { .. }
-            | MitoManifestInfo { .. } => StatusCode::Internal,
+            | CastColumn { .. }
+            | MitoManifestInfo { .. }
+            | ParquetToArrowSchema { .. } => StatusCode::Internal,
 
             FetchManifests { source, .. } => source.status_code(),
 
@@ -1318,7 +1475,6 @@ impl ErrorExt for Error {
 
             WriteParquet { .. } => StatusCode::StorageUnavailable,
             WriteGroup { source, .. } => source.status_code(),
-            EncodeSparsePrimaryKey { .. } => StatusCode::Unexpected,
             InvalidBatch { .. } => StatusCode::InvalidArguments,
             InvalidRecordBatch { .. } => StatusCode::InvalidArguments,
             ConvertVector { source, .. } => source.status_code(),
@@ -1326,15 +1482,18 @@ impl ErrorExt for Error {
             PrimaryKeyLengthMismatch { .. } => StatusCode::InvalidArguments,
             InvalidSender { .. } => StatusCode::InvalidArguments,
             InvalidSchedulerState { .. } => StatusCode::InvalidArguments,
+            RegionRequirement { .. } => StatusCode::InvalidArguments,
             DeleteSsts { .. } | DeleteIndex { .. } | DeleteIndexes { .. } => {
                 StatusCode::StorageUnavailable
             }
             FlushRegion { source, .. } | BuildIndexAsync { source, .. } => source.status_code(),
             RegionDropped { .. } => StatusCode::Cancelled,
             RegionClosed { .. } => StatusCode::Cancelled,
+            StaleCompactionExecution { .. } => StatusCode::Cancelled,
             RegionTruncated { .. } => StatusCode::Cancelled,
             RejectWrite { .. } => StatusCode::StorageUnavailable,
             CompactRegion { source, .. } => source.status_code(),
+            EditRegion { source, .. } => source.status_code(),
             CompatReader { .. } => StatusCode::Unexpected,
             InvalidRegionRequest { source, .. } => source.status_code(),
             RegionState { .. } | UpdateManifest { .. } => StatusCode::RegionNotReady,
@@ -1356,7 +1515,9 @@ impl ErrorExt for Error {
             | PuffinPurgeStager { source, .. } => source.status_code(),
             CleanDir { .. } => StatusCode::Unexpected,
             InvalidConfig { .. } => StatusCode::InvalidArguments,
-            StaleLogEntry { .. } => StatusCode::Unexpected,
+            StaleLogEntry { .. }
+            | InvalidNativeHistogramSubfield { .. }
+            | InvalidNativeHistogramFieldId { .. } => StatusCode::Unexpected,
 
             External { source, .. } => source.status_code(),
 
@@ -1389,7 +1550,14 @@ impl ErrorExt for Error {
             #[cfg(feature = "vector_index")]
             VectorIndexBuild { .. } | VectorIndexFinish { .. } => StatusCode::Internal,
 
-            ManualCompactionOverride {} => StatusCode::Cancelled,
+            ManualCompactionOverride {} | CompactionCancelled {} | FlushCancelled {} => {
+                StatusCode::Cancelled
+            }
+
+            // A concurrent manual compaction fails fast instead of being queued;
+            // the conflict is reported to the caller, which decides whether to
+            // issue a new request after the running one finishes.
+            ManualCompactionAlreadyRunning { .. } => StatusCode::RegionBusy,
 
             CompactionMemoryExhausted { source, .. } => source.status_code(),
 
@@ -1410,10 +1578,132 @@ impl ErrorExt for Error {
             TooManyFilesToRead { .. } | TooManyGcJobs { .. } => StatusCode::RateLimited,
 
             PruneFile { source, .. } => source.status_code(),
+
+            FlushableRegionState { .. } => StatusCode::RegionNotReady,
         }
     }
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn retry_hint(&self) -> RetryHint {
+        use Error::*;
+
+        match self {
+            ReadParquet { .. }
+            | WriteParquet { .. }
+            | RejectWrite { .. }
+            | Download { .. }
+            | Upload { .. }
+            | RegionState { .. }
+            | UpdateManifest { .. }
+            | RegionStopped { .. }
+            | RegionBusy { .. }
+            | ManualCompactionAlreadyRunning { .. }
+            | FlushableRegionState { .. } => RetryHint::Retryable,
+
+            OpenDal { error, .. }
+            | DeleteSsts { error, .. }
+            | DeleteIndex { error, .. }
+            | DeleteIndexes { error, .. } => retry_hint_from_opendal_error(error),
+
+            WriteWal { source, .. }
+            | ReadWal { source, .. }
+            | DeleteWal { source, .. }
+            | FetchManifests { source, .. }
+            | External { source, .. } => source.retry_hint(),
+
+            OpenRegion { source, .. }
+            | WriteGroup { source, .. }
+            | FlushRegion { source, .. }
+            | BuildIndexAsync { source, .. }
+            | CompactRegion { source, .. }
+            | EditRegion { source, .. }
+            | ScanSeries { source, .. }
+            | PruneFile { source, .. } => source.retry_hint(),
+
+            DataTypeMismatch { source, .. }
+            | ConvertVector { source, .. }
+            | ConvertValue { source, .. }
+            | IndexOptions { source, .. }
+            | CastVector { source, .. } => source.retry_hint(),
+
+            BuildIndexApplier { source, .. }
+            | PushIndexValue { source, .. }
+            | ApplyInvertedIndex { source, .. }
+            | IndexFinish { source, .. } => source.retry_hint(),
+
+            ApplyBloomFilterIndex { source, .. }
+            | PushBloomFilterValue { source, .. }
+            | BloomFilterFinish { source, .. } => source.retry_hint(),
+
+            PuffinReadBlob { source, .. }
+            | PuffinAddBlob { source, .. }
+            | PuffinInitStager { source, .. }
+            | PuffinBuildReader { source, .. }
+            | PuffinPurgeStager { source, .. } => source.retry_hint(),
+
+            CreateFulltextCreator { source, .. }
+            | FulltextPushText { source, .. }
+            | FulltextFinish { source, .. }
+            | ApplyFulltextIndex { source, .. } => source.retry_hint(),
+
+            InvalidRegionRequest { source, .. } => source.retry_hint(),
+            InvalidPartitionExpr { source, .. } => source.retry_hint(),
+            RecordBatch { source, .. } => source.retry_hint(),
+            GetSchemaMetadata { source, .. } => source.retry_hint(),
+            CompactionMemoryExhausted { source, .. } => source.retry_hint(),
+            ConvertBulkWalEntry { source, .. } => source.retry_hint(),
+            Encode { source, .. } | Decode { source, .. } => source.retry_hint(),
+
+            #[cfg(feature = "enterprise")]
+            ScanExternalRange { source, .. } => source.retry_hint(),
+
+            _ => RetryHint::NonRetryable,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use snafu::IntoError;
+
+    use super::*;
+
+    #[test]
+    fn test_manifest_update_persistence() {
+        let rejected_kinds = [
+            ErrorKind::Unsupported,
+            ErrorKind::ConfigInvalid,
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::IsADirectory,
+            ErrorKind::NotADirectory,
+            ErrorKind::AlreadyExists,
+            ErrorKind::RateLimited,
+            ErrorKind::IsSameFile,
+            ErrorKind::ConditionNotMatch,
+            ErrorKind::RangeNotSatisfied,
+        ];
+        for kind in rejected_kinds {
+            let error = OpenDalSnafu {}.into_error(object_store::Error::new(kind, "test"));
+            assert!(
+                !error.may_have_persisted_manifest_update(),
+                "error kind {kind:?} should prove the manifest was not persisted"
+            );
+        }
+
+        let error =
+            OpenDalSnafu {}.into_error(object_store::Error::new(ErrorKind::Unexpected, "test"));
+        assert!(error.may_have_persisted_manifest_update());
+
+        let region_id = RegionId::new(1, 1);
+        let error = RegionTruncatedSnafu { region_id }.build();
+        assert!(!error.may_have_persisted_manifest_update());
+
+        // This can be raised while applying an edit after its manifest file was saved.
+        let error = RegionMetadataNotFoundSnafu {}.build();
+        assert!(error.may_have_persisted_manifest_update());
     }
 }

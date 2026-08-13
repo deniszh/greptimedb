@@ -20,7 +20,7 @@ use api::region::RegionResponse;
 use async_trait::async_trait;
 use common_catalog::format_full_table_name;
 use common_procedure::error::{FromJsonSnafu, Result as ProcedureResult, ToJsonSnafu};
-use common_procedure::{Context, LockKey, Procedure, Status};
+use common_procedure::{Context, EventContext, EventTrigger, LockKey, Procedure, Status};
 use common_telemetry::{debug, error, info, warn};
 pub use executor::make_alter_region_request;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,9 @@ use crate::ddl::DdlContext;
 use crate::ddl::alter_logical_tables::executor::AlterLogicalTablesExecutor;
 use crate::ddl::alter_logical_tables::validator::{
     AlterLogicalTableValidator, ValidatorResult, retain_unskipped,
+};
+use crate::ddl::event::table::{
+    TableDdlEvent, TableDdlEventType, TableDdlLocator, alter_table_kind_name,
 };
 use crate::ddl::utils::{extract_column_metadatas, map_to_procedure_error, sync_follower_regions};
 use crate::error::Result;
@@ -58,13 +61,13 @@ pub struct AlterLogicalTablesProcedure {
 fn build_validator_from_alter_table_data<'a>(
     data: &'a AlterTablesData,
 ) -> AlterLogicalTableValidator<'a> {
-    let phsycial_table_id = data.physical_table_id;
+    let physical_table_id = data.physical_table_id;
     let alters = data
         .tasks
         .iter()
         .map(|task| &task.alter_table)
         .collect::<Vec<_>>();
-    AlterLogicalTableValidator::new(phsycial_table_id, alters)
+    AlterLogicalTableValidator::new(physical_table_id, alters)
 }
 
 /// Builds the executor from the [`AlterTablesData`].
@@ -316,6 +319,42 @@ impl Procedure for AlterLogicalTablesProcedure {
 
         LockKey::new(lock_key)
     }
+
+    fn event(&self, ctx: &EventContext<'_>) -> Option<Box<dyn common_event_recorder::Event>> {
+        if !ctx
+            .event_type_filter
+            .allows(TableDdlEventType::AlterLogicalTables.as_str())
+        {
+            return None;
+        }
+        if ctx.trigger != EventTrigger::Submitted {
+            return Some(Box::new(TableDdlEvent::lifecycle(
+                TableDdlEventType::AlterLogicalTables,
+                self.data.tasks.iter().map(|task| {
+                    let table_ref = task.table_ref();
+                    TableDdlLocator::new(table_ref.catalog, table_ref.schema, table_ref.table)
+                        .with_physical_table_id(self.data.physical_table_id)
+                }),
+            )));
+        }
+
+        let locators = self.data.tasks.iter().map(|task| {
+            let table_ref = task.table_ref();
+            TableDdlLocator::new(table_ref.catalog, table_ref.schema, table_ref.table)
+                .with_physical_table_id(self.data.physical_table_id)
+        });
+        let kinds = self
+            .data
+            .tasks
+            .iter()
+            .filter_map(|task| task.alter_table.kind.as_ref())
+            .filter_map(alter_table_kind_name);
+        Some(Box::new(TableDdlEvent::alter_logical_tables_submitted(
+            locators,
+            self.data.tasks.len(),
+            kinds,
+        )))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -333,12 +372,12 @@ pub struct AlterTablesData {
 }
 
 impl AlterTablesData {
-    /// Clears all data fields except `state` and `table_cache_keys_to_invalidate` after metadata update.
-    /// This is done to avoid persisting unnecessary data after the update metadata step.
+    /// Clears metadata snapshots after the update metadata step.
+    ///
+    /// Keep the tasks and physical table ID until the procedure finishes: lifecycle
+    /// events use them to retain the logical table locator.
     fn clear_metadata_fields(&mut self) {
-        self.tasks.clear();
         self.table_info_values.clear();
-        self.physical_table_id = 0;
         self.physical_table_info = None;
         self.physical_columns.clear();
     }
